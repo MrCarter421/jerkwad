@@ -481,6 +481,71 @@ function sectorAt(map, sectorLoops, px, py) {
   return best;
 }
 
+// Detect "phantom" sectors: a sector is a phantom if its loop is identical
+// (or reverse-identical) to another sector's loop, meaning two sectors share
+// the same boundary and stack on top of each other in the world.
+// Also flags sectors that have no loops at all (sidedefs reference them but
+// no closed boundary can be reconstructed).
+// Returns { phantoms: Set<sectorId>, partners: Map<sectorId, sectorId> }
+// where partners[phantom] = the "real" sector it shadows (lower numeric id).
+function findPhantomSectors(map, sectorLoops) {
+  const phantoms = new Set();
+  const partners = new Map();
+  // No loops at all → can't see, can't reach. Phantom.
+  for (const s of map.sectors) {
+    if (!sectorLoops.has(s.id)) phantoms.add(s.id);
+  }
+  // Same loop vertex-set as another sector (in either direction) → phantom.
+  const sigs = new Map(); // signature -> first sectorId we saw it on
+  const sigOf = (loop) => {
+    // Canonical signature: sorted vertex IDs joined.
+    return [...loop].sort().join('|');
+  };
+  for (const [secId, loops] of sectorLoops) {
+    for (const loop of loops) {
+      const sig = sigOf(loop);
+      if (sigs.has(sig)) {
+        const partner = sigs.get(sig);
+        if (partner !== secId) {
+          // Later sector is the phantom; keep the earlier one.
+          phantoms.add(secId);
+          partners.set(secId, partner);
+        }
+      } else {
+        sigs.set(sig, secId);
+      }
+    }
+  }
+  return { phantoms, partners };
+}
+
+// Remove phantom sectors and the sidedefs that reference them. Linedef
+// front/back fields that referenced removed sidedefs become -1 and the line
+// flips back to one-sided.
+function cleanPhantomSectors(map) {
+  const loops = buildSectorLoops(map);
+  const { phantoms } = findPhantomSectors(map, loops);
+  if (phantoms.size === 0) return { map, removed: 0 };
+  const sdToDelete = new Set();
+  for (const sd of map.sidedefs) if (phantoms.has(sd.sector)) sdToDelete.add(sd.id);
+  const nextSectors = map.sectors.filter(s => !phantoms.has(s.id));
+  const nextSidedefs = map.sidedefs.filter(sd => !sdToDelete.has(sd.id));
+  const nextLinedefs = map.linedefs.map(l => {
+    let f = sdToDelete.has(l.front) ? -1 : l.front;
+    let b = sdToDelete.has(l.back) ? -1 : l.back;
+    let flags = l.flags;
+    if ((f === -1) !== (b === -1)) {
+      // Became one-sided: clear two-sided bit, set impassable.
+      flags = (flags | 1) & ~4;
+    }
+    return { ...l, front: f, back: b, flags };
+  });
+  return {
+    map: { ...map, sectors: nextSectors, sidedefs: nextSidedefs, linedefs: nextLinedefs },
+    removed: phantoms.size,
+  };
+}
+
 // ============================================================================
 // TOPOLOGY RESOLVER
 // ============================================================================
@@ -503,6 +568,35 @@ function buildSectorFromLoop(map, chain, opts = {}) {
   walk.push(walk[0]);
 
   const cent = polygonCentroid(pts);
+
+  // Phantom guard: if any existing sector already has a loop with the same
+  // vertex set as our closing chain, we're just retracing that sector's
+  // boundary. Return it instead of stacking a phantom on the empty back
+  // sides of every wall. (Vertex-set match is robust against line-storage
+  // orientation, walk direction, and starting vertex.)
+  {
+    const chainVerts = new Set(walk.slice(0, -1));
+    const existingLoops = buildSectorLoops(map);
+    let matchedSec = null;
+    outer: for (const [sId, loops] of existingLoops) {
+      for (const loop of loops) {
+        if (loop.length !== chainVerts.size) continue;
+        let allIn = true;
+        for (const v of loop) if (!chainVerts.has(v)) { allIn = false; break; }
+        if (allIn) { matchedSec = sId; break outer; }
+      }
+    }
+    if (matchedSec) {
+      return {
+        vertices: map.vertices, linedefs: map.linedefs, sidedefs: map.sidedefs,
+        sectors: map.sectors, things: map.things,
+        createdSectorId: null,
+        selectedExistingId: matchedSec,
+        parentId: null,
+      };
+    }
+  }
+
   const loops = buildSectorLoops(map);
   const parentId = sectorAt(map, loops, cent.x, cent.y);
   const parent = parentId ? map.sectors.find(s => s.id === parentId) : null;
@@ -948,8 +1042,15 @@ export default function WadEditor() {
       if (isClosing) {
         const result = buildSectorFromLoop(staged, newChain);
         if (result) {
-          staged = result;
-          setHint(result.parentId ? 'Sector built inside ' + result.parentId : 'Sector built');
+          if (result.selectedExistingId) {
+            // Re-traced an existing sector's boundary — select it instead of
+            // building a phantom stacked on the back sidedefs.
+            setSelection({ type: 'sector', id: result.selectedExistingId });
+            setHint('Already a sector here — selected ' + result.selectedExistingId);
+          } else {
+            staged = result;
+            setHint(result.parentId ? 'Sector built inside ' + result.parentId : 'Sector built');
+          }
         }
       }
       return staged;
@@ -1744,6 +1845,12 @@ export default function WadEditor() {
               ))}
               <button onClick={() => addNewMapSlot('outdoor')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber }}>+ outdoor map</button>
               <button onClick={() => addNewMapSlot('interior')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.accent }}>+ interior map</button>
+              <button onClick={() => {
+                let removed = 0;
+                updateMap(m => { const r = cleanPhantomSectors(m); removed = r.removed; return r.map; });
+                setMapMenuOpen(false);
+                setHint(removed > 0 ? 'Cleaned ' + removed + ' phantom sector' + (removed === 1 ? '' : 's') : 'No phantoms found');
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.textDim, borderTop: '1px solid ' + COLORS.border }}>⌫ clean phantoms</button>
             </div>
           )}
         </div>

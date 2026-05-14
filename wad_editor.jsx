@@ -111,6 +111,137 @@ function flatColor(name, light) {
   return [Math.round(rgb[0] * lt), Math.round(rgb[1] * lt), Math.round(rgb[2] * lt)];
 }
 
+// Procedurally build a 64x64 canvas approximating a Doom flat texture.
+// Caller is responsible for caching the result; this function regenerates
+// from scratch each call (small, ~64x64 pixels of canvas work).
+function buildFlatCanvas(name) {
+  if (typeof document === 'undefined') return null;
+  const cnv = document.createElement('canvas');
+  cnv.width = 64; cnv.height = 64;
+  const ctx = cnv.getContext('2d');
+  const baseRgb = FLAT_COLORS[name] || (/^F_SKY/.test(name || '') ? SKY_COLOR : [86, 70, 50]);
+  ctx.fillStyle = `rgb(${baseRgb[0]},${baseRgb[1]},${baseRgb[2]})`;
+  ctx.fillRect(0, 0, 64, 64);
+
+  if (/^F_SKY/.test(name || '')) {
+    const grad = ctx.createLinearGradient(0, 0, 0, 64);
+    grad.addColorStop(0, '#1a2a4a'); grad.addColorStop(1, '#4a6088');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, 64, 64);
+    // Cloud blobs
+    ctx.fillStyle = 'rgba(180,200,220,0.4)';
+    [[12, 20, 8], [40, 16, 6], [22, 40, 10], [50, 48, 7]].forEach(([x, y, r]) => {
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    });
+    return cnv;
+  }
+
+  const dim = (f) => [baseRgb[0] * f | 0, baseRgb[1] * f | 0, baseRgb[2] * f | 0];
+  const bright = (f) => [
+    Math.min(255, baseRgb[0] * f | 0),
+    Math.min(255, baseRgb[1] * f | 0),
+    Math.min(255, baseRgb[2] * f | 0),
+  ];
+  // Deterministic PRNG seeded by name so each flat has stable texture.
+  let rnd = 1;
+  for (let i = 0; i < (name || '').length; i++) rnd = (rnd * 31 + (name.charCodeAt(i) | 0)) >>> 0;
+  rnd = (rnd || 1) & 0x7fffffff;
+  const rand = () => { rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; return (rnd >> 8) / 0xffffff; };
+
+  if (/^(MFLR8|GRASS)/.test(name)) {
+    const d = dim(0.65), b = bright(1.2);
+    for (let i = 0; i < 120; i++) {
+      const x = rand() * 64 | 0, y = rand() * 64 | 0;
+      const c = rand() > 0.5 ? b : d;
+      ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+      ctx.fillRect(x, y, 1 + (rand() * 2 | 0), 1);
+    }
+  } else if (/^NUKAGE/.test(name)) {
+    const b = bright(1.3), d = dim(0.7);
+    for (let i = 0; i < 18; i++) {
+      const x = rand() * 64, y = rand() * 64, r = 2 + rand() * 4;
+      ctx.fillStyle = `rgba(${b[0]},${b[1]},${b[2]},0.5)`;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    for (let i = 0; i < 6; i++) {
+      ctx.fillStyle = `rgba(${d[0]},${d[1]},${d[2]},0.5)`;
+      ctx.beginPath(); ctx.arc(rand() * 64, rand() * 64, 2 + rand() * 3, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (/^(BLOOD|LAVA)/.test(name)) {
+    const b = bright(1.3), d = dim(0.6);
+    for (let i = 0; i < 14; i++) {
+      const x = rand() * 64, y = rand() * 64, r = 2 + rand() * 6;
+      ctx.fillStyle = rand() > 0.5
+        ? `rgba(${b[0]},${b[1]},${b[2]},0.55)`
+        : `rgba(${d[0]},${d[1]},${d[2]},0.55)`;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (/^(FWATER|SLIME)/.test(name)) {
+    const b = bright(1.2);
+    ctx.strokeStyle = `rgba(${b[0]},${b[1]},${b[2]},0.55)`;
+    ctx.lineWidth = 1;
+    for (let y = 4; y < 64; y += 10) {
+      ctx.beginPath(); ctx.moveTo(0, y);
+      for (let x = 0; x <= 64; x += 4) ctx.lineTo(x, y + Math.sin((x + rnd * 0.001) * 0.3) * 2);
+      ctx.stroke();
+    }
+  } else if (/^STEP/.test(name)) {
+    const d = dim(0.65), b = bright(1.2);
+    ctx.fillStyle = `rgb(${d[0]},${d[1]},${d[2]})`;
+    for (let y = 0; y < 64; y += 16) ctx.fillRect(0, y, 64, 3);
+    ctx.fillStyle = `rgb(${b[0]},${b[1]},${b[2]})`;
+    for (let y = 13; y < 64; y += 16) ctx.fillRect(0, y, 64, 1);
+  } else if (/^TLITE/.test(name)) {
+    const b = bright(1.4), d = dim(0.4);
+    ctx.fillStyle = `rgb(${d[0]},${d[1]},${d[2]})`;
+    ctx.fillRect(0, 0, 4, 64); ctx.fillRect(60, 0, 4, 64);
+    ctx.fillRect(0, 0, 64, 4); ctx.fillRect(0, 60, 64, 4);
+    ctx.fillStyle = `rgba(${b[0]},${b[1]},${b[2]},0.4)`;
+    ctx.fillRect(4, 4, 56, 56);
+  } else if (/^CEIL/.test(name) || /^DEM1/.test(name)) {
+    const d = dim(0.6);
+    ctx.fillStyle = `rgb(${d[0]},${d[1]},${d[2]})`;
+    for (let y = 4; y < 64; y += 8) for (let x = 4; x < 64; x += 8) ctx.fillRect(x, y, 2, 2);
+  } else if (/^(RROCK|GRNROCK)/.test(name)) {
+    for (let i = 0; i < 22; i++) {
+      const f = 0.6 + rand() * 0.7;
+      const c = bright(f);
+      ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+      ctx.fillRect(rand() * 64 | 0, rand() * 64 | 0, 3 + (rand() * 6 | 0), 3 + (rand() * 6 | 0));
+    }
+  } else if (/^CRATOP/.test(name)) {
+    const d = dim(0.6), b = bright(1.2);
+    ctx.fillStyle = `rgb(${b[0]},${b[1]},${b[2]})`;
+    ctx.fillRect(2, 2, 60, 60);
+    ctx.strokeStyle = `rgb(${d[0]},${d[1]},${d[2]})`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(2, 2, 60, 60);
+    ctx.beginPath();
+    ctx.moveTo(2, 2); ctx.lineTo(62, 62);
+    ctx.moveTo(62, 2); ctx.lineTo(2, 62);
+    ctx.stroke();
+  } else {
+    // Generic floor: staggered brick.
+    const d = dim(0.55);
+    ctx.strokeStyle = `rgb(${d[0]},${d[1]},${d[2]})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let y = 16; y < 64; y += 16) { ctx.moveTo(0, y + 0.5); ctx.lineTo(64, y + 0.5); }
+    for (let row = 0; row < 4; row++) {
+      const off = (row % 2) * 16;
+      for (let x = off; x <= 64; x += 32) {
+        ctx.moveTo(x + 0.5, row * 16);
+        ctx.lineTo(x + 0.5, (row + 1) * 16);
+      }
+    }
+    ctx.stroke();
+    // Light highlight
+    const b = bright(1.1);
+    ctx.fillStyle = `rgba(${b[0]},${b[1]},${b[2]},0.15)`;
+    for (let i = 0; i < 12; i++) ctx.fillRect(rand() * 64 | 0, rand() * 64 | 0, 1, 1);
+  }
+  return cnv;
+}
+
 // ============================================================================
 // WAD I/O
 // ============================================================================
@@ -315,6 +446,35 @@ function normalizeMap(m) {
   return { vertices: verts, linedefs, sidedefs, sectors, things };
 }
 
+// WADED-style vertex merge: if two vertices share exact coords, fold the
+// second into the first. Rewrites linedef v1/v2 references; collapsed lines
+// (v1 === v2) and their sidedefs are dropped.
+function mergeCoincidentVertices(map, movedId) {
+  const moved = map.vertices.find(v => v.id === movedId);
+  if (!moved) return map;
+  const target = map.vertices.find(v => v.id !== movedId && v.x === moved.x && v.y === moved.y);
+  if (!target) return map;
+  const nextVertices = map.vertices.filter(v => v.id !== movedId);
+  const remapped = map.linedefs.map(l => ({
+    ...l,
+    v1: l.v1 === movedId ? target.id : l.v1,
+    v2: l.v2 === movedId ? target.id : l.v2,
+  }));
+  const collapsed = new Set(remapped.filter(l => l.v1 === l.v2).map(l => l.id));
+  const sdToDelete = new Set();
+  for (const l of remapped) {
+    if (!collapsed.has(l.id)) continue;
+    if (l.front && l.front !== -1) sdToDelete.add(l.front);
+    if (l.back && l.back !== -1) sdToDelete.add(l.back);
+  }
+  return {
+    ...map,
+    vertices: nextVertices,
+    linedefs: remapped.filter(l => !collapsed.has(l.id)),
+    sidedefs: map.sidedefs.filter(sd => !sdToDelete.has(sd.id)),
+  };
+}
+
 const DEFAULT_OUTDOOR_SECTOR = {
   floorH: 0, ceilH: 256, floorTex: 'MFLR8_1', ceilTex: 'F_SKY1',
   light: 224, special: 0, tag: 0
@@ -325,9 +485,17 @@ const DEFAULT_INDOOR_SECTOR = {
 };
 const DEFAULT_SIDEDEF = { xOff: 0, yOff: 0, upper: '-', lower: '-', middle: 'STARTAN2' };
 
+// Canonical Doom convention: lines stored CW around the sector so that
+// FRONT side (right of v1->v2) is the interior side. Vertices laid out
+// NW, NE, SE, SW (CW in Y-up world).
 function outdoorStarter() {
   const H = 1024; const m = emptyMap();
-  m.vertices = [{ id: 'v0', x: -H, y: -H }, { id: 'v1', x: H, y: -H }, { id: 'v2', x: H, y: H }, { id: 'v3', x: -H, y: H }];
+  m.vertices = [
+    { id: 'v0', x: -H, y:  H }, // NW
+    { id: 'v1', x:  H, y:  H }, // NE
+    { id: 'v2', x:  H, y: -H }, // SE
+    { id: 'v3', x: -H, y: -H }, // SW
+  ];
   m.sectors = [{ id: 's0', ...DEFAULT_OUTDOOR_SECTOR }];
   m.sidedefs = [0, 1, 2, 3].map(i => ({ id: 'sd' + i, ...DEFAULT_SIDEDEF, middle: 'BIGDOOR2', sector: 's0' }));
   m.linedefs = [{ v1: 'v0', v2: 'v1' }, { v1: 'v1', v2: 'v2' }, { v1: 'v2', v2: 'v3' }, { v1: 'v3', v2: 'v0' }]
@@ -337,7 +505,12 @@ function outdoorStarter() {
 }
 function interiorStarter() {
   const H = 256; const m = emptyMap();
-  m.vertices = [{ id: 'v0', x: -H, y: -H }, { id: 'v1', x: H, y: -H }, { id: 'v2', x: H, y: H }, { id: 'v3', x: -H, y: H }];
+  m.vertices = [
+    { id: 'v0', x: -H, y:  H }, // NW
+    { id: 'v1', x:  H, y:  H }, // NE
+    { id: 'v2', x:  H, y: -H }, // SE
+    { id: 'v3', x: -H, y: -H }, // SW
+  ];
   m.sectors = [{ id: 's0', ...DEFAULT_INDOOR_SECTOR }];
   m.sidedefs = [0, 1, 2, 3].map(i => ({ id: 'sd' + i, ...DEFAULT_SIDEDEF, middle: 'STARTAN2', sector: 's0' }));
   m.linedefs = [{ v1: 'v0', v2: 'v1' }, { v1: 'v1', v2: 'v2' }, { v1: 'v2', v2: 'v3' }, { v1: 'v3', v2: 'v0' }]
@@ -830,6 +1003,8 @@ export default function WadEditor() {
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.18 });
   const [snap, setSnap] = useState(32);
   const [showGrid, setShowGrid] = useState(true);
+  const [textureView, setTextureView] = useState('floor'); // 'floor' | 'ceil' | 'off'
+  const flatCacheRef = useRef(new Map());
   const [welcomeOpen, setWelcomeOpen] = useState(true);
   const [mapMenuOpen, setMapMenuOpen] = useState(false);
   const [thingPicker, setThingPicker] = useState(null);
@@ -1316,6 +1491,19 @@ export default function WadEditor() {
       if (g?.kind === 'drag-vertex') setSelection({ type: 'vertex', id: g.vertexId });
       else if (g?.kind === 'drag-thing') setSelection({ type: 'thing', id: g.thingId });
       else if (g?.kind === 'tap-or-pan') handleTap(ptr.sx, ptr.sy);
+    } else if (g?.kind === 'drag-vertex') {
+      // Real drag of a vertex: WADED-style merge if dropped onto another.
+      updateMap(m => {
+        const merged = mergeCoincidentVertices(m, g.vertexId);
+        if (merged !== m) setHint('Vertices merged');
+        return merged;
+      });
+      // The merged-into vertex inherits selection.
+      const cur = doc.maps[doc.currentMap].vertices.find(v => v.id === g.vertexId);
+      if (cur) {
+        const other = doc.maps[doc.currentMap].vertices.find(v => v.id !== g.vertexId && v.x === cur.x && v.y === cur.y);
+        if (other) setSelection({ type: 'vertex', id: other.id });
+      }
     }
     if (pointersRef.current.size === 0) gestureRef.current = null;
     else if (pointersRef.current.size === 1) {
@@ -1343,7 +1531,10 @@ export default function WadEditor() {
     if (ld) { setSelection({ type: 'linedef', id: ld.id }); return; }
     const secId = hitSector(sx, sy);
     if (secId) { setSelection({ type: 'sector', id: secId }); return; }
-    placeOrExtendDraw(w.x, w.y);
+    // Empty space + no active chain: deselect. Drawing must be initiated via
+    // long-press radial -> Draw, so a finger landing in empty space doesn't
+    // accidentally start a chain.
+    setSelection(null);
   };
 
   const placeThing = (typeId) => {
@@ -1425,14 +1616,17 @@ export default function WadEditor() {
     const vmap = new Map(map.vertices.map(v => [v.id, v]));
 
     if (sectorLoops.size) {
+      const cache = flatCacheRef.current;
+      const origin = worldToScreen(0, 0);
+      const usePattern = textureView !== 'off' && view.zoom > 0.05;
       for (const [sectorId, loops] of sectorLoops) {
         const sector = map.sectors.find(s => s.id === sectorId);
         if (!sector) continue;
         const isSel = selection?.type === 'sector' && selection.id === sectorId;
-        const [r, g, b] = flatColor(sector.floorTex, sector.light);
-        ctx.fillStyle = isSel
-          ? `rgba(${Math.min(255, r + 60)}, ${Math.min(255, g + 30)}, ${b}, 0.82)`
-          : `rgba(${r}, ${g}, ${b}, 0.78)`;
+        const flatName = textureView === 'ceil' ? sector.ceilTex : sector.floorTex;
+
+        // Build the sector polygon path once; reuse for pattern fill,
+        // light dim overlay, sky tint, and selection highlight.
         ctx.beginPath();
         for (const loop of loops) {
           for (let i = 0; i < loop.length; i++) {
@@ -1442,9 +1636,52 @@ export default function WadEditor() {
           }
           ctx.closePath();
         }
-        ctx.fill('evenodd');
-        if (sector.ceilTex === 'F_SKY1') {
-          ctx.fillStyle = 'rgba(40, 56, 92, 0.22)';
+
+        if (usePattern) {
+          let canvas = cache.get(flatName);
+          if (!canvas) {
+            canvas = buildFlatCanvas(flatName);
+            cache.set(flatName, canvas);
+          }
+          if (canvas) {
+            const pattern = ctx.createPattern(canvas, 'repeat');
+            // Align pattern to world origin: translate to where world (0,0)
+            // sits on screen, then scale by zoom. Y is negated because world Y
+            // is up but screen Y is down. Pattern tile = 64 world units.
+            const matrix = new DOMMatrix();
+            matrix.translateSelf(origin.x, origin.y);
+            matrix.scaleSelf(view.zoom, -view.zoom);
+            pattern.setTransform(matrix);
+            ctx.fillStyle = pattern;
+            ctx.fill('evenodd');
+            // Light-level dim overlay (skip for sky which is its own thing).
+            if (!/^F_SKY/.test(flatName || '')) {
+              const lt = Math.max(0.15, (sector.light ?? 160) / 255);
+              if (lt < 0.99) {
+                ctx.fillStyle = `rgba(0,0,0,${(1 - lt) * 0.7})`;
+                ctx.fill('evenodd');
+              }
+            }
+          } else {
+            const [r, g, b] = flatColor(flatName, sector.light);
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.85)`;
+            ctx.fill('evenodd');
+          }
+        } else {
+          const [r, g, b] = flatColor(flatName, sector.light);
+          ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.85)`;
+          ctx.fill('evenodd');
+        }
+
+        // Sky tint when looking at floor view but ceiling is sky (the player
+        // would see sky overhead — a subtle hint without obscuring the floor).
+        if (textureView === 'floor' && sector.ceilTex === 'F_SKY1') {
+          ctx.fillStyle = 'rgba(40, 56, 92, 0.12)';
+          ctx.fill('evenodd');
+        }
+
+        if (isSel) {
+          ctx.fillStyle = 'rgba(127, 255, 212, 0.18)';
           ctx.fill('evenodd');
         }
       }
@@ -1500,7 +1737,7 @@ export default function WadEditor() {
         const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
         const dx = b.x - a.x, dy = b.y - a.y;
         const len = Math.hypot(dx, dy) || 1;
-        const nx = dy / len, ny = -dx / len;
+        const nx = -dy / len, ny = dx / len;
         ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx + nx * 4, my + ny * 4); ctx.stroke();
       }
     }
@@ -1811,6 +2048,11 @@ export default function WadEditor() {
         setThingPicker({ x: sn.x, y: sn.y });
         break;
       }
+      case 'start-draw': {
+        const w = screenToWorld(r.sx, r.sy);
+        placeOrExtendDraw(w.x, w.y);
+        break;
+      }
       case 'stamp-shape': setStampSheet('shapes'); break;
     }
   }
@@ -1887,6 +2129,14 @@ export default function WadEditor() {
             setSnap(opts[(idx + 1) % opts.length]);
           }}>
             <span style={{ fontFamily: monoStack, fontSize: 10 }}>SNAP {snap || 'OFF'}</span>
+          </FloatingBtn>
+          <FloatingBtn active={textureView !== 'off'} onClick={() => {
+            const next = textureView === 'floor' ? 'ceil' : textureView === 'ceil' ? 'off' : 'floor';
+            setTextureView(next);
+          }}>
+            <span style={{ fontFamily: monoStack, fontSize: 10 }}>
+              TEX {textureView === 'floor' ? 'FLR' : textureView === 'ceil' ? 'CEIL' : 'OFF'}
+            </span>
           </FloatingBtn>
           {selection?.type === 'sector' && (
             <FloatingBtn active={transformMode} onClick={() => setTransformMode(t => !t)}>
@@ -2144,6 +2394,7 @@ function RadialMenu({ radial, onAction, onClose }) {
       { id: 'delete', label: 'Delete', glyph: '✕' },
     ],
     empty: [
+      { id: 'start-draw', label: 'Draw', glyph: '✎' },
       { id: 'place-thing', label: 'Thing', glyph: '◉' },
       { id: 'stamp-shape', label: 'Shape', glyph: '◫' },
     ],

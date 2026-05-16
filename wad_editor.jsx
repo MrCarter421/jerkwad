@@ -659,139 +659,287 @@ function generateRandomWorld() {
   return m;
 }
 
-// Dungeon generator: an enclosed network of rectangular rooms connected by
-// narrow corridors. Unlike generateRandomWorld (which scatters rooms inside
-// an outdoor sandbox), the dungeon has no outer accessible area — the player
-// can only traverse rooms and corridors. Geometry is constructed directly
-// (not via buildSectorFromLoop) so corridor entries can split room walls
-// cleanly into wall + opening + wall segments without phantom-sector risk.
+// Dungeon generator v2. Distilled from "Tricks of the Doom Gurus", Romero's
+// level-design rules, doomwiki Mapping reference, and The Level Design Book
+// Doom metrics. Builds a network of 4 square + 2 octagon rooms placed
+// non-overlapping in a 3000-unit field, connected by axis-aligned corridors
+// (spanning tree + ~60% extra chords for multi-route loops). Every room gets
+// a 16-unit perimeter trim ring at +8 height (Romero's "border" rule), and
+// half get a concentric inner feature: a raised platform or a skylit center.
+// Heights constrained so adjacent rooms never exceed the 24-unit step limit.
+// Door texture is DOOR3 (64-wide canonical) and door tracks use DOORTRAK
+// with the lower-unpegged flag set so the side textures don't slide.
 function generateDungeon() {
   let seed = (Date.now() & 0x7fffffff) || 1;
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+  const sn = v => Math.round(v / 32) * 32;
 
-  const GRID = 4;
-  const CELL = 512;
-  const ROOM = 384;
-  const CW = 64;
+  const MAX_STEP = 24;     // Doom player can step up ≤24 without lift
+  const CW = 64;           // canonical corridor width
+  const TRIM_W = 16;       // perimeter trim ring width
+  const INNER_INSET = 96;  // inner-feature inset from trim's inner edge
 
-  // Grow a connected cluster of cells outward from (0,0) so every cell is
-  // guaranteed to have at least one grid-neighbour already placed. This
-  // ensures the adjacency graph is connected and the spanning tree will
-  // wire corridors between every room.
-  const cells = [];
-  const placed = new Set();
-  const enqueue = (i, j) => {
-    if (i < 0 || i >= GRID || j < 0 || j >= GRID) return;
-    const k = i + ',' + j;
-    if (placed.has(k)) return;
-    placed.add(k); cells.push({ i, j });
-  };
-  enqueue(0, 0);
-  for (let pass = 0; pass < 8 && cells.length < 12; pass++) {
-    const snapshot = cells.slice();
-    for (const c of snapshot) {
-      const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-      for (const [di, dj] of dirs) {
-        if (rand() < 0.55) enqueue(c.i + di, c.j + dj);
+  // -------- polygon helpers --------
+  function squarePoly(cx, cy, w, h) {
+    const hw = w / 2, hh = h / 2;
+    return [
+      { x: cx - hw, y: cy - hh }, { x: cx + hw, y: cy - hh },
+      { x: cx + hw, y: cy + hh }, { x: cx - hw, y: cy + hh },
+    ];
+  }
+  function octagonPoly(cx, cy, r) {
+    const out = [];
+    for (let i = 0; i < 8; i++) {
+      const a = (22.5 + 45 * i) * Math.PI / 180;
+      out.push({ x: Math.round(cx + Math.cos(a) * r), y: Math.round(cy + Math.sin(a) * r) });
+    }
+    return out;
+  }
+  function roomPoly(room, shrink = 0) {
+    if (room.type === 'octagon') return octagonPoly(room.cx, room.cy, room.r - shrink);
+    return squarePoly(room.cx, room.cy, room.w - 2 * shrink, room.h - 2 * shrink);
+  }
+  // Effective bbox = the rectangle that bounds the cardinal-aligned doorway
+  // edges (used for placement and corridor feasibility). For octagons at
+  // 22.5° offset, that's ±0.924r in both dimensions.
+  function roomBBox(room, shrink = 0) {
+    if (room.type === 'octagon') {
+      const er = (room.r - shrink) * 0.924;
+      return { minX: room.cx - er, maxX: room.cx + er, minY: room.cy - er, maxY: room.cy + er };
+    }
+    return {
+      minX: room.cx - room.w / 2 + shrink, maxX: room.cx + room.w / 2 - shrink,
+      minY: room.cy - room.h / 2 + shrink, maxY: room.cy + room.h / 2 - shrink,
+    };
+  }
+  function bboxOverlap(a, b, margin = 0) {
+    return !(a.maxX + margin < b.minX || b.maxX + margin < a.minX ||
+             a.maxY + margin < b.minY || b.maxY + margin < a.minY);
+  }
+
+  // -------- 1. place rooms --------
+  const rooms = [];
+  const PLACE_R = 1500;
+  const MARGIN = 96;
+  function tryPlace(maker, attempts = 200) {
+    for (let i = 0; i < attempts; i++) {
+      const r = maker();
+      const bb = roomBBox(r);
+      if (bb.minX < -PLACE_R || bb.maxX > PLACE_R || bb.minY < -PLACE_R || bb.maxY > PLACE_R) continue;
+      if (rooms.some(o => bboxOverlap(roomBBox(o), bb, MARGIN))) continue;
+      rooms.push(r);
+      return true;
+    }
+    return false;
+  }
+  // 4 square rooms, sizes 512–1024 (combat-room canon)
+  for (let i = 0; i < 4; i++) {
+    tryPlace(() => ({
+      type: 'square',
+      cx: sn((rand() - 0.5) * 2 * PLACE_R),
+      cy: sn((rand() - 0.5) * 2 * PLACE_R),
+      w: (8 + Math.floor(rand() * 9)) * 64,
+      h: (8 + Math.floor(rand() * 9)) * 64,
+    }));
+  }
+  // 2 octagon rooms (radius 384–576 keeps doorways ≥ 64 long)
+  for (let i = 0; i < 2; i++) {
+    tryPlace(() => ({
+      type: 'octagon',
+      cx: sn((rand() - 0.5) * 2 * PLACE_R),
+      cy: sn((rand() - 0.5) * 2 * PLACE_R),
+      r: (6 + Math.floor(rand() * 4)) * 64,
+    }));
+  }
+  if (rooms.length < 3) {
+    [{ cx: -512, cy: 0 }, { cx: 512, cy: 0 }, { cx: 0, cy: 512 }, { cx: 0, cy: -512 }].forEach(p => {
+      const r = { type: 'square', cx: p.cx, cy: p.cy, w: 512, h: 512 };
+      if (!rooms.some(o => bboxOverlap(roomBBox(o), roomBBox(r), MARGIN))) rooms.push(r);
+    });
+  }
+
+  // -------- 2. pairwise corridor feasibility --------
+  const ends = co => co.orient === 'H' ? [co.wIdx, co.eIdx] : [co.sIdx, co.nIdx];
+  function tryCorridor(ai, bi) {
+    const ra = rooms[ai], rb = rooms[bi];
+    const ba = roomBBox(ra), bb = roomBBox(rb);
+    // horizontal corridor: rooms X-separated, Y-overlap ≥ CW + 96 margin
+    if (ba.maxX + 64 < bb.minX || bb.maxX + 64 < ba.minX) {
+      const west = ba.maxX < bb.minX ? ra : rb;
+      const east = ba.maxX < bb.minX ? rb : ra;
+      const wbb = roomBBox(west), ebb = roomBBox(east);
+      const yLow = Math.max(wbb.minY, ebb.minY) + 96;  // keep doorways away from corners
+      const yHigh = Math.min(wbb.maxY, ebb.maxY) - 96;
+      if (yHigh - yLow >= CW) {
+        const cy = sn((yLow + yHigh) / 2);
+        const co = {
+          orient: 'H', wIdx: rooms.indexOf(west), eIdx: rooms.indexOf(east),
+          minX: wbb.maxX, maxX: ebb.minX, minY: cy - CW / 2, maxY: cy + CW / 2,
+        };
+        const blocked = rooms.some((r, idx) =>
+          idx !== co.wIdx && idx !== co.eIdx && bboxOverlap(roomBBox(r), co, 16));
+        if (!blocked) return co;
       }
     }
-  }
-  if (cells.length < 3) {
-    cells.length = 0; placed.clear();
-    enqueue(0, 0); enqueue(1, 0); enqueue(0, 1); enqueue(1, 1);
-  }
-
-  const offset = -((GRID - 1) * CELL) / 2;
-  cells.forEach((c, idx) => {
-    c.idx = idx;
-    c.cx = offset + c.i * CELL;
-    c.cy = offset + c.j * CELL;
-    c.minX = c.cx - ROOM / 2; c.maxX = c.cx + ROOM / 2;
-    c.minY = c.cy - ROOM / 2; c.maxY = c.cy + ROOM / 2;
-    c.corridors = { N: [], S: [], E: [], W: [] };
-  });
-
-  // Adjacency edges between grid-neighbour cells.
-  const adj = [];
-  for (let a = 0; a < cells.length; a++) for (let b = a + 1; b < cells.length; b++) {
-    const A = cells[a], B = cells[b];
-    if (Math.abs(A.i - B.i) === 1 && A.j === B.j) adj.push({ a, b, dir: 'EW' });
-    else if (Math.abs(A.j - B.j) === 1 && A.i === B.i) adj.push({ a, b, dir: 'NS' });
-  }
-  // Random spanning tree to guarantee connectedness.
-  const connected = new Set([0]);
-  const tree = [];
-  let safety = adj.length + 8;
-  while (connected.size < cells.length && safety-- > 0) {
-    const cands = adj.filter(e => connected.has(e.a) !== connected.has(e.b));
-    if (!cands.length) break;
-    const p = cands[Math.floor(rand() * cands.length)];
-    tree.push(p);
-    connected.add(p.a); connected.add(p.b);
-  }
-  // Optional cycle edges (loops) for non-tree adjacencies.
-  for (const e of adj) { if (!tree.includes(e) && rand() < 0.25) tree.push(e); }
-
-  // Define corridors and mark which side of each room they enter.
-  const corridors = [];
-  for (const e of tree) {
-    const A = cells[e.a], B = cells[e.b];
-    if (e.dir === 'EW') {
-      const west = A.cx < B.cx ? A : B;
-      const east = A.cx < B.cx ? B : A;
-      const mid = (Math.max(west.minY, east.minY) + Math.min(west.maxY, east.maxY)) / 2;
-      const co = {
-        minX: west.maxX, maxX: east.minX,
-        minY: mid - CW / 2, maxY: mid + CW / 2,
-        orient: 'H', west, east,
-      };
-      corridors.push(co);
-      west.corridors.E.push({ a: co.minY, b: co.maxY, corridor: co });
-      east.corridors.W.push({ a: co.minY, b: co.maxY, corridor: co });
-    } else {
-      const south = A.cy < B.cy ? A : B;
-      const north = A.cy < B.cy ? B : A;
-      const mid = (Math.max(south.minX, north.minX) + Math.min(south.maxX, north.maxX)) / 2;
-      const co = {
-        minX: mid - CW / 2, maxX: mid + CW / 2,
-        minY: south.maxY, maxY: north.minY,
-        orient: 'V', south, north,
-      };
-      corridors.push(co);
-      south.corridors.N.push({ a: co.minX, b: co.maxX, corridor: co });
-      north.corridors.S.push({ a: co.minX, b: co.maxX, corridor: co });
+    if (ba.maxY + 64 < bb.minY || bb.maxY + 64 < ba.minY) {
+      const south = ba.maxY < bb.minY ? ra : rb;
+      const north = ba.maxY < bb.minY ? rb : ra;
+      const sbb = roomBBox(south), nbb = roomBBox(north);
+      const xLow = Math.max(sbb.minX, nbb.minX) + 96;
+      const xHigh = Math.min(sbb.maxX, nbb.maxX) - 96;
+      if (xHigh - xLow >= CW) {
+        const cx = sn((xLow + xHigh) / 2);
+        const co = {
+          orient: 'V', sIdx: rooms.indexOf(south), nIdx: rooms.indexOf(north),
+          minX: cx - CW / 2, maxX: cx + CW / 2, minY: sbb.maxY, maxY: nbb.minY,
+        };
+        const blocked = rooms.some((r, idx) =>
+          idx !== co.sIdx && idx !== co.nIdx && bboxOverlap(roomBBox(r), co, 16));
+        if (!blocked) return co;
+      }
     }
+    return null;
+  }
+  const possible = [];
+  for (let a = 0; a < rooms.length; a++) for (let b = a + 1; b < rooms.length; b++) {
+    const co = tryCorridor(a, b);
+    if (co) possible.push(co);
   }
 
-  // Allocate sector IDs up front so corridor sectors can be referenced when
-  // building room walls (and vice-versa).
-  const sectors = [];
-  const ROOM_FLOORS = ['FLOOR0_1', 'FLOOR5_1', 'FLAT5_3', 'CEIL3_5', 'FLOOR3_3'];
-  const ROOM_CEILS = ['CEIL3_5', 'CEIL1_1', 'TLITE6_1', 'CEIL5_2'];
-  const CORRIDOR_FLOORS = ['FLOOR4_8', 'FLAT5', 'STEP1', 'FLOOR0_3'];
-  cells.forEach(c => {
-    const id = 's' + sectors.length;
-    c.sectorId = id;
-    sectors.push({
-      id, floorH: 0, ceilH: 128 + Math.floor(rand() * 3) * 32,
-      floorTex: pick(ROOM_FLOORS), ceilTex: pick(ROOM_CEILS),
-      light: 128 + Math.floor(rand() * 8) * 12,
-      special: 0, tag: 0,
+  // -------- 3. spanning tree + chord edges for multi-route --------
+  const corridors = [];
+  const connected = new Set([0]);
+  let safety = 50;
+  while (connected.size < rooms.length && safety-- > 0) {
+    const cands = possible.filter(co => {
+      const [a, b] = ends(co);
+      return connected.has(a) !== connected.has(b) && !corridors.includes(co);
     });
+    if (!cands.length) break;
+    const chosen = cands[Math.floor(rand() * cands.length)];
+    corridors.push(chosen);
+    const [a, b] = ends(chosen);
+    connected.add(a); connected.add(b);
+  }
+  for (const co of possible) {
+    if (corridors.includes(co)) continue;
+    const [a, b] = ends(co);
+    const dup = corridors.some(t => {
+      const [ta, tb] = ends(t);
+      return (ta === a && tb === b) || (ta === b && tb === a);
+    });
+    if (!dup && rand() < 0.6) corridors.push(co);
+  }
+
+  // -------- 4. room properties --------
+  // Palettes lifted from research: techbase / industrial / metal / hellstone /
+  // wood / gray. Floor flat change requires height change ±8 (Romero), so the
+  // trim ring's +8 step and different floor tex pair satisfies this rule.
+  const PALETTES = [
+    { wall: 'STARTAN2', floor: 'FLOOR0_1', ceil: 'CEIL3_5', trim: 'FLOOR4_8', accent: 'TLITE6_1' },
+    { wall: 'BROWN1',   floor: 'FLOOR4_8', ceil: 'CEIL5_2', trim: 'FLAT5_4',  accent: 'CEIL1_2' },
+    { wall: 'METAL',    floor: 'FLOOR0_3', ceil: 'CEIL3_2', trim: 'CRATOP1',  accent: 'TLITE6_5' },
+    { wall: 'STONE2',   floor: 'RROCK11',  ceil: 'CEIL3_3', trim: 'STEP2',    accent: 'FLAT5'    },
+    { wall: 'WOOD1',    floor: 'FLOOR5_2', ceil: 'CEIL5_1', trim: 'FLOOR5_4', accent: 'TLITE6_4' },
+    { wall: 'GRAY5',    floor: 'FLAT5_4',  ceil: 'CEIL3_1', trim: 'STEP1',    accent: 'TLITE6_6' },
+  ];
+  rooms.forEach((r) => {
+    r.palette = pick(PALETTES);
+    r.floorH = Math.floor(rand() * 4) * 8;                  // 0/8/16/24
+    r.ceilH = r.floorH + 128 + Math.floor(rand() * 3) * 32; // 128/160/192 above
+    r.light = pick([128, 144, 160, 176, 192]);
+    r.hasSky = rand() < 0.4;
+    if (r.hasSky) {
+      r.ceilH = r.floorH + 256;
+      r.light = pick([208, 224, 240]);
+    }
+    const roll = rand();
+    if (r.hasSky)          r.feature = 'sky';
+    else if (roll < 0.45)  r.feature = 'platform';
+    else if (roll < 0.6)   r.feature = 'pit';
+    else                   r.feature = 'none';
+    r.special = rand() < 0.15 ? 8 : (rand() < 0.06 ? 17 : 0);
   });
-  corridors.forEach(co => {
+
+  // -------- 5. constrain heights for traversal --------
+  for (let iter = 0; iter < 12; iter++) {
+    let changed = false;
+    for (const co of corridors) {
+      const [ai, bi] = ends(co);
+      const delta = Math.abs(rooms[ai].floorH - rooms[bi].floorH);
+      if (delta > MAX_STEP) {
+        const low = rooms[ai].floorH < rooms[bi].floorH ? rooms[ai] : rooms[bi];
+        low.floorH = Math.max(rooms[ai].floorH, rooms[bi].floorH) - MAX_STEP;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  // -------- 6. allocate sectors --------
+  const sectors = [];
+  const allocSec = (props) => {
     const id = 's' + sectors.length;
-    co.sectorId = id;
-    sectors.push({
-      id, floorH: 0, ceilH: 96,
-      floorTex: pick(CORRIDOR_FLOORS), ceilTex: 'CEIL3_5',
-      light: 96 + Math.floor(rand() * 5) * 12,
-      special: 0, tag: 0,
+    sectors.push({ id, floorH: 0, ceilH: 128, floorTex: 'FLOOR0_1', ceilTex: 'CEIL3_5',
+      light: 160, special: 0, tag: 0, ...props });
+    return id;
+  };
+
+  rooms.forEach((r) => {
+    // Trim ring (donut) – ALWAYS present. Outer surface of the room visible
+    // to corridors. Walks the outer wall path.
+    r.trimId = allocSec({
+      floorH: r.floorH + 8, ceilH: r.ceilH,
+      floorTex: r.palette.trim, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+      light: Math.min(255, r.light + 8), special: 0,
+    });
+    // Main interior. If feature='none', this is a solid polygon. Else, it's
+    // a donut around the inner feature.
+    r.mainId = allocSec({
+      floorH: r.floorH, ceilH: r.ceilH,
+      floorTex: r.palette.floor, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+      light: r.light, special: r.special,
+    });
+    // Inner feature
+    if (r.feature === 'platform') {
+      r.featureId = allocSec({
+        floorH: r.floorH + 16, ceilH: r.ceilH,
+        floorTex: r.palette.accent, ceilTex: r.palette.accent,
+        light: Math.min(255, r.light + 32), special: 0,
+      });
+    } else if (r.feature === 'sky') {
+      r.featureId = allocSec({
+        floorH: r.floorH, ceilH: r.floorH + 384,
+        floorTex: r.palette.floor, ceilTex: 'F_SKY1',
+        light: Math.min(255, r.light + 32), special: 0,
+      });
+    } else if (r.feature === 'pit') {
+      r.featureId = allocSec({
+        floorH: r.floorH - 16, ceilH: r.ceilH,
+        floorTex: pick(['BLOOD1', 'NUKAGE1', 'LAVA1', 'FWATER1']),
+        ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+        light: Math.max(64, r.light - 24), special: r.feature === 'pit' ? 7 : 0,
+      });
+    }
+  });
+
+  // Corridors: floor = max of two rooms' floors, ceiling = floor + 96 (canon).
+  // Light 32 below the brighter neighbour for that "darker corridor → bright
+  // room" contrast (Romero's doorway-light-delta rule).
+  corridors.forEach((co) => {
+    const [ai, bi] = ends(co);
+    const ra = rooms[ai], rb = rooms[bi];
+    const fh = Math.max(ra.floorH, rb.floorH);
+    const baseLight = Math.max(ra.light, rb.light);
+    co.sectorId = allocSec({
+      floorH: fh, ceilH: fh + 96,
+      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      light: Math.max(96, baseLight - 48), special: 0,
     });
   });
 
-  // Build geometry directly.
+  // -------- 7. build geometry --------
   const vmap = new Map();
   const verts = [];
   const getV = (x, y) => {
@@ -810,151 +958,226 @@ function generateDungeon() {
     sidedefs.push({ id, xOff: 0, yOff: 0, upper: '-', lower: '-', middle: 'STARTAN2', sector: sectorId, ...props });
     return id;
   };
-
-  // Emit a wall segment. If sharedSector is provided, build it as a two-sided
-  // line with this sector on front and shared on back. If a line between the
-  // two vertices already exists (room emitted it; corridor revisiting), attach
-  // this side to the back if vacant.
-  function emitWall(x1, y1, x2, y2, sectorId, sharedSector = null) {
+  function emitWall(x1, y1, x2, y2, sectorId, sharedSector, props = {}) {
     const v1 = getV(x1, y1), v2 = getV(x2, y2);
-    if (v1 === v2) return;
+    if (v1 === v2) return null;
     const existing = linedefs.find(l =>
       (l.v1 === v1 && l.v2 === v2) || (l.v1 === v2 && l.v2 === v1));
     if (existing) {
-      // Already built (likely by the other side of a corridor opening).
-      // Attach this sector to the back if the line still has -1 there.
       if (existing.back === -1) {
-        existing.back = newSd(sectorId, { middle: '-' });
+        existing.back = newSd(sectorId, { middle: '-', ...props.backSide });
         existing.flags = (existing.flags | 4) & ~1;
       }
-      return;
+      return existing;
     }
-    const front = newSd(sectorId, { middle: sharedSector ? '-' : 'STARTAN2' });
-    const back = sharedSector ? newSd(sharedSector, { middle: '-' }) : -1;
-    linedefs.push({
+    const middle = sharedSector ? '-' : (props.middle ?? 'STARTAN2');
+    const front = newSd(sectorId, { middle, ...props.frontSide });
+    const back = sharedSector ? newSd(sharedSector, { middle: '-', ...props.backSide }) : -1;
+    const ld = {
       id: 'l' + linedefs.length,
       v1, v2,
       flags: sharedSector ? 4 : 1,
       special: 0, tag: 0, front, back,
-    });
+    };
+    linedefs.push(ld);
+    return ld;
   }
 
-  // Walk one side of a room CW (N: west→east, E: north→south, S: east→west,
-  // W: south→north), splitting at corridor entries.
-  function walkRoomSide(c, side) {
-    const entries = (c.corridors[side] || []).slice().sort((p, q) => p.a - q.a);
-    let sx, sy, ex, ey;
-    if (side === 'N')      { sx = c.minX; sy = c.maxY; ex = c.maxX; ey = c.maxY; }
-    else if (side === 'E') { sx = c.maxX; sy = c.maxY; ex = c.maxX; ey = c.minY; }
-    else if (side === 'S') { sx = c.maxX; sy = c.minY; ex = c.minX; ey = c.minY; }
-    else                   { sx = c.minX; sy = c.minY; ex = c.minX; ey = c.maxY; }
-    const isHoriz = side === 'N' || side === 'S';
-    const dir = isHoriz ? Math.sign(ex - sx) : Math.sign(ey - sy);
-    const start = isHoriz ? sx : sy;
-    const end = isHoriz ? ex : ey;
-    const ortho = isHoriz ? sy : sx;
-    const ordered = entries.slice().sort((p, q) => (p.a - q.a) * dir);
-    let pos = start;
-    for (const ent of ordered) {
-      const near = dir > 0 ? ent.a : ent.b;
-      const far  = dir > 0 ? ent.b : ent.a;
-      if (pos !== near) {
-        if (isHoriz) emitWall(pos, ortho, near, ortho, c.sectorId);
-        else         emitWall(ortho, pos, ortho, near, c.sectorId);
+  // Walk one outer edge, splitting at any corridor attachment that lies on
+  // axis-aligned segments matching the corridor's direction.
+  function emitOuterEdge(room, p1, p2) {
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const isHoriz = Math.abs(dy) < 0.5;
+    const isVert = Math.abs(dx) < 0.5;
+    // Attachments on this edge: corridors that touch this room and whose
+    // axis matches the edge's orientation, and whose attached cardinal side
+    // matches the edge's position.
+    const atts = [];
+    for (const co of corridors) {
+      let side = null, range = null, perp = null;
+      if (co.orient === 'H' && co.wIdx === rooms.indexOf(room)) {
+        side = 'E'; range = [co.minY, co.maxY]; perp = co.minX;
+      } else if (co.orient === 'H' && co.eIdx === rooms.indexOf(room)) {
+        side = 'W'; range = [co.minY, co.maxY]; perp = co.maxX;
+      } else if (co.orient === 'V' && co.sIdx === rooms.indexOf(room)) {
+        side = 'N'; range = [co.minX, co.maxX]; perp = co.minY;
+      } else if (co.orient === 'V' && co.nIdx === rooms.indexOf(room)) {
+        side = 'S'; range = [co.minX, co.maxX]; perp = co.maxY;
       }
-      if (isHoriz) emitWall(near, ortho, far, ortho, c.sectorId, ent.corridor.sectorId);
-      else         emitWall(ortho, near, ortho, far, c.sectorId, ent.corridor.sectorId);
-      pos = far;
+      if (!side) continue;
+      const edgeIsVert = isVert;
+      const sideExpectsVert = side === 'E' || side === 'W';
+      if (edgeIsVert !== sideExpectsVert) continue;
+      // Edge position must match perp coordinate
+      if (sideExpectsVert) {
+        if (Math.abs(p1.x - perp) > 0.5) continue;
+        // Edge y-span must contain the corridor y-range
+        const eMin = Math.min(p1.y, p2.y), eMax = Math.max(p1.y, p2.y);
+        if (range[0] < eMin - 0.5 || range[1] > eMax + 0.5) continue;
+      } else {
+        if (Math.abs(p1.y - perp) > 0.5) continue;
+        const eMin = Math.min(p1.x, p2.x), eMax = Math.max(p1.x, p2.x);
+        if (range[0] < eMin - 0.5 || range[1] > eMax + 0.5) continue;
+      }
+      atts.push({ a: range[0], b: range[1], corridor: co, edgeVert: sideExpectsVert });
     }
-    if (pos !== end) {
-      if (isHoriz) emitWall(pos, ortho, end, ortho, c.sectorId);
-      else         emitWall(ortho, pos, ortho, end, c.sectorId);
+    if (atts.length === 0) {
+      emitWall(p1.x, p1.y, p2.x, p2.y, room.trimId, null, { middle: room.palette.wall });
+      return;
+    }
+    const walkDir = isHoriz ? Math.sign(dx) : Math.sign(dy);
+    atts.sort((u, v) => (u.a - v.a) * walkDir);
+    let cur = isHoriz ? p1.x : p1.y;
+    const ortho = isHoriz ? p1.y : p1.x;
+    const end = isHoriz ? p2.x : p2.y;
+    for (const att of atts) {
+      const near = walkDir > 0 ? att.a : att.b;
+      const far = walkDir > 0 ? att.b : att.a;
+      if (Math.abs(cur - near) > 0.5) {
+        if (isHoriz) emitWall(cur, ortho, near, ortho, room.trimId, null, { middle: room.palette.wall });
+        else emitWall(ortho, cur, ortho, near, room.trimId, null, { middle: room.palette.wall });
+      }
+      if (isHoriz) emitWall(near, ortho, far, ortho, room.trimId, att.corridor.sectorId);
+      else emitWall(ortho, near, ortho, far, room.trimId, att.corridor.sectorId);
+      cur = far;
+    }
+    if (Math.abs(cur - end) > 0.5) {
+      if (isHoriz) emitWall(cur, ortho, end, ortho, room.trimId, null, { middle: room.palette.wall });
+      else emitWall(ortho, cur, ortho, end, room.trimId, null, { middle: room.palette.wall });
     }
   }
 
-  cells.forEach(c => { walkRoomSide(c, 'N'); walkRoomSide(c, 'E'); walkRoomSide(c, 'S'); walkRoomSide(c, 'W'); });
-
-  // Corridor walls. The two ends that connect to rooms revisit existing
-  // shared lines (no-op via the existing check). The two perpendicular ends
-  // are fresh solid walls.
-  corridors.forEach(co => {
-    if (co.orient === 'H') {
-      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId);                                  // N solid
-      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, co.east.sectorId);                // E shared
-      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId);                                  // S solid
-      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, co.west.sectorId);                // W shared
-    } else {
-      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, co.north.sectorId);               // N shared
-      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId);                                  // E solid
-      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, co.south.sectorId);               // S shared
-      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId);                                  // W solid
+  // For each room: outer polygon (CW walk, front=trim ring), then trim's
+  // inner edge (CCW walk around inner polygon, front=trim, back=main), then
+  // optional inner feature ring (CCW walk around feature polygon, front=main,
+  // back=feature).
+  rooms.forEach((room) => {
+    const outerCCW = roomPoly(room);
+    const outerCW = outerCCW.slice().reverse();
+    for (let i = 0; i < outerCW.length; i++) {
+      emitOuterEdge(room, outerCW[i], outerCW[(i + 1) % outerCW.length]);
+    }
+    // Trim inner ring
+    const trimInnerCCW = roomPoly(room, TRIM_W);
+    for (let i = 0; i < trimInnerCCW.length; i++) {
+      const p1 = trimInnerCCW[i], p2 = trimInnerCCW[(i + 1) % trimInnerCCW.length];
+      const ld = emitWall(p1.x, p1.y, p2.x, p2.y, room.trimId, room.mainId);
+      if (ld) {
+        // trim is +8 above main; back (main) sees a small step. Set lower
+        // texture on the BACK sidedef (the one facing the lower main floor).
+        const bs = sidedefs.find(s => s.id === ld.back);
+        if (bs) bs.lower = room.palette.trim;
+      }
+    }
+    // Inner feature ring
+    if (room.feature !== 'none') {
+      const featureCCW = roomPoly(room, TRIM_W + INNER_INSET);
+      for (let i = 0; i < featureCCW.length; i++) {
+        const p1 = featureCCW[i], p2 = featureCCW[(i + 1) % featureCCW.length];
+        const ld = emitWall(p1.x, p1.y, p2.x, p2.y, room.mainId, room.featureId);
+        if (ld && room.feature === 'platform') {
+          const bs = sidedefs.find(s => s.id === ld.back);
+          if (bs) bs.lower = room.palette.accent;
+        } else if (ld && room.feature === 'pit') {
+          const fs = sidedefs.find(s => s.id === ld.front);
+          if (fs) fs.lower = 'STEP1';
+        } else if (ld && room.feature === 'sky') {
+          // Sky column reaches higher than main ceiling — upper texture on
+          // main's side (front sidedef which faces main).
+          const fs = sidedefs.find(s => s.id === ld.front);
+          if (fs) fs.upper = room.palette.wall;
+        }
+      }
     }
   });
 
-  // Add door specials on the corridor's two shared edges. Find lines whose
-  // front/back sectors are (corridor, room) or (room, corridor) and mark them
-  // as DR-1 doors (and lower-unpegged so the side tracks don't slide).
+  // Corridor walls (excluding shared edges with rooms — already emitted)
+  corridors.forEach((co) => {
+    if (co.orient === 'H') {
+      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, null, { middle: 'STARTAN2' });
+      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, rooms[co.eIdx].trimId);
+      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, null, { middle: 'STARTAN2' });
+      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, rooms[co.wIdx].trimId);
+    } else {
+      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, rooms[co.nIdx].trimId);
+      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, null, { middle: 'STARTAN2' });
+      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, rooms[co.sIdx].trimId);
+      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, null, { middle: 'STARTAN2' });
+    }
+  });
+
+  // -------- 8. Apply door specials and door textures --------
+  // Door image: DOOR3 (64-wide canonical). Upper texture set on both sides.
+  // Corridor's perpendicular (track) walls: DOORTRAK + lower-unpegged so the
+  // texture doesn't move with the ceiling.
   const sdMap = new Map(sidedefs.map(s => [s.id, s]));
-  for (const co of corridors) {
+  corridors.forEach((co) => {
     for (const l of linedefs) {
       if (l.front === -1 || l.back === -1) continue;
       const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
       if (!fs || !bs) continue;
-      const sectorsTouched = new Set([fs.sector, bs.sector]);
-      if (!sectorsTouched.has(co.sectorId)) continue;
-      const otherSecId = fs.sector === co.sectorId ? bs.sector : fs.sector;
-      // Only mark doors at the room/corridor interface — not internal
-      // corridor walls (which would touch only the corridor sector).
-      if (otherSecId === co.sectorId) continue;
-      if (cells.find(c => c.sectorId === otherSecId)) {
-        l.special = 1; // DR Open Door
-        l.flags = (l.flags | 16); // lower-unpegged
-        fs.upper = 'BIGDOOR2'; bs.upper = 'BIGDOOR2';
-      }
+      const interfacesCorridor = (fs.sector === co.sectorId && rooms.some(r => r.trimId === bs.sector))
+                              || (bs.sector === co.sectorId && rooms.some(r => r.trimId === fs.sector));
+      if (!interfacesCorridor) continue;
+      l.special = 1; // DR Open Door
+      l.flags = (l.flags | 16); // lower-unpegged on the door face
+      const doorTex = (co.maxX - co.minX > 96 || co.maxY - co.minY > 96) ? 'BIGDOOR2' : 'DOOR3';
+      fs.upper = doorTex; bs.upper = doorTex;
     }
-  }
+    // The corridor's perpendicular-to-corridor walls are tracks. Set DOORTRAK +
+    // lower-unpegged so the side textures stay put when the door moves.
+    for (const l of linedefs) {
+      if (l.back !== -1) continue;
+      const fs = sdMap.get(l.front);
+      if (!fs || fs.sector !== co.sectorId) continue;
+      fs.middle = 'DOORTRAK';
+      l.flags = (l.flags | 16);
+    }
+  });
 
-  // Player start in cells[0]; exit in the cell furthest from start by grid
-  // distance. Light monsters and items elsewhere.
-  const things = [];
-  things.push({ id: 't0', x: cells[0].cx | 0, y: cells[0].cy | 0, angle: 90, type: 1, flags: 7 });
-  let exitIdx = -1, exitDist = -1;
-  for (let i = 1; i < cells.length; i++) {
-    const d = Math.abs(cells[i].i - cells[0].i) + Math.abs(cells[i].j - cells[0].j);
-    if (d > exitDist) { exitDist = d; exitIdx = i; }
-  }
+  // -------- 9. Place things --------
+  const things = [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
   const MONSTERS = [3001, 3002, 3004, 9, 3005];
   const ITEMS = [2007, 2008, 2011, 2014, 2018, 2002];
-  for (let i = 1; i < cells.length; i++) {
-    if (rand() < 0.65) {
+  // Vary monster count by room size — bigger rooms host more.
+  rooms.forEach((r, i) => {
+    if (i === 0) return; // start room empty
+    const bb = roomBBox(r);
+    const area = (bb.maxX - bb.minX) * (bb.maxY - bb.minY);
+    const monsterCount = Math.min(4, Math.floor(area / (300 * 300)) + (rand() < 0.4 ? 1 : 0));
+    for (let m = 0; m < monsterCount; m++) {
+      const off = 64 + rand() * 96;
+      const ang = rand() * Math.PI * 2;
       things.push({
         id: 't' + things.length,
-        x: cells[i].cx | 0, y: cells[i].cy | 0, angle: 0,
+        x: Math.round(r.cx + Math.cos(ang) * off),
+        y: Math.round(r.cy + Math.sin(ang) * off),
+        angle: Math.floor(rand() * 8) * 45,
         type: pick(MONSTERS), flags: 7,
       });
     }
-    if (rand() < 0.4) {
+    if (rand() < 0.55) {
       things.push({
         id: 't' + things.length,
-        x: (cells[i].cx + 48) | 0, y: (cells[i].cy + 48) | 0, angle: 0,
+        x: r.cx | 0, y: r.cy | 0, angle: 0,
         type: pick(ITEMS), flags: 7,
       });
     }
+  });
+  // Exit switch in the room furthest by Manhattan distance from start
+  let exitIdx = 0, exitDist = -1;
+  for (let i = 1; i < rooms.length; i++) {
+    const d = Math.abs(rooms[i].cx - rooms[0].cx) + Math.abs(rooms[i].cy - rooms[0].cy);
+    if (d > exitDist) { exitDist = d; exitIdx = i; }
   }
-  // Tag one corridor adjacent to the exit room as a switch-exit. Find any
-  // line that bounds the exit room and is one-sided (a solid wall) — turn
-  // it into an exit switch with a SW1EXIT texture.
-  if (exitIdx >= 0) {
-    const exitSecId = cells[exitIdx].sectorId;
-    const sdMap2 = new Map(sidedefs.map(s => [s.id, s]));
-    for (const l of linedefs) {
-      if (l.back !== -1) continue;
-      const fs = sdMap2.get(l.front);
-      if (!fs || fs.sector !== exitSecId) continue;
-      l.special = 11; // S1 Exit Level
-      fs.middle = 'SW1EXIT';
-      break;
-    }
+  const exitTrim = rooms[exitIdx].trimId;
+  for (const l of linedefs) {
+    if (l.back !== -1) continue;
+    const fs = sdMap.get(l.front);
+    if (!fs || fs.sector !== exitTrim) continue;
+    l.special = 11;
+    fs.middle = 'SW1EXIT';
+    break;
   }
 
   return { vertices: verts, linedefs, sidedefs, sectors, things };
@@ -2528,7 +2751,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.5</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.6</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -2621,6 +2844,12 @@ export default function WadEditor() {
           <div className="absolute top-2 left-2 px-2.5 py-1 rounded text-xs"
             style={{ background: COLORS.bgPanel + 'ee', border: '1px solid ' + COLORS.border, fontFamily: monoStack, color: COLORS.accent }}>
             {drawChain.length < 3 ? 'Tap to add line' : 'Tap start to close → sector'}
+          </div>
+        )}
+        {mode === 'build' && drawChain.length === 0 && !selection && !hint && (
+          <div className="absolute top-2 left-2 px-2.5 py-1 rounded text-xs"
+            style={{ background: COLORS.bgPanel + 'cc', border: '1px solid ' + COLORS.border, fontFamily: monoStack, color: COLORS.textDim }}>
+            Long-press to ✎ draw · ◉ thing · ◫ shape
           </div>
         )}
         {hint && (
@@ -3425,7 +3654,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.5</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.6</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

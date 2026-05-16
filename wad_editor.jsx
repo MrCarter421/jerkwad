@@ -519,6 +519,146 @@ function interiorStarter() {
   return m;
 }
 
+// Curated Doom texture list. Used by the texture picker; not exhaustive but
+// covers the textures real mappers reach for. Each entry is just the name
+// string — preview color comes from FLAT_COLORS for floors/ceilings and
+// from the wall-name heuristic for wall textures.
+const DOOM_TEXTURES = {
+  walls: [
+    'STARTAN1', 'STARTAN2', 'STARTAN3',
+    'BROWN1', 'BROWN144', 'BROWN96', 'BROWNGRN', 'BROWNHUG',
+    'METAL', 'METAL2', 'METAL3', 'METAL4', 'METAL5', 'METAL7',
+    'STONE', 'STONE2', 'STONE3', 'STONE4', 'STONE5', 'STONE6',
+    'WOOD1', 'WOOD3', 'WOOD5', 'WOOD9', 'WOODGARG',
+    'BIGDOOR1', 'BIGDOOR2', 'BIGDOOR3', 'BIGDOOR4', 'BIGDOOR5', 'BIGDOOR7',
+    'DOOR1', 'DOOR3', 'DOORBLU', 'DOORRED', 'DOORYEL', 'DOORTRAK',
+    'EXITDOOR', 'EXITSIGN', 'EXITSTON',
+    'SW1COMM', 'SW1STON1', 'SW1WOOD', 'SW1BRN1', 'SW2COMM', 'SW2STON1', 'SW2WOOD',
+    'GRAY1', 'GRAY2', 'GRAY4', 'GRAY5', 'GRAY7', 'GRAYBIG', 'GRAYTALL',
+    'COMPSTA1', 'COMPSTA2', 'COMPWERD', 'COMPBLUE', 'COMPSPAN',
+    'MIDGRATE', 'MIDBARS1', 'MIDBARS3', 'MIDBRN1', 'MIDSPACE',
+    'LITE3', 'LITE5', 'LITEBLU4', 'LITEMET', 'LITERED',
+    'SUPPORT2', 'SUPPORT3', 'SHAWN1', 'SHAWN2', 'SHAWN3',
+    'PIPE1', 'PIPE2', 'PIPE4', 'PIPE6',
+    'CRATE1', 'CRATE2', 'CRATELIT', 'CRATWIDE',
+    'SLADWALL', 'TANROCK2', 'TANROCK4', 'TANROCK5',
+  ],
+  floors: [
+    'FLOOR0_1', 'FLOOR0_2', 'FLOOR0_3', 'FLOOR0_5', 'FLOOR0_6', 'FLOOR0_7',
+    'FLOOR1_1', 'FLOOR1_6', 'FLOOR1_7',
+    'FLOOR3_3', 'FLOOR4_1', 'FLOOR4_5', 'FLOOR4_6', 'FLOOR4_8',
+    'FLOOR5_1', 'FLOOR5_2', 'FLOOR5_3', 'FLOOR5_4',
+    'FLOOR6_1', 'FLOOR6_2', 'FLOOR7_1', 'FLOOR7_2',
+    'FLAT1', 'FLAT2', 'FLAT3', 'FLAT4', 'FLAT5', 'FLAT5_4', 'FLAT8',
+    'FLAT9', 'FLAT10', 'FLAT14', 'FLAT17', 'FLAT19', 'FLAT22', 'FLAT23',
+    'MFLR8_1', 'MFLR8_2', 'MFLR8_3', 'MFLR8_4',
+    'GRASS1', 'GRASS2',
+    'NUKAGE1', 'BLOOD1', 'LAVA1', 'FWATER1',
+    'SLIME01', 'SLIME05', 'SLIME09', 'SLIME13',
+    'STEP1', 'STEP2',
+    'RROCK01', 'RROCK05', 'RROCK11', 'RROCK16', 'RROCK19',
+    'CRATOP1', 'CRATOP2',
+    'GATE1', 'GATE2', 'GATE3', 'GATE4',
+    'GRNROCK',
+  ],
+  ceilings: [
+    'CEIL1_1', 'CEIL1_2', 'CEIL1_3',
+    'CEIL3_1', 'CEIL3_2', 'CEIL3_3', 'CEIL3_4', 'CEIL3_5', 'CEIL3_6',
+    'CEIL4_1', 'CEIL4_2', 'CEIL4_3',
+    'CEIL5_1', 'CEIL5_2',
+    'TLITE6_1', 'TLITE6_4', 'TLITE6_5', 'TLITE6_6',
+    'F_SKY1',
+    'FLAT5_1', 'FLAT5_2',
+    'DEM1_1', 'DEM1_5',
+    'FLAT2', 'FLAT18', 'FLAT20',
+  ],
+};
+
+// Random map generator: scatter 4-8 child sectors inside an outdoor sandbox,
+// vary their heights/textures/lights, sprinkle monsters and items. Not a
+// dungeon graph — that's a separate feature — but a one-tap playable map.
+function generateRandomWorld() {
+  let m = outdoorStarter();
+  let seed = (Date.now() & 0x7fffffff) || 1;
+  const rand = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return (seed >>> 8) / 0xffffff;
+  };
+  const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+
+  const FLOOR_TEX = ['FLOOR0_1', 'FLOOR5_1', 'FLAT5_3', 'CEIL3_5', 'FLOOR3_3', 'FLOOR4_8', 'FLAT5_4'];
+  const CEIL_TEX = ['CEIL1_1', 'CEIL3_5', 'FLAT5', 'CEIL5_2', 'CEIL4_1', 'TLITE6_1'];
+  const WALL_TEX = ['STARTAN2', 'BROWN1', 'METAL', 'STONE2', 'STONE3', 'WOOD1', 'GRAY5', 'BROVINE2'];
+  const STEP_TEX = ['STEP1', 'STEP2'];
+
+  const MONSTERS = [3001, 3002, 3004, 9, 3005];
+  const ITEMS = [2007, 2008, 2011, 2014, 2015, 2018];
+
+  const placed = [];
+  const N_ROOMS = 4 + Math.floor(rand() * 5);
+  const MARGIN = 96;
+  const BOUND = 900;
+
+  for (let i = 0; i < N_ROOMS; i++) {
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const w = (3 + Math.floor(rand() * 8)) * 64;
+      const h = (3 + Math.floor(rand() * 8)) * 64;
+      const cx = Math.floor((rand() - 0.5) * 2 * (BOUND - w / 2) / 32) * 32;
+      const cy = Math.floor((rand() - 0.5) * 2 * (BOUND - h / 2) / 32) * 32;
+      if (Math.abs(cx) + w / 2 > BOUND || Math.abs(cy) + h / 2 > BOUND) continue;
+      const overlaps = placed.some(p =>
+        Math.abs(p.cx - cx) < (p.w + w) / 2 + MARGIN &&
+        Math.abs(p.cy - cy) < (p.h + h) / 2 + MARGIN);
+      if (overlaps) continue;
+
+      const floorH = Math.floor(rand() * 4) * 8;
+      const ceilH = 128 + Math.floor(rand() * 4) * 32;
+      const light = 96 + Math.floor(rand() * 13) * 12;
+      const result = stampShape(m, 32, rectVertices(cx, cy, w, h), {
+        floorH, ceilH, light,
+        floorTex: pick(FLOOR_TEX),
+        ceilTex: pick(CEIL_TEX),
+      });
+      if (!result) continue;
+
+      // Set wall middle texture on the new room's interior-facing sidedefs.
+      const wallTex = pick(WALL_TEX);
+      const lowerTex = pick(STEP_TEX);
+      const newSdIds = new Set(result.sidedefs
+        .filter(sd => !m.sidedefs.find(o => o.id === sd.id))
+        .map(sd => sd.id));
+      result.sidedefs = result.sidedefs.map(sd => {
+        if (!newSdIds.has(sd.id)) return sd;
+        // Two-sided pillar/room walls: middle stays '-', set lower for height step
+        return { ...sd, lower: lowerTex, upper: wallTex };
+      });
+      m = result;
+      placed.push({ cx, cy, w, h });
+      break;
+    }
+  }
+
+  // Sprinkle monsters and items.
+  if (placed.length > 0) {
+    const things = [...m.things];
+    for (let i = 0; i < placed.length * 2; i++) {
+      const room = placed[Math.floor(rand() * placed.length)];
+      const tx = Math.round((room.cx + (rand() - 0.5) * room.w * 0.55) / 16) * 16;
+      const ty = Math.round((room.cy + (rand() - 0.5) * room.h * 0.55) / 16) * 16;
+      const isMonster = rand() < 0.55;
+      const type = pick(isMonster ? MONSTERS : ITEMS);
+      things.push({
+        id: 't' + things.length,
+        x: tx, y: ty, angle: Math.floor(rand() * 8) * 45,
+        type, flags: 7,
+      });
+    }
+    m = { ...m, things };
+  }
+
+  return m;
+}
+
 // ============================================================================
 // GEOMETRY
 // ============================================================================
@@ -891,7 +1031,7 @@ function ngonVertices(cx, cy, r, n, rotation = 0) {
   }
   return out;
 }
-function stampShape(map, snap, worldPts) {
+function stampShape(map, snap, worldPts, overrides) {
   const snapped = worldPts.map(p => snap > 0
     ? { x: Math.round(p.x / snap) * snap, y: Math.round(p.y / snap) * snap }
     : { x: Math.round(p.x), y: Math.round(p.y) });
@@ -906,7 +1046,7 @@ function stampShape(map, snap, worldPts) {
   }
   chain.push(chain[0]);
   const stagedMap = { ...map, vertices: verts };
-  return buildSectorFromLoop(stagedMap, chain);
+  return buildSectorFromLoop(stagedMap, chain, overrides ? { overrides } : undefined);
 }
 
 // ============================================================================
@@ -1259,12 +1399,22 @@ export default function WadEditor() {
     updateMap(m => {
       let working = m;
       const stepW = w / n;
+      // Determine the base floor height from the sector under the stamp
+      // center. Each step's height must be set BEFORE buildSectorFromLoop
+      // resolves upper/lower textures, otherwise the step risers come out
+      // textureless (HOM) because textures are decided at the moment of
+      // sector creation, not patched in afterwards.
+      const baseLoops = buildSectorLoops(working);
+      const parentId = sectorAt(working, baseLoops, cx, cy);
+      const parent = parentId ? working.sectors.find(s => s.id === parentId) : null;
+      const baseFloor = parent?.floorH ?? 0;
       for (let i = 0; i < n; i++) {
         const px = cx - w / 2 + (i + 0.5) * stepW;
-        const result = stampShape(working, snap, rectVertices(px, cy, stepW, h));
+        const result = stampShape(working, snap, rectVertices(px, cy, stepW, h), {
+          floorH: baseFloor + (i + 1) * rise,
+          floorTex: 'STEP1',
+        });
         if (!result) continue;
-        result.sectors = result.sectors.map(s => s.id === result.createdSectorId
-          ? { ...s, floorH: s.floorH + (i + 1) * rise, floorTex: 'STEP1' } : s);
         working = result;
       }
       setHint('Stairs stamped (' + n + ' steps)');
@@ -1898,18 +2048,25 @@ export default function WadEditor() {
     setShareModal({ kind: 'manual', fileName });
   };
   const onNewMap = (kind = 'outdoor') => {
-    setDoc({ maps: { 'MAP01': kind === 'interior' ? interiorStarter() : outdoorStarter() }, currentMap: 'MAP01', fileName: 'untitled.wad' });
+    const fresh = kind === 'random' ? generateRandomWorld()
+      : kind === 'interior' ? interiorStarter()
+      : outdoorStarter();
+    setDoc({ maps: { 'MAP01': fresh }, currentMap: 'MAP01', fileName: 'untitled.wad' });
     setSelection(null); setDrawChain([]);
     setView({ x: 0, y: 0, zoom: kind === 'interior' ? 0.6 : 0.2 });
     setWelcomeOpen(false);
+    if (kind === 'random') setHint('Random world generated');
   };
   const addNewMapSlot = (kind = 'outdoor') => {
     setDoc(d => {
       let n = 1; while (d.maps['MAP' + String(n).padStart(2, '0')]) n++;
       const name = 'MAP' + String(n).padStart(2, '0');
-      return { ...d, maps: { ...d.maps, [name]: kind === 'interior' ? interiorStarter() : outdoorStarter() }, currentMap: name };
+      const fresh = kind === 'random' ? generateRandomWorld()
+        : kind === 'interior' ? interiorStarter() : outdoorStarter();
+      return { ...d, maps: { ...d.maps, [name]: fresh }, currentMap: name };
     });
     setMapMenuOpen(false);
+    if (kind === 'random') setHint('Random world generated');
   };
   const switchMap = (name) => {
     setDoc(d => ({ ...d, currentMap: name }));
@@ -2087,6 +2244,7 @@ export default function WadEditor() {
               ))}
               <button onClick={() => addNewMapSlot('outdoor')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber }}>+ outdoor map</button>
               <button onClick={() => addNewMapSlot('interior')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.accent }}>+ interior map</button>
+              <button onClick={() => addNewMapSlot('random')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚄ random world</button>
               <button onClick={() => {
                 let removed = 0;
                 updateMap(m => { const r = cleanPhantomSectors(m); removed = r.removed; return r.map; });
@@ -2254,7 +2412,9 @@ export default function WadEditor() {
       {shareModal && <ShareInstructions fileName={shareModal.fileName} onClose={() => setShareModal(null)} />}
       {welcomeOpen && (
         <WelcomeOverlay onOpen={() => fileInputRef.current?.click()}
-          onNewOutdoor={() => onNewMap('outdoor')} onNewInterior={() => onNewMap('interior')} />
+          onNewOutdoor={() => onNewMap('outdoor')}
+          onNewInterior={() => onNewMap('interior')}
+          onNewRandom={() => onNewMap('random')} />
       )}
     </div>
   );
@@ -2631,6 +2791,154 @@ function FieldNum({ label, value, onChange }) {
     </label>
   );
 }
+// Texture field: tap the value to open the picker modal. Keeps a manual
+// "type a name" input for power users who want a custom texture name.
+function FieldTexture({ label, value, kind, onChange }) {
+  const monoStack = "'JetBrains Mono', monospace";
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  return (
+    <>
+      <label className="flex items-center justify-between gap-2 py-1.5">
+        <span className="text-xs uppercase" style={{ color: COLORS.textDim, fontFamily: monoStack, letterSpacing: '0.08em' }}>
+          {label}
+        </span>
+        {editing ? (
+          <input type="text" value={value ?? ''} autoFocus
+            onBlur={() => setEditing(false)}
+            onChange={e => onChange(e.target.value.toUpperCase())}
+            className="px-2 py-1 rounded text-right"
+            style={{ width: 140, background: COLORS.bg, color: COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack, fontSize: 13, textTransform: 'uppercase' }}
+            maxLength={8} />
+        ) : (
+          <div className="flex items-center gap-1">
+            <button onClick={() => setPickerOpen(true)}
+              className="px-2 py-1 rounded text-right flex items-center gap-1.5"
+              style={{ width: 140, background: COLORS.bg, color: COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack, fontSize: 13 }}>
+              <TextureSwatch name={value || '-'} kind={kind} size={14} />
+              <span style={{ flex: 1, textAlign: 'right' }}>{value || '-'}</span>
+              <span style={{ color: COLORS.textDim }}>▾</span>
+            </button>
+            <button onClick={() => setEditing(true)}
+              style={{ padding: '4px 6px', color: COLORS.textDim, fontFamily: monoStack, fontSize: 11 }}>✎</button>
+          </div>
+        )}
+      </label>
+      {pickerOpen && (
+        <TexturePicker
+          kind={kind}
+          current={value}
+          onPick={(name) => { onChange(name); setPickerOpen(false); }}
+          onCancel={() => setPickerOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// Small swatch that previews a texture's appearance.
+function TextureSwatch({ name, kind, size = 32 }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cnv = ref.current;
+    if (!cnv) return;
+    cnv.width = size; cnv.height = size;
+    const ctx = cnv.getContext('2d');
+    if (kind === 'walls') {
+      ctx.fillStyle = wallSwatchColor(name);
+      ctx.fillRect(0, 0, size, size);
+    } else {
+      const tile = buildFlatCanvas(name);
+      if (tile) {
+        ctx.drawImage(tile, 0, 0, 64, 64, 0, 0, size, size);
+      } else {
+        ctx.fillStyle = '#444';
+        ctx.fillRect(0, 0, size, size);
+      }
+    }
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
+  }, [name, kind, size]);
+  return <canvas ref={ref} width={size} height={size} style={{ display: 'block', flexShrink: 0, borderRadius: 2 }} />;
+}
+
+function wallSwatchColor(name) {
+  if (!name || name === '-') return '#1a2030';
+  if (/^STARTAN/.test(name)) return '#7a8e8e';
+  if (/^BRO/.test(name)) return '#876544';
+  if (/^METAL/.test(name)) return '#5a5a5a';
+  if (/^STONE|^TANROCK/.test(name)) return '#8a8074';
+  if (/^WOOD/.test(name)) return '#8c5a2a';
+  if (/^GRAY/.test(name)) return '#9a9aa0';
+  if (/^BIGDOOR|^DOOR(?!TRAK)/.test(name)) return '#a08050';
+  if (/^DOORTRAK/.test(name)) return '#3a3024';
+  if (/^EXIT/.test(name)) return '#a07050';
+  if (/^SW[12]/.test(name)) return '#7e6a5a';
+  if (/^COMP/.test(name)) return '#3a5070';
+  if (/^MID/.test(name)) return '#666688';
+  if (/^LITE/.test(name)) return '#c8b878';
+  if (/^SUPPORT|^SHAWN/.test(name)) return '#6a6a6a';
+  if (/^PIPE/.test(name)) return '#3a3a3a';
+  if (/^CRAT/.test(name)) return '#a07c44';
+  if (/^SLAD/.test(name)) return '#506050';
+  return '#7a7a7a';
+}
+
+function TexturePicker({ kind, current, onPick, onCancel }) {
+  const monoStack = "'JetBrains Mono', monospace";
+  const [tab, setTab] = useState(kind || 'walls');
+  const [filter, setFilter] = useState('');
+  const list = (DOOM_TEXTURES[tab] || []).filter(n =>
+    !filter || n.toLowerCase().includes(filter.toLowerCase()));
+  return (
+    <div className="absolute inset-0 z-50 flex items-end" style={{ background: '#000a' }} onClick={onCancel}>
+      <div className="w-full rounded-t-lg flex flex-col"
+        style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border, maxHeight: '80%', paddingBottom: 'env(safe-area-inset-bottom)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 border-b flex items-center justify-between" style={{ borderColor: COLORS.border }}>
+          <div>
+            <div style={{ color: COLORS.amber, fontFamily: monoStack, fontSize: 13 }}>TEXTURE</div>
+            <div style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 10 }}>current: {current || '-'}</div>
+          </div>
+          <button onClick={() => onPick('-')} style={{ color: COLORS.danger, fontFamily: monoStack, fontSize: 11, padding: '4px 8px' }}>CLEAR (-)</button>
+          <button onClick={onCancel} style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 11, padding: '4px 8px' }}>CLOSE</button>
+        </div>
+        <div className="flex gap-1 p-2 border-b" style={{ borderColor: COLORS.border, flexShrink: 0 }}>
+          {['walls', 'floors', 'ceilings'].map(t => (
+            <button key={t} onClick={() => setTab(t)}
+              className="px-3 py-1 rounded text-xs"
+              style={{
+                background: tab === t ? COLORS.amber : 'transparent',
+                color: tab === t ? COLORS.bg : COLORS.text,
+                border: '1px solid ' + (tab === t ? COLORS.amber : COLORS.border),
+                fontFamily: monoStack, textTransform: 'uppercase', letterSpacing: '0.06em'
+              }}>{t}</button>
+          ))}
+          <input type="text" value={filter} onChange={e => setFilter(e.target.value)}
+            placeholder="filter…"
+            style={{ flex: 1, marginLeft: 8, background: COLORS.bg, color: COLORS.text, border: '1px solid ' + COLORS.border, borderRadius: 4, padding: '4px 8px', fontFamily: monoStack, fontSize: 12 }} />
+        </div>
+        <div className="flex-1 overflow-y-auto p-2">
+          <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(96px, 1fr))', gap: 6 }}>
+            {list.map(name => (
+              <button key={name} onClick={() => onPick(name)}
+                className="flex flex-col items-center gap-1 p-2 rounded"
+                style={{
+                  background: name === current ? COLORS.bgPanel2 : COLORS.bg,
+                  border: '1px solid ' + (name === current ? COLORS.amber : COLORS.border),
+                  fontFamily: monoStack,
+                }}>
+                <TextureSwatch name={name} kind={tab} size={56} />
+                <span style={{ fontSize: 9, color: COLORS.text, letterSpacing: '0.02em' }}>{name}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function FieldText({ label, value, onChange }) {
   return (
     <label className="flex items-center justify-between gap-2 py-1.5">
@@ -2684,9 +2992,9 @@ function SidedefFields({ sd, onChange }) {
   const monoStack = "'JetBrains Mono', monospace";
   return (
     <div style={{ paddingLeft: 4 }}>
-      <FieldText label="Upper" value={sd.upper} onChange={v => onChange({ upper: v })} />
-      <FieldText label="Middle" value={sd.middle} onChange={v => onChange({ middle: v })} />
-      <FieldText label="Lower" value={sd.lower} onChange={v => onChange({ lower: v })} />
+      <FieldTexture label="Upper" kind="walls" value={sd.upper} onChange={v => onChange({ upper: v })} />
+      <FieldTexture label="Middle" kind="walls" value={sd.middle} onChange={v => onChange({ middle: v })} />
+      <FieldTexture label="Lower" kind="walls" value={sd.lower} onChange={v => onChange({ lower: v })} />
       <div className="grid grid-cols-2 gap-2">
         <FieldNum label="X Off" value={sd.xOff} onChange={v => onChange({ xOff: v })} />
         <FieldNum label="Y Off" value={sd.yOff} onChange={v => onChange({ yOff: v })} />
@@ -2699,8 +3007,8 @@ function SectorFields({ obj, onChange }) {
   return (<>
     <FieldNum label="Floor H" value={obj.floorH} onChange={v => onChange({ floorH: v })} />
     <FieldNum label="Ceil H" value={obj.ceilH} onChange={v => onChange({ ceilH: v })} />
-    <FieldText label="Floor Tex" value={obj.floorTex} onChange={v => onChange({ floorTex: v })} />
-    <FieldText label="Ceil Tex" value={obj.ceilTex} onChange={v => onChange({ ceilTex: v })} />
+    <FieldTexture label="Floor Tex" kind="floors" value={obj.floorTex} onChange={v => onChange({ floorTex: v })} />
+    <FieldTexture label="Ceil Tex" kind="ceilings" value={obj.ceilTex} onChange={v => onChange({ ceilTex: v })} />
     <FieldNum label="Light" value={obj.light} onChange={v => onChange({ light: Math.max(0, Math.min(255, v)) })} />
     <FieldNum label="Special" value={obj.special} onChange={v => onChange({ special: v })} />
     <FieldNum label="Tag" value={obj.tag} onChange={v => onChange({ tag: v })} />
@@ -2800,7 +3108,7 @@ function ShareInstructions({ fileName, onClose }) {
   );
 }
 
-function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior }) {
+function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom }) {
   const monoStack = "'JetBrains Mono', monospace";
   return (
     <div className="absolute inset-0 z-40 flex items-center justify-center px-6"
@@ -2810,11 +3118,13 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior }) {
         <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.4</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
-          Build mode draws lines, closes them into sectors. Long-press for radial menus. Two-finger tap = undo. Stamps add prefabs.
+          Long-press for menus. Two-finger tap = undo. Random world drops a playable map in one tap.
         </div>
         <div className="flex flex-col gap-2">
-          <button onClick={onNewOutdoor} className="py-3 rounded font-semibold"
-            style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · OUTDOOR</button>
+          <button onClick={onNewRandom} className="py-3 rounded font-semibold"
+            style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>⚄ RANDOM WORLD</button>
+          <button onClick={onNewOutdoor} className="py-2.5 rounded font-semibold"
+            style={{ background: 'transparent', color: COLORS.amber, border: '1px solid ' + COLORS.amber, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · OUTDOOR</button>
           <button onClick={onNewInterior} className="py-2.5 rounded font-semibold"
             style={{ background: 'transparent', color: COLORS.accent, border: '1px solid ' + COLORS.accent, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · INTERIOR</button>
           <button onClick={onOpen} className="py-2 rounded"

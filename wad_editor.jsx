@@ -659,6 +659,269 @@ function generateRandomWorld() {
   return m;
 }
 
+// Dungeon generator: an enclosed network of rectangular rooms connected by
+// narrow corridors. Unlike generateRandomWorld (which scatters rooms inside
+// an outdoor sandbox), the dungeon has no outer accessible area — the player
+// can only traverse rooms and corridors. Geometry is constructed directly
+// (not via buildSectorFromLoop) so corridor entries can split room walls
+// cleanly into wall + opening + wall segments without phantom-sector risk.
+function generateDungeon() {
+  let seed = (Date.now() & 0x7fffffff) || 1;
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
+  const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+
+  const GRID = 4;
+  const CELL = 512;
+  const ROOM = 384;
+  const CW = 64;
+
+  const cells = [];
+  for (let i = 0; i < GRID; i++) for (let j = 0; j < GRID; j++) {
+    if (rand() > 0.35) cells.push({ i, j });
+  }
+  if (cells.length < 3) {
+    cells.length = 0;
+    cells.push({ i: 0, j: 0 }, { i: 1, j: 0 }, { i: 0, j: 1 }, { i: 1, j: 1 });
+  }
+
+  const offset = -((GRID - 1) * CELL) / 2;
+  cells.forEach((c, idx) => {
+    c.idx = idx;
+    c.cx = offset + c.i * CELL;
+    c.cy = offset + c.j * CELL;
+    c.minX = c.cx - ROOM / 2; c.maxX = c.cx + ROOM / 2;
+    c.minY = c.cy - ROOM / 2; c.maxY = c.cy + ROOM / 2;
+    c.corridors = { N: [], S: [], E: [], W: [] };
+  });
+
+  // Adjacency edges between grid-neighbour cells.
+  const adj = [];
+  for (let a = 0; a < cells.length; a++) for (let b = a + 1; b < cells.length; b++) {
+    const A = cells[a], B = cells[b];
+    if (Math.abs(A.i - B.i) === 1 && A.j === B.j) adj.push({ a, b, dir: 'EW' });
+    else if (Math.abs(A.j - B.j) === 1 && A.i === B.i) adj.push({ a, b, dir: 'NS' });
+  }
+  // Random spanning tree to guarantee connectedness.
+  const connected = new Set([0]);
+  const tree = [];
+  let safety = adj.length + 8;
+  while (connected.size < cells.length && safety-- > 0) {
+    const cands = adj.filter(e => connected.has(e.a) !== connected.has(e.b));
+    if (!cands.length) break;
+    const p = cands[Math.floor(rand() * cands.length)];
+    tree.push(p);
+    connected.add(p.a); connected.add(p.b);
+  }
+  // Optional cycle edges (loops) for non-tree adjacencies.
+  for (const e of adj) { if (!tree.includes(e) && rand() < 0.25) tree.push(e); }
+
+  // Define corridors and mark which side of each room they enter.
+  const corridors = [];
+  for (const e of tree) {
+    const A = cells[e.a], B = cells[e.b];
+    if (e.dir === 'EW') {
+      const west = A.cx < B.cx ? A : B;
+      const east = A.cx < B.cx ? B : A;
+      const mid = (Math.max(west.minY, east.minY) + Math.min(west.maxY, east.maxY)) / 2;
+      const co = {
+        minX: west.maxX, maxX: east.minX,
+        minY: mid - CW / 2, maxY: mid + CW / 2,
+        orient: 'H', west, east,
+      };
+      corridors.push(co);
+      west.corridors.E.push({ a: co.minY, b: co.maxY, corridor: co });
+      east.corridors.W.push({ a: co.minY, b: co.maxY, corridor: co });
+    } else {
+      const south = A.cy < B.cy ? A : B;
+      const north = A.cy < B.cy ? B : A;
+      const mid = (Math.max(south.minX, north.minX) + Math.min(south.maxX, north.maxX)) / 2;
+      const co = {
+        minX: mid - CW / 2, maxX: mid + CW / 2,
+        minY: south.maxY, maxY: north.minY,
+        orient: 'V', south, north,
+      };
+      corridors.push(co);
+      south.corridors.N.push({ a: co.minX, b: co.maxX, corridor: co });
+      north.corridors.S.push({ a: co.minX, b: co.maxX, corridor: co });
+    }
+  }
+
+  // Allocate sector IDs up front so corridor sectors can be referenced when
+  // building room walls (and vice-versa).
+  const sectors = [];
+  const ROOM_FLOORS = ['FLOOR0_1', 'FLOOR5_1', 'FLAT5_3', 'CEIL3_5', 'FLOOR3_3'];
+  const ROOM_CEILS = ['CEIL3_5', 'CEIL1_1', 'TLITE6_1', 'CEIL5_2'];
+  const CORRIDOR_FLOORS = ['FLOOR4_8', 'FLAT5', 'STEP1', 'FLOOR0_3'];
+  cells.forEach(c => {
+    const id = 's' + sectors.length;
+    c.sectorId = id;
+    sectors.push({
+      id, floorH: 0, ceilH: 128 + Math.floor(rand() * 3) * 32,
+      floorTex: pick(ROOM_FLOORS), ceilTex: pick(ROOM_CEILS),
+      light: 128 + Math.floor(rand() * 8) * 12,
+      special: 0, tag: 0,
+    });
+  });
+  corridors.forEach(co => {
+    const id = 's' + sectors.length;
+    co.sectorId = id;
+    sectors.push({
+      id, floorH: 0, ceilH: 96,
+      floorTex: pick(CORRIDOR_FLOORS), ceilTex: 'CEIL3_5',
+      light: 96 + Math.floor(rand() * 5) * 12,
+      special: 0, tag: 0,
+    });
+  });
+
+  // Build geometry directly.
+  const vmap = new Map();
+  const verts = [];
+  const getV = (x, y) => {
+    x = Math.round(x); y = Math.round(y);
+    const k = x + ',' + y;
+    if (vmap.has(k)) return vmap.get(k);
+    const id = 'v' + verts.length;
+    vmap.set(k, id);
+    verts.push({ id, x, y });
+    return id;
+  };
+  const sidedefs = [];
+  const linedefs = [];
+  const newSd = (sectorId, props = {}) => {
+    const id = 'sd' + sidedefs.length;
+    sidedefs.push({ id, xOff: 0, yOff: 0, upper: '-', lower: '-', middle: 'STARTAN2', sector: sectorId, ...props });
+    return id;
+  };
+
+  // Emit a wall segment. If sharedSector is provided, build it as a two-sided
+  // line with this sector on front and shared on back. If a line between the
+  // two vertices already exists (room emitted it; corridor revisiting), attach
+  // this side to the back if vacant.
+  function emitWall(x1, y1, x2, y2, sectorId, sharedSector = null) {
+    const v1 = getV(x1, y1), v2 = getV(x2, y2);
+    if (v1 === v2) return;
+    const existing = linedefs.find(l =>
+      (l.v1 === v1 && l.v2 === v2) || (l.v1 === v2 && l.v2 === v1));
+    if (existing) {
+      // Already built (likely by the other side of a corridor opening).
+      // Attach this sector to the back if the line still has -1 there.
+      if (existing.back === -1) {
+        existing.back = newSd(sectorId, { middle: '-' });
+        existing.flags = (existing.flags | 4) & ~1;
+      }
+      return;
+    }
+    const front = newSd(sectorId, { middle: sharedSector ? '-' : 'STARTAN2' });
+    const back = sharedSector ? newSd(sharedSector, { middle: '-' }) : -1;
+    linedefs.push({
+      id: 'l' + linedefs.length,
+      v1, v2,
+      flags: sharedSector ? 4 : 1,
+      special: 0, tag: 0, front, back,
+    });
+  }
+
+  // Walk one side of a room CW (N: west→east, E: north→south, S: east→west,
+  // W: south→north), splitting at corridor entries.
+  function walkRoomSide(c, side) {
+    const entries = (c.corridors[side] || []).slice().sort((p, q) => p.a - q.a);
+    let sx, sy, ex, ey;
+    if (side === 'N')      { sx = c.minX; sy = c.maxY; ex = c.maxX; ey = c.maxY; }
+    else if (side === 'E') { sx = c.maxX; sy = c.maxY; ex = c.maxX; ey = c.minY; }
+    else if (side === 'S') { sx = c.maxX; sy = c.minY; ex = c.minX; ey = c.minY; }
+    else                   { sx = c.minX; sy = c.minY; ex = c.minX; ey = c.maxY; }
+    const isHoriz = side === 'N' || side === 'S';
+    const dir = isHoriz ? Math.sign(ex - sx) : Math.sign(ey - sy);
+    const start = isHoriz ? sx : sy;
+    const end = isHoriz ? ex : ey;
+    const ortho = isHoriz ? sy : sx;
+    const ordered = entries.slice().sort((p, q) => (p.a - q.a) * dir);
+    let pos = start;
+    for (const ent of ordered) {
+      const near = dir > 0 ? ent.a : ent.b;
+      const far  = dir > 0 ? ent.b : ent.a;
+      if (pos !== near) {
+        if (isHoriz) emitWall(pos, ortho, near, ortho, c.sectorId);
+        else         emitWall(ortho, pos, ortho, near, c.sectorId);
+      }
+      if (isHoriz) emitWall(near, ortho, far, ortho, c.sectorId, ent.corridor.sectorId);
+      else         emitWall(ortho, near, ortho, far, c.sectorId, ent.corridor.sectorId);
+      pos = far;
+    }
+    if (pos !== end) {
+      if (isHoriz) emitWall(pos, ortho, end, ortho, c.sectorId);
+      else         emitWall(ortho, pos, ortho, end, c.sectorId);
+    }
+  }
+
+  cells.forEach(c => { walkRoomSide(c, 'N'); walkRoomSide(c, 'E'); walkRoomSide(c, 'S'); walkRoomSide(c, 'W'); });
+
+  // Corridor walls. The two ends that connect to rooms revisit existing
+  // shared lines (no-op via the existing check). The two perpendicular ends
+  // are fresh solid walls.
+  corridors.forEach(co => {
+    if (co.orient === 'H') {
+      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId);                                  // N solid
+      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, co.east.sectorId);                // E shared
+      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId);                                  // S solid
+      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, co.west.sectorId);                // W shared
+    } else {
+      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, co.north.sectorId);               // N shared
+      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId);                                  // E solid
+      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, co.south.sectorId);               // S shared
+      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId);                                  // W solid
+    }
+  });
+
+  // Add door specials on the corridor's two shared edges. Find lines whose
+  // front/back sectors are (corridor, room) or (room, corridor) and mark them
+  // as DR-1 doors (and lower-unpegged so the side tracks don't slide).
+  const sdMap = new Map(sidedefs.map(s => [s.id, s]));
+  for (const co of corridors) {
+    for (const l of linedefs) {
+      if (l.front === -1 || l.back === -1) continue;
+      const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
+      if (!fs || !bs) continue;
+      const sectorsTouched = new Set([fs.sector, bs.sector]);
+      if (!sectorsTouched.has(co.sectorId)) continue;
+      const otherSecId = fs.sector === co.sectorId ? bs.sector : fs.sector;
+      // Only mark doors at the room/corridor interface — not internal
+      // corridor walls (which would touch only the corridor sector).
+      if (otherSecId === co.sectorId) continue;
+      if (cells.find(c => c.sectorId === otherSecId)) {
+        l.special = 1; // DR Open Door
+        l.flags = (l.flags | 16); // lower-unpegged
+        fs.upper = 'BIGDOOR2'; bs.upper = 'BIGDOOR2';
+      }
+    }
+  }
+
+  // Player start in first room. Monsters scattered in others; one Cyberdemon-
+  // free guarantee — keep it light for a one-tap dungeon.
+  const things = [];
+  things.push({ id: 't0', x: cells[0].cx | 0, y: cells[0].cy | 0, angle: 90, type: 1, flags: 7 });
+  const MONSTERS = [3001, 3002, 3004, 9, 3005];
+  const ITEMS = [2007, 2008, 2011, 2014, 2018];
+  for (let i = 1; i < cells.length; i++) {
+    if (rand() < 0.65) {
+      things.push({
+        id: 't' + things.length,
+        x: cells[i].cx | 0, y: cells[i].cy | 0, angle: 0,
+        type: pick(MONSTERS), flags: 7,
+      });
+    }
+    if (rand() < 0.4) {
+      things.push({
+        id: 't' + things.length,
+        x: (cells[i].cx + 48) | 0, y: (cells[i].cy + 48) | 0, angle: 0,
+        type: pick(ITEMS), flags: 7,
+      });
+    }
+  }
+
+  return { vertices: verts, linedefs, sidedefs, sectors, things };
+}
+
 // ============================================================================
 // GEOMETRY
 // ============================================================================
@@ -2048,25 +2311,29 @@ export default function WadEditor() {
     setShareModal({ kind: 'manual', fileName });
   };
   const onNewMap = (kind = 'outdoor') => {
-    const fresh = kind === 'random' ? generateRandomWorld()
+    const fresh = kind === 'dungeon' ? generateDungeon()
+      : kind === 'random' ? generateRandomWorld()
       : kind === 'interior' ? interiorStarter()
       : outdoorStarter();
     setDoc({ maps: { 'MAP01': fresh }, currentMap: 'MAP01', fileName: 'untitled.wad' });
     setSelection(null); setDrawChain([]);
-    setView({ x: 0, y: 0, zoom: kind === 'interior' ? 0.6 : 0.2 });
+    setView({ x: 0, y: 0, zoom: kind === 'interior' ? 0.6 : kind === 'dungeon' ? 0.18 : 0.2 });
     setWelcomeOpen(false);
     if (kind === 'random') setHint('Random world generated');
+    if (kind === 'dungeon') setHint('Dungeon generated');
   };
   const addNewMapSlot = (kind = 'outdoor') => {
     setDoc(d => {
       let n = 1; while (d.maps['MAP' + String(n).padStart(2, '0')]) n++;
       const name = 'MAP' + String(n).padStart(2, '0');
-      const fresh = kind === 'random' ? generateRandomWorld()
+      const fresh = kind === 'dungeon' ? generateDungeon()
+        : kind === 'random' ? generateRandomWorld()
         : kind === 'interior' ? interiorStarter() : outdoorStarter();
       return { ...d, maps: { ...d.maps, [name]: fresh }, currentMap: name };
     });
     setMapMenuOpen(false);
     if (kind === 'random') setHint('Random world generated');
+    if (kind === 'dungeon') setHint('Dungeon generated');
   };
   const switchMap = (name) => {
     setDoc(d => ({ ...d, currentMap: name }));
@@ -2245,6 +2512,7 @@ export default function WadEditor() {
               <button onClick={() => addNewMapSlot('outdoor')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber }}>+ outdoor map</button>
               <button onClick={() => addNewMapSlot('interior')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.accent }}>+ interior map</button>
               <button onClick={() => addNewMapSlot('random')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚄ random world</button>
+              <button onClick={() => addNewMapSlot('dungeon')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚔ random dungeon</button>
               <button onClick={() => {
                 let removed = 0;
                 updateMap(m => { const r = cleanPhantomSectors(m); removed = r.removed; return r.map; });
@@ -2414,7 +2682,8 @@ export default function WadEditor() {
         <WelcomeOverlay onOpen={() => fileInputRef.current?.click()}
           onNewOutdoor={() => onNewMap('outdoor')}
           onNewInterior={() => onNewMap('interior')}
-          onNewRandom={() => onNewMap('random')} />
+          onNewRandom={() => onNewMap('random')}
+          onNewDungeon={() => onNewMap('dungeon')} />
       )}
     </div>
   );
@@ -3108,7 +3377,7 @@ function ShareInstructions({ fileName, onClose }) {
   );
 }
 
-function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom }) {
+function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNewDungeon }) {
   const monoStack = "'JetBrains Mono', monospace";
   return (
     <div className="absolute inset-0 z-40 flex items-center justify-center px-6"
@@ -3118,17 +3387,19 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom }) {
         <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.4</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
-          Long-press for menus. Two-finger tap = undo. Random world drops a playable map in one tap.
+          Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.
         </div>
         <div className="flex flex-col gap-2">
-          <button onClick={onNewRandom} className="py-3 rounded font-semibold"
-            style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>⚄ RANDOM WORLD</button>
+          <button onClick={onNewDungeon} className="py-3 rounded font-semibold"
+            style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>⚔ RANDOM DUNGEON</button>
+          <button onClick={onNewRandom} className="py-2.5 rounded font-semibold"
+            style={{ background: 'transparent', color: COLORS.amber, border: '1px solid ' + COLORS.amber, fontFamily: monoStack, letterSpacing: '0.05em' }}>⚄ RANDOM WORLD</button>
           <button onClick={onNewOutdoor} className="py-2.5 rounded font-semibold"
-            style={{ background: 'transparent', color: COLORS.amber, border: '1px solid ' + COLORS.amber, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · OUTDOOR</button>
-          <button onClick={onNewInterior} className="py-2.5 rounded font-semibold"
-            style={{ background: 'transparent', color: COLORS.accent, border: '1px solid ' + COLORS.accent, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · INTERIOR</button>
+            style={{ background: 'transparent', color: COLORS.accent, border: '1px solid ' + COLORS.accent, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · OUTDOOR</button>
+          <button onClick={onNewInterior} className="py-2 rounded"
+            style={{ background: 'transparent', color: COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack, letterSpacing: '0.05em' }}>NEW · INTERIOR</button>
           <button onClick={onOpen} className="py-2 rounded"
-            style={{ background: 'transparent', color: COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack, letterSpacing: '0.05em' }}>OPEN .WAD</button>
+            style={{ background: 'transparent', color: COLORS.textDim, border: '1px solid ' + COLORS.border, fontFamily: monoStack, letterSpacing: '0.05em' }}>OPEN .WAD</button>
         </div>
       </div>
     </div>

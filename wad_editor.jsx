@@ -679,6 +679,7 @@ function generateDungeon() {
   const MAX_STEP = 24;     // Doom player can step up ≤24 without lift
   const CW = 64;           // canonical corridor width
   const TRIM_W = 16;       // perimeter trim ring width
+  const DOOR_THICK = 16;   // depth of the door body sector at each corridor end
   const INNER_INSET = 96;  // inner-feature inset from trim's inner edge
 
   // -------- polygon helpers --------
@@ -770,8 +771,8 @@ function generateDungeon() {
       const west = ba.maxX < bb.minX ? ra : rb;
       const east = ba.maxX < bb.minX ? rb : ra;
       const wbb = roomBBox(west), ebb = roomBBox(east);
-      const yLow = Math.max(wbb.minY, ebb.minY) + 96;  // keep doorways away from corners
-      const yHigh = Math.min(wbb.maxY, ebb.maxY) - 96;
+      const yLow = Math.max(wbb.minY, ebb.minY) + 64;
+      const yHigh = Math.min(wbb.maxY, ebb.maxY) - 64;
       if (yHigh - yLow >= CW) {
         const cy = sn((yLow + yHigh) / 2);
         const co = {
@@ -787,8 +788,8 @@ function generateDungeon() {
       const south = ba.maxY < bb.minY ? ra : rb;
       const north = ba.maxY < bb.minY ? rb : ra;
       const sbb = roomBBox(south), nbb = roomBBox(north);
-      const xLow = Math.max(sbb.minX, nbb.minX) + 96;
-      const xHigh = Math.min(sbb.maxX, nbb.maxX) - 96;
+      const xLow = Math.max(sbb.minX, nbb.minX) + 64;
+      const xHigh = Math.min(sbb.maxX, nbb.maxX) - 64;
       if (xHigh - xLow >= CW) {
         const cx = sn((xLow + xHigh) / 2);
         const co = {
@@ -888,39 +889,46 @@ function generateDungeon() {
   };
 
   rooms.forEach((r) => {
-    // Trim ring (donut) – ALWAYS present. Outer surface of the room visible
-    // to corridors. Walks the outer wall path.
-    r.trimId = allocSec({
-      floorH: r.floorH + 8, ceilH: r.ceilH,
-      floorTex: r.palette.trim, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
-      light: Math.min(255, r.light + 8), special: 0,
-    });
-    // Main interior. If feature='none', this is a solid polygon. Else, it's
-    // a donut around the inner feature.
-    r.mainId = allocSec({
+    // Number of concentric trim layers stepping up toward the centre.
+    r.trimLayers = 1 + Math.floor(rand() * 3);  // 1..3
+    // Outer sector: lowest floor, faces corridors. This is what doorways connect to.
+    r.outerId = allocSec({
       floorH: r.floorH, ceilH: r.ceilH,
       floorTex: r.palette.floor, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
       light: r.light, special: r.special,
     });
-    // Inner feature
+    // Concentric trim layers. Each layer steps up 8 units and uses the trim
+    // texture. Lower texture between layers is set automatically by the
+    // resolveTwoSidedTextures post-pass.
+    r.trimIds = [];
+    for (let i = 1; i <= r.trimLayers; i++) {
+      r.trimIds.push(allocSec({
+        floorH: r.floorH + i * 8, ceilH: r.ceilH,
+        floorTex: r.palette.trim,
+        ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+        light: Math.min(255, r.light + i * 6), special: 0,
+      }));
+    }
+    // Optional centre feature, sits inside the innermost trim.
+    const centerBaseFloor = r.floorH + (r.trimLayers + 1) * 8;
     if (r.feature === 'platform') {
       r.featureId = allocSec({
-        floorH: r.floorH + 16, ceilH: r.ceilH,
+        floorH: centerBaseFloor + 8, ceilH: r.ceilH,
         floorTex: r.palette.accent, ceilTex: r.palette.accent,
         light: Math.min(255, r.light + 32), special: 0,
       });
     } else if (r.feature === 'sky') {
       r.featureId = allocSec({
-        floorH: r.floorH, ceilH: r.floorH + 384,
+        floorH: centerBaseFloor, ceilH: r.floorH + 384,
         floorTex: r.palette.floor, ceilTex: 'F_SKY1',
-        light: Math.min(255, r.light + 32), special: 0,
+        light: Math.min(255, r.light + 48), special: 0,
       });
     } else if (r.feature === 'pit') {
       r.featureId = allocSec({
         floorH: r.floorH - 16, ceilH: r.ceilH,
         floorTex: pick(['BLOOD1', 'NUKAGE1', 'LAVA1', 'FWATER1']),
         ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
-        light: Math.max(64, r.light - 24), special: r.feature === 'pit' ? 7 : 0,
+        light: Math.max(64, r.light - 24), special: 7,
       });
     }
   });
@@ -933,10 +941,24 @@ function generateDungeon() {
     const ra = rooms[ai], rb = rooms[bi];
     const fh = Math.max(ra.floorH, rb.floorH);
     const baseLight = Math.max(ra.light, rb.light);
-    co.sectorId = allocSec({
+    // Main corridor body (the long middle section, ceil 96 above floor).
+    co.mainBodyId = allocSec({
       floorH: fh, ceilH: fh + 96,
       floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
       light: Math.max(96, baseLight - 48), special: 0,
+    });
+    // Two door body sectors, one at each end, 16 units thick. Closed state:
+    // ceil = floor. Player triggers DR-1 on the corridor-side face; door
+    // body's ceiling rises and the player can pass through to the room.
+    co.doorAId = allocSec({
+      floorH: fh, ceilH: fh,
+      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      light: Math.max(80, baseLight - 64), special: 0,
+    });
+    co.doorBId = allocSec({
+      floorH: fh, ceilH: fh,
+      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      light: Math.max(80, baseLight - 64), special: 0,
     });
   });
 
@@ -969,6 +991,7 @@ function generateDungeon() {
         existing.back = newSd(sectorId, { middle: '-', ...props.backSide });
         existing.flags = (existing.flags | 4) & ~1;
       }
+      if (props.flags) existing.flags |= props.flags;
       return existing;
     }
     const middle = sharedSector ? '-' : (props.middle ?? 'STARTAN2');
@@ -977,7 +1000,7 @@ function generateDungeon() {
     const ld = {
       id: 'l' + linedefs.length,
       v1, v2,
-      flags: sharedSector ? 4 : 1,
+      flags: (sharedSector ? 4 : 1) | (props.flags || 0),
       special: 0, tag: 0, front, back,
     };
     linedefs.push(ld);
@@ -1012,7 +1035,6 @@ function generateDungeon() {
       // Edge position must match perp coordinate
       if (sideExpectsVert) {
         if (Math.abs(p1.x - perp) > 0.5) continue;
-        // Edge y-span must contain the corridor y-range
         const eMin = Math.min(p1.y, p2.y), eMax = Math.max(p1.y, p2.y);
         if (range[0] < eMin - 0.5 || range[1] > eMax + 0.5) continue;
       } else {
@@ -1020,10 +1042,15 @@ function generateDungeon() {
         const eMin = Math.min(p1.x, p2.x), eMax = Math.max(p1.x, p2.x);
         if (range[0] < eMin - 0.5 || range[1] > eMax + 0.5) continue;
       }
-      atts.push({ a: range[0], b: range[1], corridor: co, edgeVert: sideExpectsVert });
+      // For corridor doorways, the segment shares with the adjacent DOOR BODY
+      // sector (not the corridor main body) so the door geometry frames the
+      // opening cleanly.
+      const isFirstRoom = (co.orient === 'H' ? co.wIdx : co.sIdx) === rooms.indexOf(room);
+      const doorBodyId = isFirstRoom ? co.doorAId : co.doorBId;
+      atts.push({ a: range[0], b: range[1], corridor: co, doorBodyId });
     }
     if (atts.length === 0) {
-      emitWall(p1.x, p1.y, p2.x, p2.y, room.trimId, null, { middle: room.palette.wall });
+      emitWall(p1.x, p1.y, p2.x, p2.y, room.outerId, null, { middle: room.palette.wall });
       return;
     }
     const walkDir = isHoriz ? Math.sign(dx) : Math.sign(dy);
@@ -1035,106 +1062,149 @@ function generateDungeon() {
       const near = walkDir > 0 ? att.a : att.b;
       const far = walkDir > 0 ? att.b : att.a;
       if (Math.abs(cur - near) > 0.5) {
-        if (isHoriz) emitWall(cur, ortho, near, ortho, room.trimId, null, { middle: room.palette.wall });
-        else emitWall(ortho, cur, ortho, near, room.trimId, null, { middle: room.palette.wall });
+        if (isHoriz) emitWall(cur, ortho, near, ortho, room.outerId, null, { middle: room.palette.wall });
+        else emitWall(ortho, cur, ortho, near, room.outerId, null, { middle: room.palette.wall });
       }
-      if (isHoriz) emitWall(near, ortho, far, ortho, room.trimId, att.corridor.sectorId);
-      else emitWall(ortho, near, ortho, far, room.trimId, att.corridor.sectorId);
+      // Doorway segment: two-sided room outer ↔ door body. Mark
+      // lower-unpegged because the door body's ceiling rises and we don't
+      // want the side textures to slide.
+      if (isHoriz) emitWall(near, ortho, far, ortho, room.outerId, att.doorBodyId, { flags: 16 });
+      else emitWall(ortho, near, ortho, far, room.outerId, att.doorBodyId, { flags: 16 });
       cur = far;
     }
     if (Math.abs(cur - end) > 0.5) {
-      if (isHoriz) emitWall(cur, ortho, end, ortho, room.trimId, null, { middle: room.palette.wall });
-      else emitWall(ortho, cur, ortho, end, room.trimId, null, { middle: room.palette.wall });
+      if (isHoriz) emitWall(cur, ortho, end, ortho, room.outerId, null, { middle: room.palette.wall });
+      else emitWall(ortho, cur, ortho, end, room.outerId, null, { middle: room.palette.wall });
     }
   }
 
-  // For each room: outer polygon (CW walk, front=trim ring), then trim's
-  // inner edge (CCW walk around inner polygon, front=trim, back=main), then
-  // optional inner feature ring (CCW walk around feature polygon, front=main,
-  // back=feature).
+  // For each room: outer polygon CW walk (with corridor cuts), then one ring
+  // per trim layer (CCW walk around the inset polygon, layer-N-1 on front,
+  // layer-N on back), then optional centre feature ring.
   rooms.forEach((room) => {
     const outerCCW = roomPoly(room);
     const outerCW = outerCCW.slice().reverse();
     for (let i = 0; i < outerCW.length; i++) {
       emitOuterEdge(room, outerCW[i], outerCW[(i + 1) % outerCW.length]);
     }
-    // Trim inner ring
-    const trimInnerCCW = roomPoly(room, TRIM_W);
-    for (let i = 0; i < trimInnerCCW.length; i++) {
-      const p1 = trimInnerCCW[i], p2 = trimInnerCCW[(i + 1) % trimInnerCCW.length];
-      const ld = emitWall(p1.x, p1.y, p2.x, p2.y, room.trimId, room.mainId);
-      if (ld) {
-        // trim is +8 above main; back (main) sees a small step. Set lower
-        // texture on the BACK sidedef (the one facing the lower main floor).
-        const bs = sidedefs.find(s => s.id === ld.back);
-        if (bs) bs.lower = room.palette.trim;
+    const layerIds = [room.outerId, ...room.trimIds];
+    // Ring i (1..trimLayers): between layer i-1 (outer-side) and layer i (inner-side).
+    for (let layer = 1; layer <= room.trimLayers; layer++) {
+      const ringPoly = roomPoly(room, TRIM_W * layer);
+      if (ringPoly.length < 3) break;
+      for (let j = 0; j < ringPoly.length; j++) {
+        const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+        // Walking CCW around the inset polygon: right of v1->v2 = outside
+        // inset = inside outer layer. emitWall(p1, p2, outerLayer, innerLayer)
+        // gives front=outerLayer, back=innerLayer.
+        emitWall(p1.x, p1.y, p2.x, p2.y, layerIds[layer - 1], layerIds[layer]);
       }
     }
-    // Inner feature ring
-    if (room.feature !== 'none') {
-      const featureCCW = roomPoly(room, TRIM_W + INNER_INSET);
-      for (let i = 0; i < featureCCW.length; i++) {
-        const p1 = featureCCW[i], p2 = featureCCW[(i + 1) % featureCCW.length];
-        const ld = emitWall(p1.x, p1.y, p2.x, p2.y, room.mainId, room.featureId);
-        if (ld && room.feature === 'platform') {
-          const bs = sidedefs.find(s => s.id === ld.back);
-          if (bs) bs.lower = room.palette.accent;
-        } else if (ld && room.feature === 'pit') {
-          const fs = sidedefs.find(s => s.id === ld.front);
-          if (fs) fs.lower = 'STEP1';
-        } else if (ld && room.feature === 'sky') {
-          // Sky column reaches higher than main ceiling — upper texture on
-          // main's side (front sidedef which faces main).
-          const fs = sidedefs.find(s => s.id === ld.front);
-          if (fs) fs.upper = room.palette.wall;
+    // Centre feature
+    if (room.feature !== 'none' && room.featureId) {
+      const ringPoly = roomPoly(room, TRIM_W * room.trimLayers + INNER_INSET);
+      if (ringPoly.length >= 3) {
+        const innerMost = layerIds[layerIds.length - 1];
+        for (let j = 0; j < ringPoly.length; j++) {
+          const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+          emitWall(p1.x, p1.y, p2.x, p2.y, innerMost, room.featureId);
         }
       }
     }
   });
 
-  // Corridor walls (excluding shared edges with rooms — already emitted)
+  // Corridor walls: three sectors per corridor — doorBodyA at one end, the
+  // main hallway body in the middle, and doorBodyB at the other end. Each
+  // door body is 16 deep with closed-state ceil=floor. Track walls
+  // (perpendicular to the corridor's long axis, 16 units long) get DOORTRAK
+  // middle + LOWER_UNPEGGED so the side texture doesn't slide. The line
+  // between mainBody and each doorBody is the door action line (DR-1) with
+  // DOOR3 upper as the door image — front is mainBody so the player
+  // approaching from the corridor sees the door.
   corridors.forEach((co) => {
     if (co.orient === 'H') {
-      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, null, { middle: 'STARTAN2' });
-      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, rooms[co.eIdx].trimId);
-      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, null, { middle: 'STARTAN2' });
-      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, rooms[co.wIdx].trimId);
+      const A = co.minX, B = co.maxX, C = co.minY, D = co.maxY;
+      const aIn = A + DOOR_THICK, bIn = B - DOOR_THICK;
+      // doorBodyA (west) tracks
+      emitWall(A, D, aIn, D, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(aIn, C, A, C, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      // mainBody long walls
+      emitWall(aIn, D, bIn, D, co.mainBodyId, null, { middle: 'STARTAN2' });
+      emitWall(bIn, C, aIn, C, co.mainBodyId, null, { middle: 'STARTAN2' });
+      // doorBodyB (east) tracks
+      emitWall(bIn, D, B, D, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(B, C, bIn, C, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      // door A face (between mainBody and doorBodyA). front=mainBody.
+      emitWall(aIn, C, aIn, D, co.mainBodyId, co.doorAId);
+      // door B face (between mainBody and doorBodyB). front=mainBody.
+      emitWall(bIn, D, bIn, C, co.mainBodyId, co.doorBId);
     } else {
-      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, rooms[co.nIdx].trimId);
-      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, null, { middle: 'STARTAN2' });
-      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, rooms[co.sIdx].trimId);
-      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, null, { middle: 'STARTAN2' });
+      const A = co.minY, B = co.maxY, C = co.minX, D = co.maxX;
+      const aIn = A + DOOR_THICK, bIn = B - DOOR_THICK;
+      // doorBodyA (south) tracks (parallel to the corridor's long Y axis)
+      emitWall(C, A, C, aIn, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(D, aIn, D, A, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      // mainBody long walls
+      emitWall(C, aIn, C, bIn, co.mainBodyId, null, { middle: 'STARTAN2' });
+      emitWall(D, bIn, D, aIn, co.mainBodyId, null, { middle: 'STARTAN2' });
+      // doorBodyB (north) tracks
+      emitWall(C, bIn, C, B, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(D, B, D, bIn, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      // door A face (south end). emit so mainBody is on front (north side).
+      emitWall(D, aIn, C, aIn, co.mainBodyId, co.doorAId);
+      // door B face (north end). emit so mainBody is on front (south side).
+      emitWall(C, bIn, D, bIn, co.mainBodyId, co.doorBId);
     }
   });
 
-  // -------- 8. Apply door specials and door textures --------
-  // Door image: DOOR3 (64-wide canonical). Upper texture set on both sides.
-  // Corridor's perpendicular (track) walls: DOORTRAK + lower-unpegged so the
-  // texture doesn't move with the ceiling.
+  // -------- 8. Apply door specials --------
+  // Each line between mainBody and a doorBody becomes a DR-1 door. DOOR3
+  // upper goes on the mainBody side (front) so the player approaching from
+  // the corridor sees the door image stretched from corridor ceiling down
+  // to the closed door body. Do NOT set lower-unpegged on the door face —
+  // the door image must ride with the moving ceiling.
   const sdMap = new Map(sidedefs.map(s => [s.id, s]));
   corridors.forEach((co) => {
     for (const l of linedefs) {
       if (l.front === -1 || l.back === -1) continue;
       const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
       if (!fs || !bs) continue;
-      const interfacesCorridor = (fs.sector === co.sectorId && rooms.some(r => r.trimId === bs.sector))
-                              || (bs.sector === co.sectorId && rooms.some(r => r.trimId === fs.sector));
-      if (!interfacesCorridor) continue;
-      l.special = 1; // DR Open Door
-      l.flags = (l.flags | 16); // lower-unpegged on the door face
-      const doorTex = (co.maxX - co.minX > 96 || co.maxY - co.minY > 96) ? 'BIGDOOR2' : 'DOOR3';
-      fs.upper = doorTex; bs.upper = doorTex;
-    }
-    // The corridor's perpendicular-to-corridor walls are tracks. Set DOORTRAK +
-    // lower-unpegged so the side textures stay put when the door moves.
-    for (const l of linedefs) {
-      if (l.back !== -1) continue;
-      const fs = sdMap.get(l.front);
-      if (!fs || fs.sector !== co.sectorId) continue;
-      fs.middle = 'DOORTRAK';
-      l.flags = (l.flags | 16);
+      const isDoorFace = fs.sector === co.mainBodyId &&
+        (bs.sector === co.doorAId || bs.sector === co.doorBId);
+      if (!isDoorFace) continue;
+      l.special = 1; // DR Open Door — operates on the BACK sector (door body)
+      const doorTex = 'DOOR3'; // 64-wide canonical
+      fs.upper = doorTex;
+      bs.upper = doorTex;
     }
   });
+
+  // -------- 8b. Resolve upper / lower textures on every two-sided line --------
+  // For every two-sided line with a floor or ceiling step, set a wall texture
+  // on the visible side (lower texture on the side with the lower floor,
+  // upper texture on the side with the higher ceiling). Skips sides already
+  // textured (preserves door image, DOORTRAK tracks, etc.) and sky-to-sky.
+  const secMap = new Map(sectors.map(s => [s.id, s]));
+  for (const l of linedefs) {
+    if (l.front === -1 || l.back === -1) continue;
+    const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
+    if (!fs || !bs) continue;
+    const fsec = secMap.get(fs.sector), bsec = secMap.get(bs.sector);
+    if (!fsec || !bsec) continue;
+    // Lower texture: on the side adjacent to the LOWER floor (visible from there).
+    if (fsec.floorH !== bsec.floorH) {
+      const lowSide = fsec.floorH < bsec.floorH ? fs : bs;
+      if (!lowSide.lower || lowSide.lower === '-') lowSide.lower = 'STEP1';
+    }
+    // Upper texture: on the side adjacent to the HIGHER ceiling (visible from there).
+    if (fsec.ceilH !== bsec.ceilH) {
+      const bothSky = fsec.ceilTex === 'F_SKY1' && bsec.ceilTex === 'F_SKY1';
+      if (!bothSky) {
+        const highSide = fsec.ceilH > bsec.ceilH ? fs : bs;
+        if (!highSide.upper || highSide.upper === '-') highSide.upper = 'STARTAN2';
+      }
+    }
+  }
 
   // -------- 9. Place things --------
   const things = [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
@@ -1171,14 +1241,23 @@ function generateDungeon() {
     const d = Math.abs(rooms[i].cx - rooms[0].cx) + Math.abs(rooms[i].cy - rooms[0].cy);
     if (d > exitDist) { exitDist = d; exitIdx = i; }
   }
-  const exitTrim = rooms[exitIdx].trimId;
-  for (const l of linedefs) {
-    if (l.back !== -1) continue;
-    const fs = sdMap.get(l.front);
-    if (!fs || fs.sector !== exitTrim) continue;
-    l.special = 11;
-    fs.middle = 'SW1EXIT';
-    break;
+  // Exit switch in the room furthest from start. Prefer to paint it on the
+  // innermost trim layer's wall so the player has to push deep into the
+  // room to find it — but fall back to the outer wall if the room has no
+  // trim layers (shouldn't happen, but safe).
+  const exitSectorCandidates = [
+    ...(rooms[exitIdx].trimIds || []).slice().reverse(),
+    rooms[exitIdx].outerId,
+  ];
+  outer: for (const secId of exitSectorCandidates) {
+    for (const l of linedefs) {
+      if (l.back !== -1) continue;
+      const fs = sdMap.get(l.front);
+      if (!fs || fs.sector !== secId) continue;
+      l.special = 11;
+      fs.middle = 'SW1EXIT';
+      break outer;
+    }
   }
 
   return { vertices: verts, linedefs, sidedefs, sectors, things };
@@ -2824,7 +2903,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.7</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.8</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -3859,7 +3938,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.7</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.8</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

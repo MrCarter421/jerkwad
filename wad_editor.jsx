@@ -1911,7 +1911,13 @@ function stampShape(map, snap, worldPts, overrides) {
 function macroDoor(map, lineId, kind = 'normal') {
   const ld = map.linedefs.find(l => l.id === lineId);
   if (!ld) return null;
-  if (!ld.back || ld.back === -1) return { error: 'Door needs a two-sided line.' };
+  // If the wall is one-sided (faces void), carve a proper door body behind
+  // it — split the wall into wall + door-face + wall, add a 16-deep closet
+  // door body sector, wire DR-1 + DOOR3 + DOORTRAK tracks + correct pegging.
+  if (!ld.back || ld.back === -1) {
+    return macroDoorOneSided(map, lineId, kind);
+  }
+  // Two-sided wall: existing "convert back sector into door body" behaviour.
   const backSd = map.sidedefs.find(s => s.id === ld.back);
   if (!backSd) return { error: 'Missing back sidedef.' };
   const doorSecId = backSd.sector;
@@ -1932,11 +1938,136 @@ function macroDoor(map, lineId, kind = 'normal') {
     sd.sector === doorSecId ? { ...sd, middle: 'DOORTRAK' } : sd);
   const trackLines = nextLines.map(l => adj.has(l.id) ? { ...l, flags: l.flags | 16 } : l);
   const finalSidedefs = trackSidedefs.map(sd => {
-    if (sd.id === ld.front) return { ...sd, upper: 'BIGDOOR2' };
-    if (sd.id === ld.back) return { ...sd, upper: 'BIGDOOR2' };
+    if (sd.id === ld.front) return { ...sd, upper: 'DOOR3' };
+    if (sd.id === ld.back) return { ...sd, upper: 'DOOR3' };
     return sd;
   });
   return { ...map, linedefs: trackLines, sidedefs: finalSidedefs, sectors: nextSectors };
+}
+
+// Carve a proper door body into the void behind a one-sided wall, then wire
+// it as a DR-1 door. The wall is split into [wall, door-face, wall] at the
+// door's width (64 by default), a 16-deep closet sector is built behind the
+// door face, and the closet's three outward walls become DOORTRAK tracks
+// with lower-unpegged pegging. Door image is DOOR3 (64-wide canonical) on
+// the door face's upper texture, with standard pegging so it rides with the
+// rising ceiling.
+function macroDoorOneSided(map, lineId, kind = 'normal') {
+  const ld = map.linedefs.find(l => l.id === lineId);
+  if (!ld) return { error: 'Line not found' };
+  if (ld.back && ld.back !== -1) return { error: 'Use macroDoor on a two-sided wall' };
+  const v1 = map.vertices.find(v => v.id === ld.v1);
+  const v2 = map.vertices.find(v => v.id === ld.v2);
+  if (!v1 || !v2) return { error: 'Wall vertices missing' };
+  const dx = v2.x - v1.x, dy = v2.y - v1.y;
+  const len = Math.hypot(dx, dy);
+  const WIDTH = 64, THICK = 16, MARGIN = 16;
+  if (len < WIDTH + MARGIN * 2) return { error: 'Wall too short for a 64-unit door' };
+  if (Math.abs(dx) > 0.5 && Math.abs(dy) > 0.5) return { error: 'Door tool requires an axis-aligned wall' };
+  const origFront = map.sidedefs.find(s => s.id === ld.front);
+  if (!origFront) return { error: 'Front sidedef missing' };
+  const roomSec = map.sectors.find(s => s.id === origFront.sector);
+  if (!roomSec) return { error: 'Room sector missing' };
+
+  const ux = dx / len, uy = dy / len;
+  const bx = -uy, by = ux; // BACK direction (left of v1->v2); for one-sided
+                            // walls this is the void side.
+  const sn = v => Math.round(v / 8) * 8;
+  const tCenter = len / 2;
+  const t0 = tCenter - WIDTH / 2;
+  const t1 = tCenter + WIDTH / 2;
+
+  const at_t0 = { x: sn(v1.x + ux * t0), y: sn(v1.y + uy * t0) };
+  const at_t1 = { x: sn(v1.x + ux * t1), y: sn(v1.y + uy * t1) };
+  const at_bk0 = { x: sn(at_t0.x + bx * THICK), y: sn(at_t0.y + by * THICK) };
+  const at_bk1 = { x: sn(at_t1.x + bx * THICK), y: sn(at_t1.y + by * THICK) };
+
+  const verts = map.vertices.slice();
+  const findV = (p) => {
+    const ex = verts.find(v => v.x === p.x && v.y === p.y);
+    if (ex) return ex.id;
+    const id = 'v' + verts.length;
+    verts.push({ id, x: p.x, y: p.y });
+    return id;
+  };
+  const vT0 = findV(at_t0);
+  const vT1 = findV(at_t1);
+  const vBk0 = findV(at_bk0);
+  const vBk1 = findV(at_bk1);
+
+  const doorSecId = 's' + map.sectors.length;
+  const sectors = [...map.sectors, {
+    id: doorSecId,
+    floorH: roomSec.floorH, ceilH: roomSec.floorH, // closed
+    floorTex: roomSec.floorTex, ceilTex: roomSec.floorTex,
+    light: Math.max(64, (roomSec.light ?? 160) - 32),
+    special: 0, tag: 0,
+  }];
+
+  const sidedefs = map.sidedefs.slice();
+  const addSd = (secId, props = {}) => {
+    const id = 'sd' + sidedefs.length;
+    sidedefs.push({ id, xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-', sector: secId, ...props });
+    return id;
+  };
+  const wallTex = origFront.middle && origFront.middle !== '-' ? origFront.middle : 'STARTAN2';
+  // Separate front sidedefs per segment so we can texture them independently.
+  const sdSeg1 = addSd(roomSec.id, { middle: wallTex });
+  const sdSeg3 = addSd(roomSec.id, { middle: wallTex });
+  // Door face: front = room side (upper = DOOR3, door image), back = door body.
+  const sdFaceFront = addSd(roomSec.id, { middle: '-', upper: 'DOOR3' });
+  const sdFaceBack = addSd(doorSecId, { middle: '-', upper: 'DOOR3' });
+  // Door body's outward walls (one-sided).
+  const sdBackWall = addSd(doorSecId, { middle: wallTex });
+  const sdTrack1 = addSd(doorSecId, { middle: 'DOORTRAK' });
+  const sdTrack2 = addSd(doorSecId, { middle: 'DOORTRAK' });
+
+  const doorSpecials = { normal: 1, red: 28, blue: 26, yellow: 27 };
+  const doorSpecial = doorSpecials[kind] ?? 1;
+
+  const linedefs = map.linedefs.slice();
+  const ldIdx = linedefs.findIndex(l => l.id === lineId);
+  // Segment 1: v1 → vT0 (keeps original line ID).
+  linedefs[ldIdx] = { ...ld, v2: vT0, front: sdSeg1, flags: (ld.flags | 1) & ~4 };
+  // Segment 2: vT0 → vT1 (the door face).
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vT0, v2: vT1,
+    flags: 4, // two-sided only — no lower-unpegged so DOOR3 rides with ceiling
+    special: doorSpecial, tag: 0,
+    front: sdFaceFront, back: sdFaceBack,
+  });
+  // Segment 3: vT1 → v2.
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vT1, v2: ld.v2,
+    flags: (ld.flags | 1) & ~4, special: 0, tag: 0,
+    front: sdSeg3, back: -1,
+  });
+  // Track 1: vT0 → vBk0 (one of the door's perpendicular walls).
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vT0, v2: vBk0,
+    flags: 1 | 16, // impassable + lower-unpegged (texture stays put as door rises)
+    special: 0, tag: 0,
+    front: sdTrack1, back: -1,
+  });
+  // Back wall: vBk0 → vBk1 (far side of the closet).
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vBk0, v2: vBk1,
+    flags: 1, special: 0, tag: 0,
+    front: sdBackWall, back: -1,
+  });
+  // Track 2: vBk1 → vT1.
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vBk1, v2: vT1,
+    flags: 1 | 16, special: 0, tag: 0,
+    front: sdTrack2, back: -1,
+  });
+
+  return { ...map, vertices: verts, linedefs, sidedefs, sectors };
 }
 function macroWindow(map, lineId) {
   const ld = map.linedefs.find(l => l.id === lineId);
@@ -3207,7 +3338,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.9</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.10</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -4324,7 +4455,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.9</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.10</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

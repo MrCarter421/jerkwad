@@ -580,7 +580,7 @@ const DOOM_TEXTURES = {
 // dungeon graph — that's a separate feature — but a one-tap playable map.
 function generateRandomWorld() {
   let m = outdoorStarter();
-  let seed = (Date.now() & 0x7fffffff) || 1;
+  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => {
     seed = (seed * 1103515245 + 12345) & 0x7fffffff;
     return (seed >>> 8) / 0xffffff;
@@ -671,7 +671,7 @@ function generateRandomWorld() {
 // Door texture is DOOR3 (64-wide canonical) and door tracks use DOORTRAK
 // with the lower-unpegged flag set so the side textures don't slide.
 function generateDungeon() {
-  let seed = (Date.now() & 0x7fffffff) || 1;
+  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
   const sn = v => Math.round(v / 32) * 32;
@@ -718,6 +718,13 @@ function generateDungeon() {
   function bboxOverlap(a, b, margin = 0) {
     return !(a.maxX + margin < b.minX || b.maxX + margin < a.minX ||
              a.maxY + margin < b.minY || b.maxY + margin < a.minY);
+  }
+  // Half-span of the axis-aligned flat segment available for a doorway on a
+  // given cardinal side. Squares: full half-dimension. Octagons at 22.5°
+  // offset: only ±0.383r is actually flat-walled — the rest is diagonal.
+  function cardinalSpan(room, side) {
+    if (room.type === 'octagon') return room.r * 0.383;
+    return (side === 'E' || side === 'W') ? room.h / 2 : room.w / 2;
   }
 
   // -------- 1. place rooms --------
@@ -771,8 +778,12 @@ function generateDungeon() {
       const west = ba.maxX < bb.minX ? ra : rb;
       const east = ba.maxX < bb.minX ? rb : ra;
       const wbb = roomBBox(west), ebb = roomBBox(east);
-      const yLow = Math.max(wbb.minY, ebb.minY) + 64;
-      const yHigh = Math.min(wbb.maxY, ebb.maxY) - 64;
+      // Doorway must fall inside BOTH rooms' actual cardinal flat-edge span,
+      // not just the effective bbox (octagons have diagonal corner segments
+      // that can't host a 64-unit doorway).
+      const wSpan = cardinalSpan(west, 'E'), eSpan = cardinalSpan(east, 'W');
+      const yLow = Math.max(west.cy - wSpan, east.cy - eSpan) + 32;
+      const yHigh = Math.min(west.cy + wSpan, east.cy + eSpan) - 32;
       if (yHigh - yLow >= CW) {
         const cy = sn((yLow + yHigh) / 2);
         const co = {
@@ -788,8 +799,9 @@ function generateDungeon() {
       const south = ba.maxY < bb.minY ? ra : rb;
       const north = ba.maxY < bb.minY ? rb : ra;
       const sbb = roomBBox(south), nbb = roomBBox(north);
-      const xLow = Math.max(sbb.minX, nbb.minX) + 64;
-      const xHigh = Math.min(sbb.maxX, nbb.maxX) - 64;
+      const sSpan = cardinalSpan(south, 'N'), nSpan = cardinalSpan(north, 'S');
+      const xLow = Math.max(south.cx - sSpan, north.cx - nSpan) + 32;
+      const xHigh = Math.min(south.cx + sSpan, north.cx + nSpan) - 32;
       if (xHigh - xLow >= CW) {
         const cx = sn((xLow + xHigh) / 2);
         const co = {
@@ -1463,6 +1475,246 @@ function cleanPhantomSectors(map) {
   };
 }
 
+// WAD validity checker. Surfaces issues the engine will complain about
+// before the user saves and runs the map in GZDoom: dangling vertex/sidedef
+// references, zero-length lines, duplicate-coincident lines, out-of-int16
+// coordinates, sectors with floor above ceiling, missing player start,
+// orphan sectors, and a few visual-glitch traps (height step on a one-sided
+// line, two-sided line with no upper/lower on a height delta).
+function validateMap(map) {
+  const issues = [];
+  const vIds = new Set(map.vertices.map(v => v.id));
+  const sdIds = new Set(map.sidedefs.map(s => s.id));
+  const secIds = new Set(map.sectors.map(s => s.id));
+  const vCoord = new Map();
+  for (const v of map.vertices) vCoord.set(v.id, v);
+
+  for (const ld of map.linedefs) {
+    if (!vIds.has(ld.v1)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing vertex ${ld.v1}`, where: ld.id });
+    if (!vIds.has(ld.v2)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing vertex ${ld.v2}`, where: ld.id });
+    if (ld.v1 === ld.v2) issues.push({ kind: 'error', text: `Line ${ld.id} is zero-length (v1==v2)`, where: ld.id });
+    if (ld.front !== -1 && !sdIds.has(ld.front)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing front sidedef ${ld.front}`, where: ld.id });
+    if (ld.back !== -1 && !sdIds.has(ld.back)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing back sidedef ${ld.back}`, where: ld.id });
+    if ((ld.front === -1 || ld.front == null) && (ld.back === -1 || ld.back == null)) {
+      issues.push({ kind: 'warning', text: `Line ${ld.id} has no sidedefs (raw line — won't render)`, where: ld.id });
+    }
+  }
+
+  for (const sd of map.sidedefs) {
+    if (!secIds.has(sd.sector)) issues.push({ kind: 'error', text: `Sidedef ${sd.id} references missing sector ${sd.sector}`, where: sd.id });
+  }
+
+  // Coincident-line detection: any two distinct lines sharing the same vertex
+  // pair (in either direction). True collinear-overlap detection (one line
+  // sitting on a sub-segment of another) is more expensive; we catch the
+  // common case here.
+  const seen = new Map();
+  for (const ld of map.linedefs) {
+    if (!vIds.has(ld.v1) || !vIds.has(ld.v2) || ld.v1 === ld.v2) continue;
+    const key = ld.v1 < ld.v2 ? ld.v1 + '|' + ld.v2 : ld.v2 + '|' + ld.v1;
+    if (seen.has(key)) {
+      issues.push({ kind: 'warning', text: `Line ${ld.id} overlaps line ${seen.get(key)} (same endpoints)`, where: ld.id });
+    } else {
+      seen.set(key, ld.id);
+    }
+  }
+
+  for (const s of map.sectors) {
+    if (s.floorH > s.ceilH) issues.push({ kind: 'error', text: `Sector ${s.id} floor (${s.floorH}) above ceiling (${s.ceilH})`, where: s.id });
+    if (s.light < 0 || s.light > 255) issues.push({ kind: 'warning', text: `Sector ${s.id} light ${s.light} outside 0..255`, where: s.id });
+    if (s.ceilH - s.floorH < 56 && s.ceilH !== s.floorH) {
+      issues.push({ kind: 'warning', text: `Sector ${s.id} headroom < 56 (player won't fit)`, where: s.id });
+    }
+  }
+
+  const refByLine = new Set();
+  for (const sd of map.sidedefs) refByLine.add(sd.sector);
+  for (const s of map.sectors) {
+    if (!refByLine.has(s.id)) issues.push({ kind: 'warning', text: `Sector ${s.id} has no sidedefs (orphan)`, where: s.id });
+  }
+
+  const hasPlayer = map.things.some(t => t.type === 1);
+  if (!hasPlayer) issues.push({ kind: 'error', text: 'No Player 1 Start (thing type 1)' });
+
+  const COORD_MAX = 32767;
+  for (const v of map.vertices) {
+    if (Math.abs(v.x) > COORD_MAX || Math.abs(v.y) > COORD_MAX) {
+      issues.push({ kind: 'error', text: `Vertex ${v.id} at (${v.x}, ${v.y}) exceeds int16 range`, where: v.id });
+    }
+  }
+
+  // HOM / Tutti-Frutti: two-sided line with a height step where no upper or
+  // lower texture is set on the visible side.
+  const sdById = new Map(map.sidedefs.map(s => [s.id, s]));
+  const secById = new Map(map.sectors.map(s => [s.id, s]));
+  let homCount = 0;
+  for (const ld of map.linedefs) {
+    if (ld.front === -1 || ld.back === -1) continue;
+    const fs = sdById.get(ld.front), bs = sdById.get(ld.back);
+    if (!fs || !bs) continue;
+    const fsec = secById.get(fs.sector), bsec = secById.get(bs.sector);
+    if (!fsec || !bsec) continue;
+    if (fsec.floorH !== bsec.floorH) {
+      const lowSide = fsec.floorH < bsec.floorH ? fs : bs;
+      if (!lowSide.lower || lowSide.lower === '-') {
+        homCount++;
+        if (homCount <= 5) issues.push({ kind: 'warning', text: `Line ${ld.id} has a floor step with no lower texture (HOM risk)`, where: ld.id });
+      }
+    }
+    if (fsec.ceilH !== bsec.ceilH) {
+      const bothSky = fsec.ceilTex === 'F_SKY1' && bsec.ceilTex === 'F_SKY1';
+      if (!bothSky) {
+        const highSide = fsec.ceilH > bsec.ceilH ? fs : bs;
+        if (!highSide.upper || highSide.upper === '-') {
+          homCount++;
+          if (homCount <= 5) issues.push({ kind: 'warning', text: `Line ${ld.id} has a ceiling step with no upper texture (HOM risk)`, where: ld.id });
+        }
+      }
+    }
+  }
+  if (homCount > 5) issues.push({ kind: 'warning', text: `(+${homCount - 5} more HOM-risk lines hidden)` });
+
+  return issues;
+}
+
+// Generate additional rooms grafted onto an existing map. Finds the bounding
+// box of existing geometry, picks a direction with space, and runs a small
+// dungeon pass adjacent to that side. New geometry uses fresh IDs offset to
+// avoid collisions with the existing map's IDs. The user can then connect
+// the new cluster via Draw mode or another Add Rooms call.
+// Find closed cycles in the linedef graph that are NOT yet sectors. Returns
+// an array of { loop: [vertexId...], centroid: {x,y}, vertices: [{x,y}...] }.
+// Drawn freely with the Draw tool, a closed shape sits as raw linedefs until
+// the user promotes it. This is WADED's "Make Sector" workflow.
+function findPotentialSectors(map) {
+  if (!map.linedefs.length || !map.vertices.length) return [];
+  // Augment: for every linedef with a missing side, attach a virtual sidedef
+  // belonging to a virtual "__void" sector. buildSectorLoops then traces the
+  // boundary of every void region as if it were a real sector.
+  const augSidedefs = map.sidedefs.slice();
+  const augLines = map.linedefs.map(ld => {
+    let { front, back } = ld;
+    if (!front || front === -1) {
+      const id = '__vf_' + ld.id;
+      augSidedefs.push({ id, sector: '__void', xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-' });
+      front = id;
+    }
+    if (!back || back === -1) {
+      const id = '__vb_' + ld.id;
+      augSidedefs.push({ id, sector: '__void', xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-' });
+      back = id;
+    }
+    return { ...ld, front, back };
+  });
+  const augMap = {
+    vertices: map.vertices,
+    sidedefs: augSidedefs,
+    sectors: map.sectors.concat([{ id: '__void' }]),
+    linedefs: augLines,
+    things: map.things,
+  };
+  const loops = buildSectorLoops(augMap);
+  const voidLoops = loops.get('__void') || [];
+  if (!voidLoops.length) return [];
+  // Existing-sector signatures so we don't suggest making a sector where one
+  // already exists.
+  const existingSigs = new Set();
+  for (const [secId, ls] of loops) {
+    if (secId === '__void') continue;
+    for (const loop of ls) existingSigs.add([...loop].sort().join('|'));
+  }
+  const vmap = new Map(map.vertices.map(v => [v.id, v]));
+  const seen = new Set();
+  const result = [];
+  for (const loop of voidLoops) {
+    if (loop.length < 3) continue;
+    const sig = [...loop].sort().join('|');
+    if (seen.has(sig) || existingSigs.has(sig)) continue;
+    seen.add(sig);
+    const pts = loop.map(id => vmap.get(id)).filter(Boolean);
+    if (pts.length < 3) continue;
+    const area = polygonSignedArea(pts);
+    if (Math.abs(area) < 64) continue; // skip degenerate slivers
+    // Keep only CCW orientation (the "inside" region). buildSectorFromLoop
+    // would normalize CW on conversion either way, but skipping the CW
+    // twin avoids duplicate highlights.
+    if (area < 0) continue;
+    result.push({ loop, vertices: pts, centroid: polygonCentroid(pts), area });
+  }
+  return result;
+}
+
+function buildAddedRooms(existing) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const v of existing.vertices) {
+    if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
+    if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
+  }
+  if (!isFinite(minX)) return existing;
+  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
+  // Pick a side with space — the new cluster will be GAP units past the
+  // existing bbox in that direction.
+  const GAP = 256;
+  const sides = ['E', 'W', 'N', 'S'];
+  let offX = 0, offY = 0;
+  for (let i = 0; i < 4; i++) {
+    const side = sides[Math.floor(rand() * sides.length)];
+    if (side === 'E' && maxX + GAP + 1024 < 32000) { offX = maxX + GAP + 768; offY = (minY + maxY) / 2; break; }
+    if (side === 'W' && minX - GAP - 1024 > -32000) { offX = minX - GAP - 768; offY = (minY + maxY) / 2; break; }
+    if (side === 'N' && maxY + GAP + 1024 < 32000) { offX = (minX + maxX) / 2; offY = maxY + GAP + 768; break; }
+    if (side === 'S' && minY - GAP - 1024 > -32000) { offX = (minX + maxX) / 2; offY = minY - GAP - 768; break; }
+  }
+  // Generate a fresh dungeon and translate it to the chosen offset.
+  const fresh = generateDungeon();
+  // Centre fresh on origin then shift to (offX, offY).
+  let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
+  for (const v of fresh.vertices) {
+    if (v.x < fMinX) fMinX = v.x; if (v.x > fMaxX) fMaxX = v.x;
+    if (v.y < fMinY) fMinY = v.y; if (v.y > fMaxY) fMaxY = v.y;
+  }
+  const fCx = (fMinX + fMaxX) / 2, fCy = (fMinY + fMaxY) / 2;
+  const dx = Math.round(offX - fCx), dy = Math.round(offY - fCy);
+  // Remap IDs to avoid clashes with the existing map.
+  const vOffset = existing.vertices.length;
+  const sdOffset = existing.sidedefs.length;
+  const sOffset = existing.sectors.length;
+  const lOffset = existing.linedefs.length;
+  const tOffset = existing.things.length;
+  const vIdMap = new Map(fresh.vertices.map((v, i) => [v.id, 'v' + (vOffset + i)]));
+  const sdIdMap = new Map(fresh.sidedefs.map((sd, i) => [sd.id, 'sd' + (sdOffset + i)]));
+  const sIdMap = new Map(fresh.sectors.map((s, i) => [s.id, 's' + (sOffset + i)]));
+  const newVertices = fresh.vertices.map((v, i) => ({
+    id: vIdMap.get(v.id), x: v.x + dx, y: v.y + dy,
+  }));
+  const newSidedefs = fresh.sidedefs.map((sd, i) => ({
+    ...sd, id: sdIdMap.get(sd.id), sector: sIdMap.get(sd.sector),
+  }));
+  const newSectors = fresh.sectors.map((s, i) => ({
+    ...s, id: sIdMap.get(s.id),
+  }));
+  const newLinedefs = fresh.linedefs.map((l, i) => ({
+    ...l, id: 'l' + (lOffset + i),
+    v1: vIdMap.get(l.v1), v2: vIdMap.get(l.v2),
+    front: l.front === -1 ? -1 : sdIdMap.get(l.front),
+    back: l.back === -1 ? -1 : sdIdMap.get(l.back),
+  }));
+  // Drop any duplicate player-1-start; keep the player in the existing map.
+  const newThings = fresh.things
+    .filter(t => t.type !== 1)
+    .map((t, i) => ({
+      ...t, id: 't' + (tOffset + i),
+      x: t.x + dx, y: t.y + dy,
+    }));
+  return {
+    vertices: [...existing.vertices, ...newVertices],
+    linedefs: [...existing.linedefs, ...newLinedefs],
+    sidedefs: [...existing.sidedefs, ...newSidedefs],
+    sectors: [...existing.sectors, ...newSectors],
+    things: [...existing.things, ...newThings],
+  };
+}
+
 // ============================================================================
 // TOPOLOGY RESOLVER
 // ============================================================================
@@ -1757,6 +2009,7 @@ export default function WadEditor() {
   // dimensions in ShapeSheet. Tapping the canvas moves the ghost; the STAMP
   // button commits it.
   const [stampPreview, setStampPreview] = useState(null);
+  const [checkIssues, setCheckIssues] = useState(null);
   const [propsOpen, setPropsOpen] = useState(false);
   const [radial, setRadial] = useState(null);
   const [hint, setHint] = useState(null);
@@ -1777,6 +2030,9 @@ export default function WadEditor() {
 
   const map = doc.maps[doc.currentMap];
   const sectorLoops = useMemo(() => buildSectorLoops(map), [map]);
+  // Potential sectors: closed cycles in raw lines that aren't sectors yet.
+  // Highlighted on the canvas; long-press inside one to promote it.
+  const potentialSectors = useMemo(() => findPotentialSectors(map), [map]);
 
   const selectedSectorLineIds = useMemo(() => {
     if (selection?.type !== 'sector') return null;
@@ -2088,6 +2344,13 @@ export default function WadEditor() {
       if (ld) { setRadial({ sx, sy, kind: 'linedef', id: ld.id }); navHaptic(); return; }
       const secId = hitSector(sx, sy);
       if (secId) { setRadial({ sx, sy, kind: 'sector', id: secId }); navHaptic(); return; }
+      // Long-press inside a potential sector's polygon → offer Make Sector.
+      const w = screenToWorld(sx, sy);
+      const ps = potentialSectors.find(p => pointInPolygon(w.x, w.y, p.vertices));
+      if (ps) {
+        setRadial({ sx, sy, kind: 'potential', potential: ps });
+        navHaptic(); return;
+      }
       setRadial({ sx, sy, kind: 'empty' });
       navHaptic();
     }, 480);
@@ -2463,6 +2726,35 @@ export default function WadEditor() {
         if (isSel) {
           ctx.fillStyle = 'rgba(127, 255, 212, 0.18)';
           ctx.fill('evenodd');
+        }
+      }
+    }
+
+    // Potential sectors: cyan dashed-fill overlay marks any closed loop in
+    // the raw linedef graph that isn't yet a sector. Long-press inside one
+    // to promote it via the radial menu.
+    if (potentialSectors.length) {
+      for (const ps of potentialSectors) {
+        ctx.beginPath();
+        for (let i = 0; i < ps.vertices.length; i++) {
+          const s = worldToScreen(ps.vertices[i].x, ps.vertices[i].y);
+          if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(127, 255, 212, 0.16)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(127, 255, 212, 0.75)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 5]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Label
+        if (view.zoom > 0.12) {
+          const cs = worldToScreen(ps.centroid.x, ps.centroid.y);
+          ctx.font = "10px 'JetBrains Mono', monospace";
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillStyle = 'rgba(127, 255, 212, 0.95)';
+          ctx.fillText('make sector', cs.x, cs.y);
         }
       }
     }
@@ -2891,6 +3183,18 @@ export default function WadEditor() {
         break;
       }
       case 'stamp-shape': setStampSheet('shapes'); break;
+      case 'make-sector': {
+        if (!r.potential) break;
+        updateMap(m => {
+          const chain = [...r.potential.loop, r.potential.loop[0]];
+          const result = buildSectorFromLoop(m, chain);
+          if (!result || result.selectedExistingId) return m;
+          setSelection({ type: 'sector', id: result.createdSectorId });
+          setHint('Sector built from cycle');
+          return result;
+        });
+        break;
+      }
     }
   }
 
@@ -2903,7 +3207,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.8</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.9</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -2930,11 +3234,20 @@ export default function WadEditor() {
               <button onClick={() => addNewMapSlot('random')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚄ random world</button>
               <button onClick={() => addNewMapSlot('dungeon')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚔ random dungeon</button>
               <button onClick={() => {
+                updateMap(m => buildAddedRooms(m));
+                setMapMenuOpen(false);
+                setHint('More rooms added — connect them in Draw mode');
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.accent, fontWeight: 600 }}>+ build more rooms</button>
+              <button onClick={() => {
+                setCheckIssues(validateMap(map));
+                setMapMenuOpen(false);
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.text, borderTop: '1px solid ' + COLORS.border }}>✓ check map</button>
+              <button onClick={() => {
                 let removed = 0;
                 updateMap(m => { const r = cleanPhantomSectors(m); removed = r.removed; return r.map; });
                 setMapMenuOpen(false);
                 setHint(removed > 0 ? 'Cleaned ' + removed + ' phantom sector' + (removed === 1 ? '' : 's') : 'No phantoms found');
-              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.textDim, borderTop: '1px solid ' + COLORS.border }}>⌫ clean phantoms</button>
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.textDim }}>⌫ clean phantoms</button>
             </div>
           )}
         </div>
@@ -3111,6 +3424,27 @@ export default function WadEditor() {
           onClose={() => setStampSheet(null)} />
       )}
       {shareModal && <ShareInstructions fileName={shareModal.fileName} onClose={() => setShareModal(null)} />}
+      {checkIssues && (
+        <CheckModal
+          issues={checkIssues}
+          onSelect={(where) => {
+            // Best-effort: try to select the issue's target if it's a known id.
+            if (!where) return;
+            if (typeof where === 'string') {
+              const t = where[0] === 'v' ? 'vertex'
+                : where[0] === 'l' && where[1] !== 'd' ? 'linedef'
+                : where[0] === 's' && where[1] !== 'd' ? 'sector'
+                : where[0] === 't' && !isNaN(where[1]) ? 'thing'
+                : where.startsWith('sd') ? 'sidedef'
+                : null;
+              if (t === 'vertex' || t === 'linedef' || t === 'sector' || t === 'thing') {
+                setSelection({ type: t, id: where });
+              }
+            }
+            setCheckIssues(null);
+          }}
+          onClose={() => setCheckIssues(null)} />
+      )}
       {welcomeOpen && (
         <WelcomeOverlay onOpen={() => fileInputRef.current?.click()}
           onNewOutdoor={() => onNewMap('outdoor')}
@@ -3360,6 +3694,11 @@ function RadialMenu({ radial, onAction, onClose }) {
       { id: 'start-draw', label: 'Draw', glyph: '✎' },
       { id: 'place-thing', label: 'Thing', glyph: '◉' },
       { id: 'stamp-shape', label: 'Shape', glyph: '◫' },
+    ],
+    potential: [
+      { id: 'make-sector', label: 'Make', glyph: '◇' },
+      { id: 'start-draw', label: 'Draw', glyph: '✎' },
+      { id: 'place-thing', label: 'Thing', glyph: '◉' },
     ],
   };
   const actions = actionsByKind[radial.kind] || [];
@@ -3906,6 +4245,53 @@ function ThingPicker({ onPick, onCancel }) {
   );
 }
 
+function CheckModal({ issues, onSelect, onClose }) {
+  const monoStack = "'JetBrains Mono', monospace";
+  const errors = issues.filter(i => i.kind === 'error');
+  const warnings = issues.filter(i => i.kind === 'warning');
+  const okay = issues.length === 0;
+  return (
+    <div className="absolute inset-0 z-50 flex items-end" style={{ background: '#000a' }} onClick={onClose}>
+      <div className="w-full rounded-t-lg flex flex-col"
+        style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border, maxHeight: '75%', paddingBottom: 'env(safe-area-inset-bottom)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 border-b flex items-center justify-between" style={{ borderColor: COLORS.border }}>
+          <div>
+            <div style={{ color: COLORS.amber, fontFamily: monoStack, fontSize: 13 }}>MAP CHECK</div>
+            <div style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 10 }}>
+              {okay ? 'No issues found' : `${errors.length} error${errors.length === 1 ? '' : 's'} · ${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 11 }}>CLOSE</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-2">
+          {okay && (
+            <div className="p-4 text-center" style={{ color: COLORS.accent, fontFamily: monoStack, fontSize: 13 }}>
+              ✓ Looks good. Save and play.
+            </div>
+          )}
+          {issues.map((iss, i) => (
+            <button key={i}
+              onClick={() => onSelect(iss.where)}
+              className="w-full text-left rounded my-1 px-3 py-2"
+              style={{
+                background: iss.kind === 'error' ? '#2a1820' : '#1f2233',
+                border: '1px solid ' + (iss.kind === 'error' ? COLORS.danger : COLORS.amber),
+                fontFamily: monoStack, fontSize: 11,
+                color: iss.kind === 'error' ? COLORS.danger : COLORS.amber,
+              }}>
+              <span style={{ fontWeight: 600, marginRight: 6 }}>
+                {iss.kind === 'error' ? 'ERR' : 'WARN'}
+              </span>
+              <span style={{ color: COLORS.text }}>{iss.text}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ShareInstructions({ fileName, onClose }) {
   const monoStack = "'JetBrains Mono', monospace";
   return (
@@ -3938,7 +4324,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.8</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.9</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

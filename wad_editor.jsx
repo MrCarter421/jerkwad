@@ -580,7 +580,7 @@ const DOOM_TEXTURES = {
 // dungeon graph — that's a separate feature — but a one-tap playable map.
 function generateRandomWorld() {
   let m = outdoorStarter();
-  let seed = (Date.now() & 0x7fffffff) || 1;
+  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => {
     seed = (seed * 1103515245 + 12345) & 0x7fffffff;
     return (seed >>> 8) / 0xffffff;
@@ -671,7 +671,7 @@ function generateRandomWorld() {
 // Door texture is DOOR3 (64-wide canonical) and door tracks use DOORTRAK
 // with the lower-unpegged flag set so the side textures don't slide.
 function generateDungeon() {
-  let seed = (Date.now() & 0x7fffffff) || 1;
+  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
   const sn = v => Math.round(v / 32) * 32;
@@ -679,6 +679,7 @@ function generateDungeon() {
   const MAX_STEP = 24;     // Doom player can step up ≤24 without lift
   const CW = 64;           // canonical corridor width
   const TRIM_W = 16;       // perimeter trim ring width
+  const DOOR_THICK = 16;   // depth of the door body sector at each corridor end
   const INNER_INSET = 96;  // inner-feature inset from trim's inner edge
 
   // -------- polygon helpers --------
@@ -717,6 +718,13 @@ function generateDungeon() {
   function bboxOverlap(a, b, margin = 0) {
     return !(a.maxX + margin < b.minX || b.maxX + margin < a.minX ||
              a.maxY + margin < b.minY || b.maxY + margin < a.minY);
+  }
+  // Half-span of the axis-aligned flat segment available for a doorway on a
+  // given cardinal side. Squares: full half-dimension. Octagons at 22.5°
+  // offset: only ±0.383r is actually flat-walled — the rest is diagonal.
+  function cardinalSpan(room, side) {
+    if (room.type === 'octagon') return room.r * 0.383;
+    return (side === 'E' || side === 'W') ? room.h / 2 : room.w / 2;
   }
 
   // -------- 1. place rooms --------
@@ -770,8 +778,12 @@ function generateDungeon() {
       const west = ba.maxX < bb.minX ? ra : rb;
       const east = ba.maxX < bb.minX ? rb : ra;
       const wbb = roomBBox(west), ebb = roomBBox(east);
-      const yLow = Math.max(wbb.minY, ebb.minY) + 96;  // keep doorways away from corners
-      const yHigh = Math.min(wbb.maxY, ebb.maxY) - 96;
+      // Doorway must fall inside BOTH rooms' actual cardinal flat-edge span,
+      // not just the effective bbox (octagons have diagonal corner segments
+      // that can't host a 64-unit doorway).
+      const wSpan = cardinalSpan(west, 'E'), eSpan = cardinalSpan(east, 'W');
+      const yLow = Math.max(west.cy - wSpan, east.cy - eSpan) + 32;
+      const yHigh = Math.min(west.cy + wSpan, east.cy + eSpan) - 32;
       if (yHigh - yLow >= CW) {
         const cy = sn((yLow + yHigh) / 2);
         const co = {
@@ -787,8 +799,9 @@ function generateDungeon() {
       const south = ba.maxY < bb.minY ? ra : rb;
       const north = ba.maxY < bb.minY ? rb : ra;
       const sbb = roomBBox(south), nbb = roomBBox(north);
-      const xLow = Math.max(sbb.minX, nbb.minX) + 96;
-      const xHigh = Math.min(sbb.maxX, nbb.maxX) - 96;
+      const sSpan = cardinalSpan(south, 'N'), nSpan = cardinalSpan(north, 'S');
+      const xLow = Math.max(south.cx - sSpan, north.cx - nSpan) + 32;
+      const xHigh = Math.min(south.cx + sSpan, north.cx + nSpan) - 32;
       if (xHigh - xLow >= CW) {
         const cx = sn((xLow + xHigh) / 2);
         const co = {
@@ -888,39 +901,46 @@ function generateDungeon() {
   };
 
   rooms.forEach((r) => {
-    // Trim ring (donut) – ALWAYS present. Outer surface of the room visible
-    // to corridors. Walks the outer wall path.
-    r.trimId = allocSec({
-      floorH: r.floorH + 8, ceilH: r.ceilH,
-      floorTex: r.palette.trim, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
-      light: Math.min(255, r.light + 8), special: 0,
-    });
-    // Main interior. If feature='none', this is a solid polygon. Else, it's
-    // a donut around the inner feature.
-    r.mainId = allocSec({
+    // Number of concentric trim layers stepping up toward the centre.
+    r.trimLayers = 1 + Math.floor(rand() * 3);  // 1..3
+    // Outer sector: lowest floor, faces corridors. This is what doorways connect to.
+    r.outerId = allocSec({
       floorH: r.floorH, ceilH: r.ceilH,
       floorTex: r.palette.floor, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
       light: r.light, special: r.special,
     });
-    // Inner feature
+    // Concentric trim layers. Each layer steps up 8 units and uses the trim
+    // texture. Lower texture between layers is set automatically by the
+    // resolveTwoSidedTextures post-pass.
+    r.trimIds = [];
+    for (let i = 1; i <= r.trimLayers; i++) {
+      r.trimIds.push(allocSec({
+        floorH: r.floorH + i * 8, ceilH: r.ceilH,
+        floorTex: r.palette.trim,
+        ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+        light: Math.min(255, r.light + i * 6), special: 0,
+      }));
+    }
+    // Optional centre feature, sits inside the innermost trim.
+    const centerBaseFloor = r.floorH + (r.trimLayers + 1) * 8;
     if (r.feature === 'platform') {
       r.featureId = allocSec({
-        floorH: r.floorH + 16, ceilH: r.ceilH,
+        floorH: centerBaseFloor + 8, ceilH: r.ceilH,
         floorTex: r.palette.accent, ceilTex: r.palette.accent,
         light: Math.min(255, r.light + 32), special: 0,
       });
     } else if (r.feature === 'sky') {
       r.featureId = allocSec({
-        floorH: r.floorH, ceilH: r.floorH + 384,
+        floorH: centerBaseFloor, ceilH: r.floorH + 384,
         floorTex: r.palette.floor, ceilTex: 'F_SKY1',
-        light: Math.min(255, r.light + 32), special: 0,
+        light: Math.min(255, r.light + 48), special: 0,
       });
     } else if (r.feature === 'pit') {
       r.featureId = allocSec({
         floorH: r.floorH - 16, ceilH: r.ceilH,
         floorTex: pick(['BLOOD1', 'NUKAGE1', 'LAVA1', 'FWATER1']),
         ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
-        light: Math.max(64, r.light - 24), special: r.feature === 'pit' ? 7 : 0,
+        light: Math.max(64, r.light - 24), special: 7,
       });
     }
   });
@@ -933,10 +953,24 @@ function generateDungeon() {
     const ra = rooms[ai], rb = rooms[bi];
     const fh = Math.max(ra.floorH, rb.floorH);
     const baseLight = Math.max(ra.light, rb.light);
-    co.sectorId = allocSec({
+    // Main corridor body (the long middle section, ceil 96 above floor).
+    co.mainBodyId = allocSec({
       floorH: fh, ceilH: fh + 96,
       floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
       light: Math.max(96, baseLight - 48), special: 0,
+    });
+    // Two door body sectors, one at each end, 16 units thick. Closed state:
+    // ceil = floor. Player triggers DR-1 on the corridor-side face; door
+    // body's ceiling rises and the player can pass through to the room.
+    co.doorAId = allocSec({
+      floorH: fh, ceilH: fh,
+      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      light: Math.max(80, baseLight - 64), special: 0,
+    });
+    co.doorBId = allocSec({
+      floorH: fh, ceilH: fh,
+      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      light: Math.max(80, baseLight - 64), special: 0,
     });
   });
 
@@ -969,6 +1003,7 @@ function generateDungeon() {
         existing.back = newSd(sectorId, { middle: '-', ...props.backSide });
         existing.flags = (existing.flags | 4) & ~1;
       }
+      if (props.flags) existing.flags |= props.flags;
       return existing;
     }
     const middle = sharedSector ? '-' : (props.middle ?? 'STARTAN2');
@@ -977,7 +1012,7 @@ function generateDungeon() {
     const ld = {
       id: 'l' + linedefs.length,
       v1, v2,
-      flags: sharedSector ? 4 : 1,
+      flags: (sharedSector ? 4 : 1) | (props.flags || 0),
       special: 0, tag: 0, front, back,
     };
     linedefs.push(ld);
@@ -1012,7 +1047,6 @@ function generateDungeon() {
       // Edge position must match perp coordinate
       if (sideExpectsVert) {
         if (Math.abs(p1.x - perp) > 0.5) continue;
-        // Edge y-span must contain the corridor y-range
         const eMin = Math.min(p1.y, p2.y), eMax = Math.max(p1.y, p2.y);
         if (range[0] < eMin - 0.5 || range[1] > eMax + 0.5) continue;
       } else {
@@ -1020,10 +1054,15 @@ function generateDungeon() {
         const eMin = Math.min(p1.x, p2.x), eMax = Math.max(p1.x, p2.x);
         if (range[0] < eMin - 0.5 || range[1] > eMax + 0.5) continue;
       }
-      atts.push({ a: range[0], b: range[1], corridor: co, edgeVert: sideExpectsVert });
+      // For corridor doorways, the segment shares with the adjacent DOOR BODY
+      // sector (not the corridor main body) so the door geometry frames the
+      // opening cleanly.
+      const isFirstRoom = (co.orient === 'H' ? co.wIdx : co.sIdx) === rooms.indexOf(room);
+      const doorBodyId = isFirstRoom ? co.doorAId : co.doorBId;
+      atts.push({ a: range[0], b: range[1], corridor: co, doorBodyId });
     }
     if (atts.length === 0) {
-      emitWall(p1.x, p1.y, p2.x, p2.y, room.trimId, null, { middle: room.palette.wall });
+      emitWall(p1.x, p1.y, p2.x, p2.y, room.outerId, null, { middle: room.palette.wall });
       return;
     }
     const walkDir = isHoriz ? Math.sign(dx) : Math.sign(dy);
@@ -1035,106 +1074,149 @@ function generateDungeon() {
       const near = walkDir > 0 ? att.a : att.b;
       const far = walkDir > 0 ? att.b : att.a;
       if (Math.abs(cur - near) > 0.5) {
-        if (isHoriz) emitWall(cur, ortho, near, ortho, room.trimId, null, { middle: room.palette.wall });
-        else emitWall(ortho, cur, ortho, near, room.trimId, null, { middle: room.palette.wall });
+        if (isHoriz) emitWall(cur, ortho, near, ortho, room.outerId, null, { middle: room.palette.wall });
+        else emitWall(ortho, cur, ortho, near, room.outerId, null, { middle: room.palette.wall });
       }
-      if (isHoriz) emitWall(near, ortho, far, ortho, room.trimId, att.corridor.sectorId);
-      else emitWall(ortho, near, ortho, far, room.trimId, att.corridor.sectorId);
+      // Doorway segment: two-sided room outer ↔ door body. Mark
+      // lower-unpegged because the door body's ceiling rises and we don't
+      // want the side textures to slide.
+      if (isHoriz) emitWall(near, ortho, far, ortho, room.outerId, att.doorBodyId, { flags: 16 });
+      else emitWall(ortho, near, ortho, far, room.outerId, att.doorBodyId, { flags: 16 });
       cur = far;
     }
     if (Math.abs(cur - end) > 0.5) {
-      if (isHoriz) emitWall(cur, ortho, end, ortho, room.trimId, null, { middle: room.palette.wall });
-      else emitWall(ortho, cur, ortho, end, room.trimId, null, { middle: room.palette.wall });
+      if (isHoriz) emitWall(cur, ortho, end, ortho, room.outerId, null, { middle: room.palette.wall });
+      else emitWall(ortho, cur, ortho, end, room.outerId, null, { middle: room.palette.wall });
     }
   }
 
-  // For each room: outer polygon (CW walk, front=trim ring), then trim's
-  // inner edge (CCW walk around inner polygon, front=trim, back=main), then
-  // optional inner feature ring (CCW walk around feature polygon, front=main,
-  // back=feature).
+  // For each room: outer polygon CW walk (with corridor cuts), then one ring
+  // per trim layer (CCW walk around the inset polygon, layer-N-1 on front,
+  // layer-N on back), then optional centre feature ring.
   rooms.forEach((room) => {
     const outerCCW = roomPoly(room);
     const outerCW = outerCCW.slice().reverse();
     for (let i = 0; i < outerCW.length; i++) {
       emitOuterEdge(room, outerCW[i], outerCW[(i + 1) % outerCW.length]);
     }
-    // Trim inner ring
-    const trimInnerCCW = roomPoly(room, TRIM_W);
-    for (let i = 0; i < trimInnerCCW.length; i++) {
-      const p1 = trimInnerCCW[i], p2 = trimInnerCCW[(i + 1) % trimInnerCCW.length];
-      const ld = emitWall(p1.x, p1.y, p2.x, p2.y, room.trimId, room.mainId);
-      if (ld) {
-        // trim is +8 above main; back (main) sees a small step. Set lower
-        // texture on the BACK sidedef (the one facing the lower main floor).
-        const bs = sidedefs.find(s => s.id === ld.back);
-        if (bs) bs.lower = room.palette.trim;
+    const layerIds = [room.outerId, ...room.trimIds];
+    // Ring i (1..trimLayers): between layer i-1 (outer-side) and layer i (inner-side).
+    for (let layer = 1; layer <= room.trimLayers; layer++) {
+      const ringPoly = roomPoly(room, TRIM_W * layer);
+      if (ringPoly.length < 3) break;
+      for (let j = 0; j < ringPoly.length; j++) {
+        const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+        // Walking CCW around the inset polygon: right of v1->v2 = outside
+        // inset = inside outer layer. emitWall(p1, p2, outerLayer, innerLayer)
+        // gives front=outerLayer, back=innerLayer.
+        emitWall(p1.x, p1.y, p2.x, p2.y, layerIds[layer - 1], layerIds[layer]);
       }
     }
-    // Inner feature ring
-    if (room.feature !== 'none') {
-      const featureCCW = roomPoly(room, TRIM_W + INNER_INSET);
-      for (let i = 0; i < featureCCW.length; i++) {
-        const p1 = featureCCW[i], p2 = featureCCW[(i + 1) % featureCCW.length];
-        const ld = emitWall(p1.x, p1.y, p2.x, p2.y, room.mainId, room.featureId);
-        if (ld && room.feature === 'platform') {
-          const bs = sidedefs.find(s => s.id === ld.back);
-          if (bs) bs.lower = room.palette.accent;
-        } else if (ld && room.feature === 'pit') {
-          const fs = sidedefs.find(s => s.id === ld.front);
-          if (fs) fs.lower = 'STEP1';
-        } else if (ld && room.feature === 'sky') {
-          // Sky column reaches higher than main ceiling — upper texture on
-          // main's side (front sidedef which faces main).
-          const fs = sidedefs.find(s => s.id === ld.front);
-          if (fs) fs.upper = room.palette.wall;
+    // Centre feature
+    if (room.feature !== 'none' && room.featureId) {
+      const ringPoly = roomPoly(room, TRIM_W * room.trimLayers + INNER_INSET);
+      if (ringPoly.length >= 3) {
+        const innerMost = layerIds[layerIds.length - 1];
+        for (let j = 0; j < ringPoly.length; j++) {
+          const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+          emitWall(p1.x, p1.y, p2.x, p2.y, innerMost, room.featureId);
         }
       }
     }
   });
 
-  // Corridor walls (excluding shared edges with rooms — already emitted)
+  // Corridor walls: three sectors per corridor — doorBodyA at one end, the
+  // main hallway body in the middle, and doorBodyB at the other end. Each
+  // door body is 16 deep with closed-state ceil=floor. Track walls
+  // (perpendicular to the corridor's long axis, 16 units long) get DOORTRAK
+  // middle + LOWER_UNPEGGED so the side texture doesn't slide. The line
+  // between mainBody and each doorBody is the door action line (DR-1) with
+  // DOOR3 upper as the door image — front is mainBody so the player
+  // approaching from the corridor sees the door.
   corridors.forEach((co) => {
     if (co.orient === 'H') {
-      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, null, { middle: 'STARTAN2' });
-      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, rooms[co.eIdx].trimId);
-      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, null, { middle: 'STARTAN2' });
-      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, rooms[co.wIdx].trimId);
+      const A = co.minX, B = co.maxX, C = co.minY, D = co.maxY;
+      const aIn = A + DOOR_THICK, bIn = B - DOOR_THICK;
+      // doorBodyA (west) tracks
+      emitWall(A, D, aIn, D, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(aIn, C, A, C, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      // mainBody long walls
+      emitWall(aIn, D, bIn, D, co.mainBodyId, null, { middle: 'STARTAN2' });
+      emitWall(bIn, C, aIn, C, co.mainBodyId, null, { middle: 'STARTAN2' });
+      // doorBodyB (east) tracks
+      emitWall(bIn, D, B, D, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(B, C, bIn, C, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      // door A face (between mainBody and doorBodyA). front=mainBody.
+      emitWall(aIn, C, aIn, D, co.mainBodyId, co.doorAId);
+      // door B face (between mainBody and doorBodyB). front=mainBody.
+      emitWall(bIn, D, bIn, C, co.mainBodyId, co.doorBId);
     } else {
-      emitWall(co.minX, co.maxY, co.maxX, co.maxY, co.sectorId, rooms[co.nIdx].trimId);
-      emitWall(co.maxX, co.maxY, co.maxX, co.minY, co.sectorId, null, { middle: 'STARTAN2' });
-      emitWall(co.maxX, co.minY, co.minX, co.minY, co.sectorId, rooms[co.sIdx].trimId);
-      emitWall(co.minX, co.minY, co.minX, co.maxY, co.sectorId, null, { middle: 'STARTAN2' });
+      const A = co.minY, B = co.maxY, C = co.minX, D = co.maxX;
+      const aIn = A + DOOR_THICK, bIn = B - DOOR_THICK;
+      // doorBodyA (south) tracks (parallel to the corridor's long Y axis)
+      emitWall(C, A, C, aIn, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(D, aIn, D, A, co.doorAId, null, { middle: 'DOORTRAK', flags: 16 });
+      // mainBody long walls
+      emitWall(C, aIn, C, bIn, co.mainBodyId, null, { middle: 'STARTAN2' });
+      emitWall(D, bIn, D, aIn, co.mainBodyId, null, { middle: 'STARTAN2' });
+      // doorBodyB (north) tracks
+      emitWall(C, bIn, C, B, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      emitWall(D, B, D, bIn, co.doorBId, null, { middle: 'DOORTRAK', flags: 16 });
+      // door A face (south end). emit so mainBody is on front (north side).
+      emitWall(D, aIn, C, aIn, co.mainBodyId, co.doorAId);
+      // door B face (north end). emit so mainBody is on front (south side).
+      emitWall(C, bIn, D, bIn, co.mainBodyId, co.doorBId);
     }
   });
 
-  // -------- 8. Apply door specials and door textures --------
-  // Door image: DOOR3 (64-wide canonical). Upper texture set on both sides.
-  // Corridor's perpendicular (track) walls: DOORTRAK + lower-unpegged so the
-  // texture doesn't move with the ceiling.
+  // -------- 8. Apply door specials --------
+  // Each line between mainBody and a doorBody becomes a DR-1 door. DOOR3
+  // upper goes on the mainBody side (front) so the player approaching from
+  // the corridor sees the door image stretched from corridor ceiling down
+  // to the closed door body. Do NOT set lower-unpegged on the door face —
+  // the door image must ride with the moving ceiling.
   const sdMap = new Map(sidedefs.map(s => [s.id, s]));
   corridors.forEach((co) => {
     for (const l of linedefs) {
       if (l.front === -1 || l.back === -1) continue;
       const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
       if (!fs || !bs) continue;
-      const interfacesCorridor = (fs.sector === co.sectorId && rooms.some(r => r.trimId === bs.sector))
-                              || (bs.sector === co.sectorId && rooms.some(r => r.trimId === fs.sector));
-      if (!interfacesCorridor) continue;
-      l.special = 1; // DR Open Door
-      l.flags = (l.flags | 16); // lower-unpegged on the door face
-      const doorTex = (co.maxX - co.minX > 96 || co.maxY - co.minY > 96) ? 'BIGDOOR2' : 'DOOR3';
-      fs.upper = doorTex; bs.upper = doorTex;
-    }
-    // The corridor's perpendicular-to-corridor walls are tracks. Set DOORTRAK +
-    // lower-unpegged so the side textures stay put when the door moves.
-    for (const l of linedefs) {
-      if (l.back !== -1) continue;
-      const fs = sdMap.get(l.front);
-      if (!fs || fs.sector !== co.sectorId) continue;
-      fs.middle = 'DOORTRAK';
-      l.flags = (l.flags | 16);
+      const isDoorFace = fs.sector === co.mainBodyId &&
+        (bs.sector === co.doorAId || bs.sector === co.doorBId);
+      if (!isDoorFace) continue;
+      l.special = 1; // DR Open Door — operates on the BACK sector (door body)
+      const doorTex = 'DOOR3'; // 64-wide canonical
+      fs.upper = doorTex;
+      bs.upper = doorTex;
     }
   });
+
+  // -------- 8b. Resolve upper / lower textures on every two-sided line --------
+  // For every two-sided line with a floor or ceiling step, set a wall texture
+  // on the visible side (lower texture on the side with the lower floor,
+  // upper texture on the side with the higher ceiling). Skips sides already
+  // textured (preserves door image, DOORTRAK tracks, etc.) and sky-to-sky.
+  const secMap = new Map(sectors.map(s => [s.id, s]));
+  for (const l of linedefs) {
+    if (l.front === -1 || l.back === -1) continue;
+    const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
+    if (!fs || !bs) continue;
+    const fsec = secMap.get(fs.sector), bsec = secMap.get(bs.sector);
+    if (!fsec || !bsec) continue;
+    // Lower texture: on the side adjacent to the LOWER floor (visible from there).
+    if (fsec.floorH !== bsec.floorH) {
+      const lowSide = fsec.floorH < bsec.floorH ? fs : bs;
+      if (!lowSide.lower || lowSide.lower === '-') lowSide.lower = 'STEP1';
+    }
+    // Upper texture: on the side adjacent to the HIGHER ceiling (visible from there).
+    if (fsec.ceilH !== bsec.ceilH) {
+      const bothSky = fsec.ceilTex === 'F_SKY1' && bsec.ceilTex === 'F_SKY1';
+      if (!bothSky) {
+        const highSide = fsec.ceilH > bsec.ceilH ? fs : bs;
+        if (!highSide.upper || highSide.upper === '-') highSide.upper = 'STARTAN2';
+      }
+    }
+  }
 
   // -------- 9. Place things --------
   const things = [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
@@ -1171,14 +1253,23 @@ function generateDungeon() {
     const d = Math.abs(rooms[i].cx - rooms[0].cx) + Math.abs(rooms[i].cy - rooms[0].cy);
     if (d > exitDist) { exitDist = d; exitIdx = i; }
   }
-  const exitTrim = rooms[exitIdx].trimId;
-  for (const l of linedefs) {
-    if (l.back !== -1) continue;
-    const fs = sdMap.get(l.front);
-    if (!fs || fs.sector !== exitTrim) continue;
-    l.special = 11;
-    fs.middle = 'SW1EXIT';
-    break;
+  // Exit switch in the room furthest from start. Prefer to paint it on the
+  // innermost trim layer's wall so the player has to push deep into the
+  // room to find it — but fall back to the outer wall if the room has no
+  // trim layers (shouldn't happen, but safe).
+  const exitSectorCandidates = [
+    ...(rooms[exitIdx].trimIds || []).slice().reverse(),
+    rooms[exitIdx].outerId,
+  ];
+  outer: for (const secId of exitSectorCandidates) {
+    for (const l of linedefs) {
+      if (l.back !== -1) continue;
+      const fs = sdMap.get(l.front);
+      if (!fs || fs.sector !== secId) continue;
+      l.special = 11;
+      fs.middle = 'SW1EXIT';
+      break outer;
+    }
   }
 
   return { vertices: verts, linedefs, sidedefs, sectors, things };
@@ -1381,6 +1472,246 @@ function cleanPhantomSectors(map) {
   return {
     map: { ...map, sectors: nextSectors, sidedefs: nextSidedefs, linedefs: nextLinedefs },
     removed: phantoms.size,
+  };
+}
+
+// WAD validity checker. Surfaces issues the engine will complain about
+// before the user saves and runs the map in GZDoom: dangling vertex/sidedef
+// references, zero-length lines, duplicate-coincident lines, out-of-int16
+// coordinates, sectors with floor above ceiling, missing player start,
+// orphan sectors, and a few visual-glitch traps (height step on a one-sided
+// line, two-sided line with no upper/lower on a height delta).
+function validateMap(map) {
+  const issues = [];
+  const vIds = new Set(map.vertices.map(v => v.id));
+  const sdIds = new Set(map.sidedefs.map(s => s.id));
+  const secIds = new Set(map.sectors.map(s => s.id));
+  const vCoord = new Map();
+  for (const v of map.vertices) vCoord.set(v.id, v);
+
+  for (const ld of map.linedefs) {
+    if (!vIds.has(ld.v1)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing vertex ${ld.v1}`, where: ld.id });
+    if (!vIds.has(ld.v2)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing vertex ${ld.v2}`, where: ld.id });
+    if (ld.v1 === ld.v2) issues.push({ kind: 'error', text: `Line ${ld.id} is zero-length (v1==v2)`, where: ld.id });
+    if (ld.front !== -1 && !sdIds.has(ld.front)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing front sidedef ${ld.front}`, where: ld.id });
+    if (ld.back !== -1 && !sdIds.has(ld.back)) issues.push({ kind: 'error', text: `Line ${ld.id} references missing back sidedef ${ld.back}`, where: ld.id });
+    if ((ld.front === -1 || ld.front == null) && (ld.back === -1 || ld.back == null)) {
+      issues.push({ kind: 'warning', text: `Line ${ld.id} has no sidedefs (raw line — won't render)`, where: ld.id });
+    }
+  }
+
+  for (const sd of map.sidedefs) {
+    if (!secIds.has(sd.sector)) issues.push({ kind: 'error', text: `Sidedef ${sd.id} references missing sector ${sd.sector}`, where: sd.id });
+  }
+
+  // Coincident-line detection: any two distinct lines sharing the same vertex
+  // pair (in either direction). True collinear-overlap detection (one line
+  // sitting on a sub-segment of another) is more expensive; we catch the
+  // common case here.
+  const seen = new Map();
+  for (const ld of map.linedefs) {
+    if (!vIds.has(ld.v1) || !vIds.has(ld.v2) || ld.v1 === ld.v2) continue;
+    const key = ld.v1 < ld.v2 ? ld.v1 + '|' + ld.v2 : ld.v2 + '|' + ld.v1;
+    if (seen.has(key)) {
+      issues.push({ kind: 'warning', text: `Line ${ld.id} overlaps line ${seen.get(key)} (same endpoints)`, where: ld.id });
+    } else {
+      seen.set(key, ld.id);
+    }
+  }
+
+  for (const s of map.sectors) {
+    if (s.floorH > s.ceilH) issues.push({ kind: 'error', text: `Sector ${s.id} floor (${s.floorH}) above ceiling (${s.ceilH})`, where: s.id });
+    if (s.light < 0 || s.light > 255) issues.push({ kind: 'warning', text: `Sector ${s.id} light ${s.light} outside 0..255`, where: s.id });
+    if (s.ceilH - s.floorH < 56 && s.ceilH !== s.floorH) {
+      issues.push({ kind: 'warning', text: `Sector ${s.id} headroom < 56 (player won't fit)`, where: s.id });
+    }
+  }
+
+  const refByLine = new Set();
+  for (const sd of map.sidedefs) refByLine.add(sd.sector);
+  for (const s of map.sectors) {
+    if (!refByLine.has(s.id)) issues.push({ kind: 'warning', text: `Sector ${s.id} has no sidedefs (orphan)`, where: s.id });
+  }
+
+  const hasPlayer = map.things.some(t => t.type === 1);
+  if (!hasPlayer) issues.push({ kind: 'error', text: 'No Player 1 Start (thing type 1)' });
+
+  const COORD_MAX = 32767;
+  for (const v of map.vertices) {
+    if (Math.abs(v.x) > COORD_MAX || Math.abs(v.y) > COORD_MAX) {
+      issues.push({ kind: 'error', text: `Vertex ${v.id} at (${v.x}, ${v.y}) exceeds int16 range`, where: v.id });
+    }
+  }
+
+  // HOM / Tutti-Frutti: two-sided line with a height step where no upper or
+  // lower texture is set on the visible side.
+  const sdById = new Map(map.sidedefs.map(s => [s.id, s]));
+  const secById = new Map(map.sectors.map(s => [s.id, s]));
+  let homCount = 0;
+  for (const ld of map.linedefs) {
+    if (ld.front === -1 || ld.back === -1) continue;
+    const fs = sdById.get(ld.front), bs = sdById.get(ld.back);
+    if (!fs || !bs) continue;
+    const fsec = secById.get(fs.sector), bsec = secById.get(bs.sector);
+    if (!fsec || !bsec) continue;
+    if (fsec.floorH !== bsec.floorH) {
+      const lowSide = fsec.floorH < bsec.floorH ? fs : bs;
+      if (!lowSide.lower || lowSide.lower === '-') {
+        homCount++;
+        if (homCount <= 5) issues.push({ kind: 'warning', text: `Line ${ld.id} has a floor step with no lower texture (HOM risk)`, where: ld.id });
+      }
+    }
+    if (fsec.ceilH !== bsec.ceilH) {
+      const bothSky = fsec.ceilTex === 'F_SKY1' && bsec.ceilTex === 'F_SKY1';
+      if (!bothSky) {
+        const highSide = fsec.ceilH > bsec.ceilH ? fs : bs;
+        if (!highSide.upper || highSide.upper === '-') {
+          homCount++;
+          if (homCount <= 5) issues.push({ kind: 'warning', text: `Line ${ld.id} has a ceiling step with no upper texture (HOM risk)`, where: ld.id });
+        }
+      }
+    }
+  }
+  if (homCount > 5) issues.push({ kind: 'warning', text: `(+${homCount - 5} more HOM-risk lines hidden)` });
+
+  return issues;
+}
+
+// Generate additional rooms grafted onto an existing map. Finds the bounding
+// box of existing geometry, picks a direction with space, and runs a small
+// dungeon pass adjacent to that side. New geometry uses fresh IDs offset to
+// avoid collisions with the existing map's IDs. The user can then connect
+// the new cluster via Draw mode or another Add Rooms call.
+// Find closed cycles in the linedef graph that are NOT yet sectors. Returns
+// an array of { loop: [vertexId...], centroid: {x,y}, vertices: [{x,y}...] }.
+// Drawn freely with the Draw tool, a closed shape sits as raw linedefs until
+// the user promotes it. This is WADED's "Make Sector" workflow.
+function findPotentialSectors(map) {
+  if (!map.linedefs.length || !map.vertices.length) return [];
+  // Augment: for every linedef with a missing side, attach a virtual sidedef
+  // belonging to a virtual "__void" sector. buildSectorLoops then traces the
+  // boundary of every void region as if it were a real sector.
+  const augSidedefs = map.sidedefs.slice();
+  const augLines = map.linedefs.map(ld => {
+    let { front, back } = ld;
+    if (!front || front === -1) {
+      const id = '__vf_' + ld.id;
+      augSidedefs.push({ id, sector: '__void', xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-' });
+      front = id;
+    }
+    if (!back || back === -1) {
+      const id = '__vb_' + ld.id;
+      augSidedefs.push({ id, sector: '__void', xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-' });
+      back = id;
+    }
+    return { ...ld, front, back };
+  });
+  const augMap = {
+    vertices: map.vertices,
+    sidedefs: augSidedefs,
+    sectors: map.sectors.concat([{ id: '__void' }]),
+    linedefs: augLines,
+    things: map.things,
+  };
+  const loops = buildSectorLoops(augMap);
+  const voidLoops = loops.get('__void') || [];
+  if (!voidLoops.length) return [];
+  // Existing-sector signatures so we don't suggest making a sector where one
+  // already exists.
+  const existingSigs = new Set();
+  for (const [secId, ls] of loops) {
+    if (secId === '__void') continue;
+    for (const loop of ls) existingSigs.add([...loop].sort().join('|'));
+  }
+  const vmap = new Map(map.vertices.map(v => [v.id, v]));
+  const seen = new Set();
+  const result = [];
+  for (const loop of voidLoops) {
+    if (loop.length < 3) continue;
+    const sig = [...loop].sort().join('|');
+    if (seen.has(sig) || existingSigs.has(sig)) continue;
+    seen.add(sig);
+    const pts = loop.map(id => vmap.get(id)).filter(Boolean);
+    if (pts.length < 3) continue;
+    const area = polygonSignedArea(pts);
+    if (Math.abs(area) < 64) continue; // skip degenerate slivers
+    // Keep only CCW orientation (the "inside" region). buildSectorFromLoop
+    // would normalize CW on conversion either way, but skipping the CW
+    // twin avoids duplicate highlights.
+    if (area < 0) continue;
+    result.push({ loop, vertices: pts, centroid: polygonCentroid(pts), area });
+  }
+  return result;
+}
+
+function buildAddedRooms(existing) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const v of existing.vertices) {
+    if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
+    if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
+  }
+  if (!isFinite(minX)) return existing;
+  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
+  // Pick a side with space — the new cluster will be GAP units past the
+  // existing bbox in that direction.
+  const GAP = 256;
+  const sides = ['E', 'W', 'N', 'S'];
+  let offX = 0, offY = 0;
+  for (let i = 0; i < 4; i++) {
+    const side = sides[Math.floor(rand() * sides.length)];
+    if (side === 'E' && maxX + GAP + 1024 < 32000) { offX = maxX + GAP + 768; offY = (minY + maxY) / 2; break; }
+    if (side === 'W' && minX - GAP - 1024 > -32000) { offX = minX - GAP - 768; offY = (minY + maxY) / 2; break; }
+    if (side === 'N' && maxY + GAP + 1024 < 32000) { offX = (minX + maxX) / 2; offY = maxY + GAP + 768; break; }
+    if (side === 'S' && minY - GAP - 1024 > -32000) { offX = (minX + maxX) / 2; offY = minY - GAP - 768; break; }
+  }
+  // Generate a fresh dungeon and translate it to the chosen offset.
+  const fresh = generateDungeon();
+  // Centre fresh on origin then shift to (offX, offY).
+  let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
+  for (const v of fresh.vertices) {
+    if (v.x < fMinX) fMinX = v.x; if (v.x > fMaxX) fMaxX = v.x;
+    if (v.y < fMinY) fMinY = v.y; if (v.y > fMaxY) fMaxY = v.y;
+  }
+  const fCx = (fMinX + fMaxX) / 2, fCy = (fMinY + fMaxY) / 2;
+  const dx = Math.round(offX - fCx), dy = Math.round(offY - fCy);
+  // Remap IDs to avoid clashes with the existing map.
+  const vOffset = existing.vertices.length;
+  const sdOffset = existing.sidedefs.length;
+  const sOffset = existing.sectors.length;
+  const lOffset = existing.linedefs.length;
+  const tOffset = existing.things.length;
+  const vIdMap = new Map(fresh.vertices.map((v, i) => [v.id, 'v' + (vOffset + i)]));
+  const sdIdMap = new Map(fresh.sidedefs.map((sd, i) => [sd.id, 'sd' + (sdOffset + i)]));
+  const sIdMap = new Map(fresh.sectors.map((s, i) => [s.id, 's' + (sOffset + i)]));
+  const newVertices = fresh.vertices.map((v, i) => ({
+    id: vIdMap.get(v.id), x: v.x + dx, y: v.y + dy,
+  }));
+  const newSidedefs = fresh.sidedefs.map((sd, i) => ({
+    ...sd, id: sdIdMap.get(sd.id), sector: sIdMap.get(sd.sector),
+  }));
+  const newSectors = fresh.sectors.map((s, i) => ({
+    ...s, id: sIdMap.get(s.id),
+  }));
+  const newLinedefs = fresh.linedefs.map((l, i) => ({
+    ...l, id: 'l' + (lOffset + i),
+    v1: vIdMap.get(l.v1), v2: vIdMap.get(l.v2),
+    front: l.front === -1 ? -1 : sdIdMap.get(l.front),
+    back: l.back === -1 ? -1 : sdIdMap.get(l.back),
+  }));
+  // Drop any duplicate player-1-start; keep the player in the existing map.
+  const newThings = fresh.things
+    .filter(t => t.type !== 1)
+    .map((t, i) => ({
+      ...t, id: 't' + (tOffset + i),
+      x: t.x + dx, y: t.y + dy,
+    }));
+  return {
+    vertices: [...existing.vertices, ...newVertices],
+    linedefs: [...existing.linedefs, ...newLinedefs],
+    sidedefs: [...existing.sidedefs, ...newSidedefs],
+    sectors: [...existing.sectors, ...newSectors],
+    things: [...existing.things, ...newThings],
   };
 }
 
@@ -1678,6 +2009,7 @@ export default function WadEditor() {
   // dimensions in ShapeSheet. Tapping the canvas moves the ghost; the STAMP
   // button commits it.
   const [stampPreview, setStampPreview] = useState(null);
+  const [checkIssues, setCheckIssues] = useState(null);
   const [propsOpen, setPropsOpen] = useState(false);
   const [radial, setRadial] = useState(null);
   const [hint, setHint] = useState(null);
@@ -1698,6 +2030,9 @@ export default function WadEditor() {
 
   const map = doc.maps[doc.currentMap];
   const sectorLoops = useMemo(() => buildSectorLoops(map), [map]);
+  // Potential sectors: closed cycles in raw lines that aren't sectors yet.
+  // Highlighted on the canvas; long-press inside one to promote it.
+  const potentialSectors = useMemo(() => findPotentialSectors(map), [map]);
 
   const selectedSectorLineIds = useMemo(() => {
     if (selection?.type !== 'sector') return null;
@@ -2009,6 +2344,13 @@ export default function WadEditor() {
       if (ld) { setRadial({ sx, sy, kind: 'linedef', id: ld.id }); navHaptic(); return; }
       const secId = hitSector(sx, sy);
       if (secId) { setRadial({ sx, sy, kind: 'sector', id: secId }); navHaptic(); return; }
+      // Long-press inside a potential sector's polygon → offer Make Sector.
+      const w = screenToWorld(sx, sy);
+      const ps = potentialSectors.find(p => pointInPolygon(w.x, w.y, p.vertices));
+      if (ps) {
+        setRadial({ sx, sy, kind: 'potential', potential: ps });
+        navHaptic(); return;
+      }
       setRadial({ sx, sy, kind: 'empty' });
       navHaptic();
     }, 480);
@@ -2384,6 +2726,35 @@ export default function WadEditor() {
         if (isSel) {
           ctx.fillStyle = 'rgba(127, 255, 212, 0.18)';
           ctx.fill('evenodd');
+        }
+      }
+    }
+
+    // Potential sectors: cyan dashed-fill overlay marks any closed loop in
+    // the raw linedef graph that isn't yet a sector. Long-press inside one
+    // to promote it via the radial menu.
+    if (potentialSectors.length) {
+      for (const ps of potentialSectors) {
+        ctx.beginPath();
+        for (let i = 0; i < ps.vertices.length; i++) {
+          const s = worldToScreen(ps.vertices[i].x, ps.vertices[i].y);
+          if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(127, 255, 212, 0.16)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(127, 255, 212, 0.75)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 5]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Label
+        if (view.zoom > 0.12) {
+          const cs = worldToScreen(ps.centroid.x, ps.centroid.y);
+          ctx.font = "10px 'JetBrains Mono', monospace";
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillStyle = 'rgba(127, 255, 212, 0.95)';
+          ctx.fillText('make sector', cs.x, cs.y);
         }
       }
     }
@@ -2812,6 +3183,18 @@ export default function WadEditor() {
         break;
       }
       case 'stamp-shape': setStampSheet('shapes'); break;
+      case 'make-sector': {
+        if (!r.potential) break;
+        updateMap(m => {
+          const chain = [...r.potential.loop, r.potential.loop[0]];
+          const result = buildSectorFromLoop(m, chain);
+          if (!result || result.selectedExistingId) return m;
+          setSelection({ type: 'sector', id: result.createdSectorId });
+          setHint('Sector built from cycle');
+          return result;
+        });
+        break;
+      }
     }
   }
 
@@ -2824,7 +3207,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.7</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.9</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -2851,11 +3234,20 @@ export default function WadEditor() {
               <button onClick={() => addNewMapSlot('random')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚄ random world</button>
               <button onClick={() => addNewMapSlot('dungeon')} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.amber, fontWeight: 600 }}>⚔ random dungeon</button>
               <button onClick={() => {
+                updateMap(m => buildAddedRooms(m));
+                setMapMenuOpen(false);
+                setHint('More rooms added — connect them in Draw mode');
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.accent, fontWeight: 600 }}>+ build more rooms</button>
+              <button onClick={() => {
+                setCheckIssues(validateMap(map));
+                setMapMenuOpen(false);
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.text, borderTop: '1px solid ' + COLORS.border }}>✓ check map</button>
+              <button onClick={() => {
                 let removed = 0;
                 updateMap(m => { const r = cleanPhantomSectors(m); removed = r.removed; return r.map; });
                 setMapMenuOpen(false);
                 setHint(removed > 0 ? 'Cleaned ' + removed + ' phantom sector' + (removed === 1 ? '' : 's') : 'No phantoms found');
-              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.textDim, borderTop: '1px solid ' + COLORS.border }}>⌫ clean phantoms</button>
+              }} className="block w-full text-left px-3 py-2 text-sm" style={{ color: COLORS.textDim }}>⌫ clean phantoms</button>
             </div>
           )}
         </div>
@@ -3032,6 +3424,27 @@ export default function WadEditor() {
           onClose={() => setStampSheet(null)} />
       )}
       {shareModal && <ShareInstructions fileName={shareModal.fileName} onClose={() => setShareModal(null)} />}
+      {checkIssues && (
+        <CheckModal
+          issues={checkIssues}
+          onSelect={(where) => {
+            // Best-effort: try to select the issue's target if it's a known id.
+            if (!where) return;
+            if (typeof where === 'string') {
+              const t = where[0] === 'v' ? 'vertex'
+                : where[0] === 'l' && where[1] !== 'd' ? 'linedef'
+                : where[0] === 's' && where[1] !== 'd' ? 'sector'
+                : where[0] === 't' && !isNaN(where[1]) ? 'thing'
+                : where.startsWith('sd') ? 'sidedef'
+                : null;
+              if (t === 'vertex' || t === 'linedef' || t === 'sector' || t === 'thing') {
+                setSelection({ type: t, id: where });
+              }
+            }
+            setCheckIssues(null);
+          }}
+          onClose={() => setCheckIssues(null)} />
+      )}
       {welcomeOpen && (
         <WelcomeOverlay onOpen={() => fileInputRef.current?.click()}
           onNewOutdoor={() => onNewMap('outdoor')}
@@ -3281,6 +3694,11 @@ function RadialMenu({ radial, onAction, onClose }) {
       { id: 'start-draw', label: 'Draw', glyph: '✎' },
       { id: 'place-thing', label: 'Thing', glyph: '◉' },
       { id: 'stamp-shape', label: 'Shape', glyph: '◫' },
+    ],
+    potential: [
+      { id: 'make-sector', label: 'Make', glyph: '◇' },
+      { id: 'start-draw', label: 'Draw', glyph: '✎' },
+      { id: 'place-thing', label: 'Thing', glyph: '◉' },
     ],
   };
   const actions = actionsByKind[radial.kind] || [];
@@ -3827,6 +4245,53 @@ function ThingPicker({ onPick, onCancel }) {
   );
 }
 
+function CheckModal({ issues, onSelect, onClose }) {
+  const monoStack = "'JetBrains Mono', monospace";
+  const errors = issues.filter(i => i.kind === 'error');
+  const warnings = issues.filter(i => i.kind === 'warning');
+  const okay = issues.length === 0;
+  return (
+    <div className="absolute inset-0 z-50 flex items-end" style={{ background: '#000a' }} onClick={onClose}>
+      <div className="w-full rounded-t-lg flex flex-col"
+        style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border, maxHeight: '75%', paddingBottom: 'env(safe-area-inset-bottom)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="px-4 py-3 border-b flex items-center justify-between" style={{ borderColor: COLORS.border }}>
+          <div>
+            <div style={{ color: COLORS.amber, fontFamily: monoStack, fontSize: 13 }}>MAP CHECK</div>
+            <div style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 10 }}>
+              {okay ? 'No issues found' : `${errors.length} error${errors.length === 1 ? '' : 's'} · ${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 11 }}>CLOSE</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-2">
+          {okay && (
+            <div className="p-4 text-center" style={{ color: COLORS.accent, fontFamily: monoStack, fontSize: 13 }}>
+              ✓ Looks good. Save and play.
+            </div>
+          )}
+          {issues.map((iss, i) => (
+            <button key={i}
+              onClick={() => onSelect(iss.where)}
+              className="w-full text-left rounded my-1 px-3 py-2"
+              style={{
+                background: iss.kind === 'error' ? '#2a1820' : '#1f2233',
+                border: '1px solid ' + (iss.kind === 'error' ? COLORS.danger : COLORS.amber),
+                fontFamily: monoStack, fontSize: 11,
+                color: iss.kind === 'error' ? COLORS.danger : COLORS.amber,
+              }}>
+              <span style={{ fontWeight: 600, marginRight: 6 }}>
+                {iss.kind === 'error' ? 'ERR' : 'WARN'}
+              </span>
+              <span style={{ color: COLORS.text }}>{iss.text}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ShareInstructions({ fileName, onClose }) {
   const monoStack = "'JetBrains Mono', monospace";
   return (
@@ -3859,7 +4324,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.7</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.9</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

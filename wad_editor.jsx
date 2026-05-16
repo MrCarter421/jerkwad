@@ -47,7 +47,8 @@ const THING_COLORS = {
   ammo: '#ffd54f', health: '#4fc3f7', key: '#ce93d8', decor: '#90a4ae'
 };
 const MODES = [
-  { id: 'build', label: 'Build', glyph: '✎' },
+  { id: 'select', label: 'Select', glyph: '⌖' },
+  { id: 'draw', label: 'Draw', glyph: '✎' },
   { id: 'thing', label: 'Thing', glyph: '◉' },
 ];
 const COLORS = {
@@ -1661,7 +1662,7 @@ export default function WadEditor() {
   const [doc, setDoc] = useState(() => ({
     maps: { 'MAP01': outdoorStarter() }, currentMap: 'MAP01', fileName: 'untitled.wad'
   }));
-  const [mode, setMode] = useState('build');
+  const [mode, setMode] = useState('select');
   const [selection, setSelection] = useState(null);
   const [drawChain, setDrawChain] = useState([]);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.18 });
@@ -1673,6 +1674,10 @@ export default function WadEditor() {
   const [mapMenuOpen, setMapMenuOpen] = useState(false);
   const [thingPicker, setThingPicker] = useState(null);
   const [stampSheet, setStampSheet] = useState(null);
+  // Live placement ghost shown on the canvas while the user adjusts shape
+  // dimensions in ShapeSheet. Tapping the canvas moves the ghost; the STAMP
+  // button commits it.
+  const [stampPreview, setStampPreview] = useState(null);
   const [propsOpen, setPropsOpen] = useState(false);
   const [radial, setRadial] = useState(null);
   const [hint, setHint] = useState(null);
@@ -2038,6 +2043,14 @@ export default function WadEditor() {
         };
         return;
       }
+      // In Draw mode, no vertex/thing drag — the finger is for placing
+      // lines. Tap still snap-merges with existing vertices, but the user
+      // can't accidentally move a vertex while drawing.
+      if (mode === 'draw') {
+        gestureRef.current = { kind: 'tap-or-pan', startView: { x: view.x, y: view.y } };
+        scheduleLongPress(sx, sy);
+        return;
+      }
       const t = hitThing(sx, sy);
       if (t) { gestureRef.current = { kind: 'drag-thing', thingId: t.id }; scheduleLongPress(sx, sy); return; }
       const v = hitVertex(sx, sy);
@@ -2189,6 +2202,14 @@ export default function WadEditor() {
 
   const handleTap = (sx, sy) => {
     const w = screenToWorld(sx, sy);
+    // Stamp preview reposition: in any mode, if a shape ghost is on screen,
+    // taps move it before the user commits via STAMP. This is the "see
+    // before commit" affordance for shape stamps.
+    if (stampPreview) {
+      const sn = snapWorld(w.x, w.y);
+      setStampPreview(p => ({ ...p, cx: sn.x, cy: sn.y }));
+      return;
+    }
     if (mode === 'thing') {
       const t = hitThing(sx, sy);
       if (t) { setSelection({ type: 'thing', id: t.id }); return; }
@@ -2196,6 +2217,15 @@ export default function WadEditor() {
       setThingPicker({ x: sn.x, y: sn.y });
       return;
     }
+    if (mode === 'draw') {
+      // Draw mode: every tap places a vertex or extends the active chain.
+      // Existing-vertex snap inside placeOrExtendDraw handles WADED-style
+      // vertex merging automatically.
+      placeOrExtendDraw(w.x, w.y);
+      return;
+    }
+    // Select mode (default): if a chain happens to be active, continue
+    // extending it; otherwise tap-to-select with the usual priority.
     if (drawChain.length > 0) { placeOrExtendDraw(w.x, w.y); return; }
     const t = hitThing(sx, sy);
     if (t) { setSelection({ type: 'thing', id: t.id }); return; }
@@ -2205,9 +2235,6 @@ export default function WadEditor() {
     if (ld) { setSelection({ type: 'linedef', id: ld.id }); return; }
     const secId = hitSector(sx, sy);
     if (secId) { setSelection({ type: 'sector', id: secId }); return; }
-    // Empty space + no active chain: deselect. Drawing must be initiated via
-    // long-press radial -> Draw, so a finger landing in empty space doesn't
-    // accidentally start a chain.
     setSelection(null);
   };
 
@@ -2443,6 +2470,51 @@ export default function WadEditor() {
       }
     }
 
+    // Ghost preview for shape stamp. Dashed amber outline at the current
+    // preview position so the user can see exactly where the shape will land
+    // before committing — prevents accidental vertex merges.
+    if (stampPreview) {
+      let ghostPts = null;
+      if (stampPreview.kind === 'rect') ghostPts = rectVertices(stampPreview.cx, stampPreview.cy, stampPreview.w, stampPreview.h);
+      else if (stampPreview.kind === 'ngon') ghostPts = ngonVertices(stampPreview.cx, stampPreview.cy, stampPreview.r, stampPreview.n, -Math.PI / 2);
+      else if (stampPreview.kind === 'stairs') {
+        // Show outer bbox + step divisions
+        ghostPts = rectVertices(stampPreview.cx, stampPreview.cy, stampPreview.w, stampPreview.h);
+      }
+      if (ghostPts) {
+        ctx.fillStyle = 'rgba(255, 157, 61, 0.18)';
+        ctx.beginPath();
+        for (let i = 0; i < ghostPts.length; i++) {
+          const s = worldToScreen(ghostPts[i].x, ghostPts[i].y);
+          if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = COLORS.amber; ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // For stairs, draw the divisions inside.
+        if (stampPreview.kind === 'stairs') {
+          const stepW = stampPreview.w / stampPreview.n;
+          ctx.strokeStyle = 'rgba(255, 157, 61, 0.6)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          for (let i = 1; i < stampPreview.n; i++) {
+            const x = stampPreview.cx - stampPreview.w / 2 + i * stepW;
+            const t = worldToScreen(x, stampPreview.cy + stampPreview.h / 2);
+            const b = worldToScreen(x, stampPreview.cy - stampPreview.h / 2);
+            ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+          }
+          ctx.setLineDash([]);
+        }
+        // Centre marker
+        const c = worldToScreen(stampPreview.cx, stampPreview.cy);
+        ctx.fillStyle = COLORS.amber;
+        ctx.beginPath(); ctx.arc(c.x, c.y, 4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
     if (drawChain.length > 0) {
       ctx.strokeStyle = COLORS.vertexDraw; ctx.lineWidth = 2;
       ctx.setLineDash([4, 4]); ctx.beginPath();
@@ -2663,8 +2735,9 @@ export default function WadEditor() {
         setStampSheet(null); setPropsOpen(false); setTransformMode(false);
       }
       if (e.key === 'Delete' || e.key === 'Backspace') { if (selection) deleteSelection(); }
-      if (e.key === '1') setMode('build');
-      if (e.key === '2') setMode('thing');
+      if (e.key === '1') setMode('select');
+      if (e.key === '2') setMode('draw');
+      if (e.key === '3') setMode('thing');
       if (e.key === 't') setTransformMode(t => !t);
     };
     window.addEventListener('keydown', onKey);
@@ -2751,7 +2824,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.6</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.7</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -2840,16 +2913,22 @@ export default function WadEditor() {
           )}
         </div>
 
-        {mode === 'build' && drawChain.length > 0 && (
+        {(mode === 'draw' || drawChain.length > 0) && drawChain.length > 0 && (
           <div className="absolute top-2 left-2 px-2.5 py-1 rounded text-xs"
             style={{ background: COLORS.bgPanel + 'ee', border: '1px solid ' + COLORS.border, fontFamily: monoStack, color: COLORS.accent }}>
             {drawChain.length < 3 ? 'Tap to add line' : 'Tap start to close → sector'}
           </div>
         )}
-        {mode === 'build' && drawChain.length === 0 && !selection && !hint && (
+        {mode === 'draw' && drawChain.length === 0 && !hint && (
+          <div className="absolute top-2 left-2 px-2.5 py-1 rounded text-xs"
+            style={{ background: COLORS.bgPanel + 'ee', border: '1px solid ' + COLORS.accent, fontFamily: monoStack, color: COLORS.accent }}>
+            DRAW · tap to place vertex · drag disabled
+          </div>
+        )}
+        {mode === 'select' && drawChain.length === 0 && !selection && !hint && (
           <div className="absolute top-2 left-2 px-2.5 py-1 rounded text-xs"
             style={{ background: COLORS.bgPanel + 'cc', border: '1px solid ' + COLORS.border, fontFamily: monoStack, color: COLORS.textDim }}>
-            Long-press to ✎ draw · ◉ thing · ◫ shape
+            Tap to select · long-press for menu
           </div>
         )}
         {hint && (
@@ -2863,8 +2942,11 @@ export default function WadEditor() {
             onOpenFull={() => setPropsOpen(true)} onClose={() => setSelection(null)} monoStack={monoStack} />
         )}
         {selObj && selection.type === 'linedef' && !propsOpen && (
-          <QuickLinePills line={selObj}
+          <QuickLinePills line={selObj} map={map}
             onChange={(patch) => updateMap(m => ({ ...m, linedefs: m.linedefs.map(l => l.id === selection.id ? { ...l, ...patch } : l) }))}
+            onChangeSidedef={(sidedefId, patch) => updateMap(m => ({
+              ...m, sidedefs: m.sidedefs.map(sd => sd.id === sidedefId ? { ...sd, ...patch } : sd)
+            }))}
             onOpenFull={() => setPropsOpen(true)} onClose={() => setSelection(null)} monoStack={monoStack} />
         )}
         {selObj && (selection.type === 'thing' || selection.type === 'vertex') && !propsOpen && (
@@ -2922,25 +3004,27 @@ export default function WadEditor() {
       {thingPicker && <ThingPicker onPick={placeThing} onCancel={() => setThingPicker(null)} />}
       {stampSheet === 'shapes' && (
         <ShapeSheet
-          onStampRect={(w, h) => {
-            const cv = screenToWorld(canvasRef.current.clientWidth / 2, canvasRef.current.clientHeight / 2);
-            const sn = snapWorld(cv.x, cv.y);
-            stampRect(sn.x, sn.y, w, h);
+          preview={stampPreview}
+          onPreviewChange={(p) => {
+            // First time the sheet opens any preview, centre it on the canvas.
+            if (p && (stampPreview == null || stampPreview.kind !== p.kind)) {
+              const cv = screenToWorld(canvasRef.current.clientWidth / 2, canvasRef.current.clientHeight / 2);
+              const sn = snapWorld(cv.x, cv.y);
+              setStampPreview({ ...p, cx: sn.x, cy: sn.y });
+            } else {
+              setStampPreview(p ? { ...stampPreview, ...p } : null);
+            }
+          }}
+          onCommit={() => {
+            if (!stampPreview) return;
+            const { kind, cx, cy } = stampPreview;
+            if (kind === 'rect') stampRect(cx, cy, stampPreview.w, stampPreview.h);
+            else if (kind === 'ngon') stampNgon(cx, cy, stampPreview.r, stampPreview.n);
+            else if (kind === 'stairs') stampStairs(cx, cy, stampPreview.w, stampPreview.h, stampPreview.n, stampPreview.rise);
+            setStampPreview(null);
             setStampSheet(null);
           }}
-          onStampNgon={(r, n) => {
-            const cv = screenToWorld(canvasRef.current.clientWidth / 2, canvasRef.current.clientHeight / 2);
-            const sn = snapWorld(cv.x, cv.y);
-            stampNgon(sn.x, sn.y, r, n);
-            setStampSheet(null);
-          }}
-          onStampStairs={(w, h, n, rise) => {
-            const cv = screenToWorld(canvasRef.current.clientWidth / 2, canvasRef.current.clientHeight / 2);
-            const sn = snapWorld(cv.x, cv.y);
-            stampStairs(sn.x, sn.y, w, h, n, rise);
-            setStampSheet(null);
-          }}
-          onClose={() => setStampSheet(null)} />
+          onClose={() => { setStampPreview(null); setStampSheet(null); }} />
       )}
       {stampSheet === 'furniture' && (
         <FurnitureSheet selection={selection}
@@ -2986,48 +3070,149 @@ function FloatingBtn({ children, onClick, active, danger, disabled }) {
   );
 }
 
+// WADED-style sector strip: floor / ceiling / light / tag scrubs plus floor
+// and ceiling texture swatches inline. Tap a swatch to open the texture
+// picker for that surface without leaving the strip.
 function QuickEditPills({ sector, onChange, onOpenFull, onClose, monoStack }) {
+  const [pickFor, setPickFor] = useState(null); // 'floor' | 'ceil' | null
   return (
-    <div className="absolute left-2 right-2 flex gap-1 flex-wrap" style={{ bottom: 10 }}>
-      <ScrubPill label="F" value={sector.floorH} step={8} onChange={v => onChange({ floorH: v })} monoStack={monoStack} />
-      <ScrubPill label="C" value={sector.ceilH} step={8} onChange={v => onChange({ ceilH: v })} monoStack={monoStack} />
-      <ScrubPill label="LT" value={sector.light} step={16} min={0} max={255} onChange={v => onChange({ light: v })} monoStack={monoStack} />
-      <ScrubPill label="TAG" value={sector.tag} step={1} onChange={v => onChange({ tag: v })} monoStack={monoStack} />
-      <button onClick={onOpenFull}
-        className="px-2 py-1 rounded text-xs"
-        style={{ background: COLORS.bgPanel + 'ee', color: COLORS.accent, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>
-        {(sector.floorTex || '').slice(0, 8)} ▸
-      </button>
-      <button onClick={onClose}
-        className="px-2 py-1 rounded text-xs"
-        style={{ background: COLORS.bgPanel + 'ee', color: COLORS.textDim, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>✕</button>
-    </div>
+    <>
+      <div className="absolute left-2 right-2" style={{ bottom: 10, overflowX: 'auto' }}>
+        <div className="flex gap-1" style={{ width: 'max-content', flexWrap: 'nowrap' }}>
+          <span style={{ background: COLORS.bgPanel + 'ee', border: '1px solid ' + COLORS.amber, color: COLORS.amber, padding: '4px 8px', borderRadius: 4, fontFamily: monoStack, fontSize: 11 }}>
+            SECTOR {sector.id}
+          </span>
+          <ScrubPill label="F"   value={sector.floorH} step={8}  onChange={v => onChange({ floorH: v })} monoStack={monoStack} />
+          <ScrubPill label="C"   value={sector.ceilH}  step={8}  onChange={v => onChange({ ceilH: v })}  monoStack={monoStack} />
+          <ScrubPill label="LT"  value={sector.light}  step={16} min={0} max={255} onChange={v => onChange({ light: v })} monoStack={monoStack} />
+          <ScrubPill label="TAG" value={sector.tag}    step={1}  onChange={v => onChange({ tag: v })}    monoStack={monoStack} />
+          <ScrubPill label="SP"  value={sector.special} step={1} onChange={v => onChange({ special: v })} monoStack={monoStack} />
+          <button onClick={() => setPickFor('floor')}
+            className="flex items-center gap-1.5 rounded"
+            style={{ background: COLORS.bgPanel + 'ee', color: COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack, fontSize: 11, padding: '4px 8px' }}>
+            <TextureSwatch name={sector.floorTex} kind="floors" size={14} />
+            <span>F {(sector.floorTex || '-').slice(0, 8)}</span>
+          </button>
+          <button onClick={() => setPickFor('ceil')}
+            className="flex items-center gap-1.5 rounded"
+            style={{ background: COLORS.bgPanel + 'ee', color: COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack, fontSize: 11, padding: '4px 8px' }}>
+            <TextureSwatch name={sector.ceilTex} kind="ceilings" size={14} />
+            <span>C {(sector.ceilTex || '-').slice(0, 8)}</span>
+          </button>
+          <button onClick={onOpenFull}
+            className="px-2 py-1 rounded text-xs"
+            style={{ background: COLORS.bgPanel + 'ee', color: COLORS.accent, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>ALL ▸</button>
+          <button onClick={onClose}
+            className="px-2 py-1 rounded text-xs"
+            style={{ background: COLORS.bgPanel + 'ee', color: COLORS.textDim, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>✕</button>
+        </div>
+      </div>
+      {pickFor && (
+        <TexturePicker
+          kind={pickFor === 'floor' ? 'floors' : 'ceilings'}
+          current={pickFor === 'floor' ? sector.floorTex : sector.ceilTex}
+          onPick={(name) => {
+            onChange(pickFor === 'floor' ? { floorTex: name } : { ceilTex: name });
+            setPickFor(null);
+          }}
+          onCancel={() => setPickFor(null)} />
+      )}
+    </>
   );
 }
-function QuickLinePills({ line, onChange, onOpenFull, onClose, monoStack }) {
-  const isTwoSided = (line.flags & 4) !== 0;
-  const isImpassable = (line.flags & 1) !== 0;
+
+// WADED-style line strip: special / tag / length / angle + flag chips +
+// front-side (U/M/L) and back-side (U/M/L) texture swatches inline.
+function QuickLinePills({ line, map, onChange, onChangeSidedef, onOpenFull, onClose, monoStack }) {
+  const isTwoSided   = (line.flags & 4)   !== 0;
+  const isImpassable = (line.flags & 1)   !== 0;
+  const upperUnp     = (line.flags & 8)   !== 0;
+  const lowerUnp     = (line.flags & 16)  !== 0;
+  const v1 = map.vertices.find(v => v.id === line.v1);
+  const v2 = map.vertices.find(v => v.id === line.v2);
+  const len = (v1 && v2) ? Math.round(Math.hypot(v2.x - v1.x, v2.y - v1.y)) : 0;
+  const ang = (v1 && v2) ? Math.round(Math.atan2(v2.y - v1.y, v2.x - v1.x) * 180 / Math.PI) : 0;
+  const front = map.sidedefs.find(s => s.id === line.front);
+  const back  = map.sidedefs.find(s => s.id === line.back);
+  const [pickFor, setPickFor] = useState(null); // { side: 'front'|'back', slot: 'upper'|'middle'|'lower' }
+  const sdValue = (sd, slot) => sd ? sd[slot] : '-';
+
+  function SideBlock({ label, sd, sideKey }) {
+    if (!sd) return (
+      <span style={{ background: COLORS.bgPanel + 'aa', color: COLORS.textDim, border: '1px dashed ' + COLORS.border, padding: '4px 8px', borderRadius: 4, fontFamily: monoStack, fontSize: 10 }}>
+        {label} —
+      </span>
+    );
+    return (
+      <span className="flex gap-1 items-center rounded" style={{ background: COLORS.bgPanel + 'ee', border: '1px solid ' + COLORS.border, padding: '3px 5px' }}>
+        <span style={{ color: COLORS.accent, fontFamily: monoStack, fontSize: 10, letterSpacing: '0.05em' }}>{label}</span>
+        {['upper', 'middle', 'lower'].map(slot => (
+          <button key={slot}
+            onClick={() => setPickFor({ side: sideKey, slot })}
+            className="flex items-center gap-1 rounded"
+            style={{
+              background: 'rgba(0,0,0,0.25)', color: COLORS.text,
+              fontFamily: monoStack, fontSize: 10, padding: '2px 4px',
+              border: '1px solid transparent',
+            }}
+            title={slot}>
+            <TextureSwatch name={sdValue(sd, slot)} kind="walls" size={12} />
+            <span>{(sdValue(sd, slot) || '-').slice(0, 6)}</span>
+          </button>
+        ))}
+      </span>
+    );
+  }
   return (
-    <div className="absolute left-2 right-2 flex gap-1 flex-wrap" style={{ bottom: 10 }}>
-      <ScrubPill label="SP" value={line.special} step={1} onChange={v => onChange({ special: v })} monoStack={monoStack} />
-      <ScrubPill label="TAG" value={line.tag} step={1} onChange={v => onChange({ tag: v })} monoStack={monoStack} />
-      <button onClick={() => onChange({ flags: line.flags ^ 1 })}
-        className="px-2 py-1 rounded text-xs"
-        style={{ background: isImpassable ? COLORS.amber : COLORS.bgPanel + 'ee', color: isImpassable ? COLORS.bg : COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>
-        IMP
-      </button>
-      <button onClick={() => onChange({ flags: line.flags ^ 4 })}
-        className="px-2 py-1 rounded text-xs"
-        style={{ background: isTwoSided ? COLORS.amber : COLORS.bgPanel + 'ee', color: isTwoSided ? COLORS.bg : COLORS.text, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>
-        2S
-      </button>
-      <button onClick={onOpenFull}
-        className="px-2 py-1 rounded text-xs"
-        style={{ background: COLORS.bgPanel + 'ee', color: COLORS.accent, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>FLAGS ▸</button>
-      <button onClick={onClose}
-        className="px-2 py-1 rounded text-xs"
-        style={{ background: COLORS.bgPanel + 'ee', color: COLORS.textDim, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>✕</button>
-    </div>
+    <>
+      <div className="absolute left-2 right-2" style={{ bottom: 10, overflowX: 'auto' }}>
+        <div className="flex gap-1 items-center" style={{ width: 'max-content', flexWrap: 'nowrap' }}>
+          <span style={{ background: COLORS.bgPanel + 'ee', border: '1px solid ' + COLORS.amber, color: COLORS.amber, padding: '4px 8px', borderRadius: 4, fontFamily: monoStack, fontSize: 11 }}>
+            LINE {line.id}
+          </span>
+          <span style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 10, padding: '0 4px' }}>
+            LEN {len} · ANG {ang}°
+          </span>
+          <ScrubPill label="SP"  value={line.special} step={1} onChange={v => onChange({ special: v })} monoStack={monoStack} />
+          <ScrubPill label="TAG" value={line.tag}     step={1} onChange={v => onChange({ tag: v })}    monoStack={monoStack} />
+          <FlagChip on={isImpassable} label="IMP"  onClick={() => onChange({ flags: line.flags ^ 1 })} monoStack={monoStack} />
+          <FlagChip on={isTwoSided}   label="2S"   onClick={() => onChange({ flags: line.flags ^ 4 })} monoStack={monoStack} />
+          <FlagChip on={upperUnp}     label="UPEG" onClick={() => onChange({ flags: line.flags ^ 8 })} monoStack={monoStack} />
+          <FlagChip on={lowerUnp}     label="LPEG" onClick={() => onChange({ flags: line.flags ^ 16 })} monoStack={monoStack} />
+          <SideBlock label="FRONT" sd={front} sideKey="front" />
+          <SideBlock label="BACK"  sd={back}  sideKey="back"  />
+          <button onClick={onOpenFull}
+            className="px-2 py-1 rounded text-xs"
+            style={{ background: COLORS.bgPanel + 'ee', color: COLORS.accent, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>ALL ▸</button>
+          <button onClick={onClose}
+            className="px-2 py-1 rounded text-xs"
+            style={{ background: COLORS.bgPanel + 'ee', color: COLORS.textDim, border: '1px solid ' + COLORS.border, fontFamily: monoStack }}>✕</button>
+        </div>
+      </div>
+      {pickFor && (
+        <TexturePicker
+          kind="walls"
+          current={sdValue(pickFor.side === 'front' ? front : back, pickFor.slot)}
+          onPick={(name) => {
+            const target = pickFor.side === 'front' ? front : back;
+            if (target) onChangeSidedef(target.id, { [pickFor.slot]: name });
+            setPickFor(null);
+          }}
+          onCancel={() => setPickFor(null)} />
+      )}
+    </>
+  );
+}
+function FlagChip({ on, label, onClick, monoStack }) {
+  return (
+    <button onClick={onClick}
+      className="px-2 py-1 rounded text-xs"
+      style={{
+        background: on ? COLORS.amber : COLORS.bgPanel + 'ee',
+        color: on ? COLORS.bg : COLORS.text,
+        border: '1px solid ' + (on ? COLORS.amber : COLORS.border),
+        fontFamily: monoStack,
+      }}>{label}</button>
   );
 }
 function QuickGenericPills({ obj, type, onOpenFull, onClose, monoStack }) {
@@ -3136,67 +3321,87 @@ function RadialMenu({ radial, onAction, onClose }) {
   );
 }
 
-function ShapeSheet({ onStampRect, onStampNgon, onStampStairs, onClose }) {
+// Stamp sheet with live placement preview. Selecting a shape (rect/ngon/
+// stairs) emits a controlled preview to the parent; parent draws a ghost
+// outline at the preview's centre on the canvas. Tapping the canvas
+// repositions the ghost (handled in parent). Pressing STAMP commits.
+function ShapeSheet({ preview, onPreviewChange, onCommit, onClose }) {
   const monoStack = "'JetBrains Mono', monospace";
-  const [rectW, setRectW] = useState(256);
-  const [rectH, setRectH] = useState(256);
-  const [ngonR, setNgonR] = useState(128);
-  const [ngonN, setNgonN] = useState(6);
-  const [stW, setStW] = useState(256);
-  const [stH, setStH] = useState(128);
-  const [stN, setStN] = useState(4);
-  const [stRise, setStRise] = useState(16);
+  const kind = preview?.kind ?? null;
+  const w = preview?.w ?? 256, h = preview?.h ?? 256;
+  const r = preview?.r ?? 128, n = preview?.n ?? 6;
+  const sn = preview?.n ?? 4, sRise = preview?.rise ?? 16;
+
+  function selectKind(k) {
+    if (k === 'rect') onPreviewChange({ kind: 'rect', w: 256, h: 256 });
+    else if (k === 'ngon') onPreviewChange({ kind: 'ngon', r: 128, n: 6 });
+    else if (k === 'stairs') onPreviewChange({ kind: 'stairs', w: 256, h: 128, n: 4, rise: 16 });
+  }
+
+  const tabStyle = (k) => ({
+    background: kind === k ? COLORS.amber : 'transparent',
+    color: kind === k ? COLORS.bg : COLORS.text,
+    border: '1px solid ' + (kind === k ? COLORS.amber : COLORS.border),
+    fontFamily: monoStack, letterSpacing: '0.05em', textTransform: 'uppercase',
+    padding: '6px 10px', borderRadius: 4, fontSize: 11,
+  });
+
   return (
-    <div className="absolute inset-0 z-50 flex items-end" style={{ background: '#000a' }} onClick={onClose}>
+    <div className="absolute inset-0 z-50 flex items-end" style={{ background: '#0006', pointerEvents: 'auto' }} onClick={(e) => { /* allow tap-through to canvas via close+reopen? simpler: don't dismiss on backdrop */ }}>
       <div className="w-full rounded-t-lg flex flex-col"
-        style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border, paddingBottom: 'env(safe-area-inset-bottom)', maxHeight: '80%' }}
+        style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border, paddingBottom: 'env(safe-area-inset-bottom)', maxHeight: '55%' }}
         onClick={e => e.stopPropagation()}>
         <div className="px-4 py-3 border-b flex items-center justify-between" style={{ borderColor: COLORS.border }}>
-          <div style={{ color: COLORS.amber, fontFamily: monoStack, fontSize: 13 }}>SHAPE STAMPS</div>
-          <button onClick={onClose} style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 11 }}>CANCEL</button>
+          <div>
+            <div style={{ color: COLORS.amber, fontFamily: monoStack, fontSize: 13 }}>SHAPE STAMP</div>
+            <div style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 10 }}>
+              {preview ? 'Tap canvas to reposition · STAMP to commit' : 'Pick a shape to preview'}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 11 }}>CLOSE</button>
         </div>
-        <div className="p-4 space-y-4 overflow-y-auto">
-          <div>
-            <div style={{ color: COLORS.text, fontFamily: monoStack, fontSize: 12, marginBottom: 6 }}>RECTANGLE</div>
+        <div className="flex gap-2 p-3 border-b" style={{ borderColor: COLORS.border }}>
+          <button onClick={() => selectKind('rect')} style={tabStyle('rect')}>◫ Rect</button>
+          <button onClick={() => selectKind('ngon')} style={tabStyle('ngon')}>⬡ Polygon</button>
+          <button onClick={() => selectKind('stairs')} style={tabStyle('stairs')}>⩘ Stairs</button>
+        </div>
+        <div className="p-4 overflow-y-auto" style={{ minHeight: 70 }}>
+          {kind === 'rect' && (
             <div className="flex items-center gap-2 flex-wrap">
-              <NumInput label="W" value={rectW} onChange={setRectW} mono={monoStack} step={64} />
-              <NumInput label="H" value={rectH} onChange={setRectH} mono={monoStack} step={64} />
-              <button onClick={() => onStampRect(rectW, rectH)}
-                className="ml-auto px-4 py-2 rounded text-xs font-semibold"
-                style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>
-                STAMP
-              </button>
+              <NumInput label="W" value={w} onChange={v => onPreviewChange({ kind: 'rect', w: v, h })} mono={monoStack} step={64} />
+              <NumInput label="H" value={h} onChange={v => onPreviewChange({ kind: 'rect', w, h: v })} mono={monoStack} step={64} />
             </div>
-          </div>
-          <div>
-            <div style={{ color: COLORS.text, fontFamily: monoStack, fontSize: 12, marginBottom: 6 }}>POLYGON</div>
+          )}
+          {kind === 'ngon' && (
             <div className="flex items-center gap-2 flex-wrap">
-              <NumInput label="R" value={ngonR} onChange={setNgonR} mono={monoStack} step={32} />
-              <NumInput label="N" value={ngonN} onChange={v => setNgonN(Math.max(3, Math.min(24, v)))} mono={monoStack} step={1} />
-              <button onClick={() => onStampNgon(ngonR, ngonN)}
-                className="ml-auto px-4 py-2 rounded text-xs font-semibold"
-                style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>
-                STAMP
-              </button>
+              <NumInput label="R" value={r} onChange={v => onPreviewChange({ kind: 'ngon', r: v, n })} mono={monoStack} step={32} />
+              <NumInput label="N" value={n} onChange={v => onPreviewChange({ kind: 'ngon', r, n: Math.max(3, Math.min(24, v)) })} mono={monoStack} step={1} />
             </div>
-          </div>
-          <div>
-            <div style={{ color: COLORS.text, fontFamily: monoStack, fontSize: 12, marginBottom: 6 }}>STAIRS</div>
+          )}
+          {kind === 'stairs' && (
             <div className="flex items-center gap-2 flex-wrap">
-              <NumInput label="W" value={stW} onChange={setStW} mono={monoStack} step={32} />
-              <NumInput label="H" value={stH} onChange={setStH} mono={monoStack} step={32} />
-              <NumInput label="N" value={stN} onChange={v => setStN(Math.max(2, Math.min(16, v)))} mono={monoStack} step={1} />
-              <NumInput label="RISE" value={stRise} onChange={setStRise} mono={monoStack} step={8} />
-              <button onClick={() => onStampStairs(stW, stH, stN, stRise)}
-                className="ml-auto px-4 py-2 rounded text-xs font-semibold"
-                style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack, letterSpacing: '0.05em' }}>
-                STAMP
-              </button>
+              <NumInput label="W" value={w} onChange={v => onPreviewChange({ kind: 'stairs', w: v, h, n: sn, rise: sRise })} mono={monoStack} step={32} />
+              <NumInput label="H" value={h} onChange={v => onPreviewChange({ kind: 'stairs', w, h: v, n: sn, rise: sRise })} mono={monoStack} step={32} />
+              <NumInput label="N" value={sn} onChange={v => onPreviewChange({ kind: 'stairs', w, h, n: Math.max(2, Math.min(16, v)), rise: sRise })} mono={monoStack} step={1} />
+              <NumInput label="RISE" value={sRise} onChange={v => onPreviewChange({ kind: 'stairs', w, h, n: sn, rise: v })} mono={monoStack} step={8} />
             </div>
-          </div>
-          <div style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 10, paddingTop: 4 }}>
-            Stamps at canvas center. Toggle XFORM after to scale or drag vertices.
-          </div>
+          )}
+          {!kind && (
+            <div style={{ color: COLORS.textDim, fontFamily: monoStack, fontSize: 11 }}>
+              Pick Rect / Polygon / Stairs above to see a placement preview.
+            </div>
+          )}
+        </div>
+        <div className="p-3 border-t flex gap-2" style={{ borderColor: COLORS.border }}>
+          <button onClick={onCommit} disabled={!kind}
+            className="flex-1 py-2.5 rounded font-semibold"
+            style={{
+              background: kind ? COLORS.amber : COLORS.bgPanel,
+              color: kind ? COLORS.bg : COLORS.textDim,
+              border: '1px solid ' + (kind ? COLORS.amber : COLORS.border),
+              fontFamily: monoStack, letterSpacing: '0.05em',
+              opacity: kind ? 1 : 0.5,
+            }}>STAMP HERE</button>
         </div>
       </div>
     </div>
@@ -3654,7 +3859,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.6</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.7</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

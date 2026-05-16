@@ -675,13 +675,31 @@ function generateDungeon() {
   const ROOM = 384;
   const CW = 64;
 
+  // Grow a connected cluster of cells outward from (0,0) so every cell is
+  // guaranteed to have at least one grid-neighbour already placed. This
+  // ensures the adjacency graph is connected and the spanning tree will
+  // wire corridors between every room.
   const cells = [];
-  for (let i = 0; i < GRID; i++) for (let j = 0; j < GRID; j++) {
-    if (rand() > 0.35) cells.push({ i, j });
+  const placed = new Set();
+  const enqueue = (i, j) => {
+    if (i < 0 || i >= GRID || j < 0 || j >= GRID) return;
+    const k = i + ',' + j;
+    if (placed.has(k)) return;
+    placed.add(k); cells.push({ i, j });
+  };
+  enqueue(0, 0);
+  for (let pass = 0; pass < 8 && cells.length < 12; pass++) {
+    const snapshot = cells.slice();
+    for (const c of snapshot) {
+      const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+      for (const [di, dj] of dirs) {
+        if (rand() < 0.55) enqueue(c.i + di, c.j + dj);
+      }
+    }
   }
   if (cells.length < 3) {
-    cells.length = 0;
-    cells.push({ i: 0, j: 0 }, { i: 1, j: 0 }, { i: 0, j: 1 }, { i: 1, j: 1 });
+    cells.length = 0; placed.clear();
+    enqueue(0, 0); enqueue(1, 0); enqueue(0, 1); enqueue(1, 1);
   }
 
   const offset = -((GRID - 1) * CELL) / 2;
@@ -896,12 +914,17 @@ function generateDungeon() {
     }
   }
 
-  // Player start in first room. Monsters scattered in others; one Cyberdemon-
-  // free guarantee — keep it light for a one-tap dungeon.
+  // Player start in cells[0]; exit in the cell furthest from start by grid
+  // distance. Light monsters and items elsewhere.
   const things = [];
   things.push({ id: 't0', x: cells[0].cx | 0, y: cells[0].cy | 0, angle: 90, type: 1, flags: 7 });
+  let exitIdx = -1, exitDist = -1;
+  for (let i = 1; i < cells.length; i++) {
+    const d = Math.abs(cells[i].i - cells[0].i) + Math.abs(cells[i].j - cells[0].j);
+    if (d > exitDist) { exitDist = d; exitIdx = i; }
+  }
   const MONSTERS = [3001, 3002, 3004, 9, 3005];
-  const ITEMS = [2007, 2008, 2011, 2014, 2018];
+  const ITEMS = [2007, 2008, 2011, 2014, 2018, 2002];
   for (let i = 1; i < cells.length; i++) {
     if (rand() < 0.65) {
       things.push({
@@ -916,6 +939,21 @@ function generateDungeon() {
         x: (cells[i].cx + 48) | 0, y: (cells[i].cy + 48) | 0, angle: 0,
         type: pick(ITEMS), flags: 7,
       });
+    }
+  }
+  // Tag one corridor adjacent to the exit room as a switch-exit. Find any
+  // line that bounds the exit room and is one-sided (a solid wall) — turn
+  // it into an exit switch with a SW1EXIT texture.
+  if (exitIdx >= 0) {
+    const exitSecId = cells[exitIdx].sectorId;
+    const sdMap2 = new Map(sidedefs.map(s => [s.id, s]));
+    for (const l of linedefs) {
+      if (l.back !== -1) continue;
+      const fs = sdMap2.get(l.front);
+      if (!fs || fs.sector !== exitSecId) continue;
+      l.special = 11; // S1 Exit Level
+      fs.middle = 'SW1EXIT';
+      break;
     }
   }
 
@@ -2488,7 +2526,10 @@ export default function WadEditor() {
       <div className="flex items-center justify-between px-2 py-1.5 border-b"
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel, flexShrink: 0 }}>
         <div className="flex items-center gap-2 min-w-0">
-          <div className="text-xs font-bold tracking-widest" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>JERKWAD</div>
+          <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
+            JERKWAD
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.5</span>
+          </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
             style={{ fontFamily: monoStack, background: 'transparent', border: '1px solid ' + COLORS.border, color: COLORS.text }}>
@@ -3384,7 +3425,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.4</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.5</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

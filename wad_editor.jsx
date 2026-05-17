@@ -2009,6 +2009,20 @@ function findPotentialSectors(map) {
     if (pts.length < 3) continue;
     const area = polygonSignedArea(pts);
     if (Math.abs(area) < 64) continue;
+    // Reject the outer infinite face. A cycle that walks around the OUTSIDE
+    // of a sub-structure will enclose every vertex of that sub-structure;
+    // the inner face that's actually paintable encloses none. This single
+    // check eliminates the phantom-fill sector bug where Make Sector
+    // produced a sector covering an entire structure's footprint.
+    {
+      const cycleSet = new Set(cycle);
+      let enclosesAny = false;
+      for (const v of map.vertices) {
+        if (cycleSet.has(v.id)) continue;
+        if (pointInPolygon(v.x, v.y, pts)) { enclosesAny = true; break; }
+      }
+      if (enclosesAny) continue;
+    }
     // Don't filter by orientation — buildSectorFromLoop normalizes the walk
     // direction when converting, so either CW or CCW cycle works.
     result.push({ loop: cycle, vertices: pts, centroid: polygonCentroid(pts), area });
@@ -2025,14 +2039,15 @@ function buildAddedRooms(existing) {
   if (!isFinite(exMinX)) return existing;
   const GAP = 256;
 
-  // Generate up to 8 candidate fresh dungeons and pick the first one whose
-  // translated bounding box is fully outside the existing map's bbox in some
-  // cardinal direction. Translation is edge-to-edge: the fresh bbox's near
-  // edge lands at the existing bbox's edge + GAP. (The prior version used a
-  // centre-with-guessed-half-width offset that could leave the fresh dungeon
-  // overlapping when its actual extent was bigger than expected.)
+  // Generate up to 16 candidate fresh dungeons and try each on all 4 sides,
+  // also sliding perpendicular to maximize wall-overlap. Accept the first
+  // (fresh, side, slide) combination that BOTH places without overlap AND
+  // produces a successful tryConnectClusters. The user wants huge
+  // interconnected mazes — no orphan wings.
   let chosen = null;
-  for (let attempt = 0; attempt < 8; attempt++) {
+  let chosenCombined = null;
+  let lastValidPlacement = null;
+  for (let attempt = 0; attempt < 16; attempt++) {
     const fresh = generateDungeon();
     let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
     for (const v of fresh.vertices) {
@@ -2044,31 +2059,54 @@ function buildAddedRooms(existing) {
       const j = Math.floor(Math.random() * (i + 1));
       [sides[i], sides[j]] = [sides[j], sides[i]];
     }
+    // Try each side with several perpendicular slides (offsets) so we can
+    // hunt for an alignment that puts a wall-pair into view.
+    const slideOffsets = [0, 256, -256, 512, -512, 768, -768];
     for (const side of sides) {
-      let dx, dy;
-      if (side === 'E')      { dx = exMaxX + GAP - fMinX; dy = ((exMinY + exMaxY) / 2) - ((fMinY + fMaxY) / 2); }
-      else if (side === 'W') { dx = exMinX - GAP - fMaxX; dy = ((exMinY + exMaxY) / 2) - ((fMinY + fMaxY) / 2); }
-      else if (side === 'N') { dx = ((exMinX + exMaxX) / 2) - ((fMinX + fMaxX) / 2); dy = exMaxY + GAP - fMinY; }
-      else                   { dx = ((exMinX + exMaxX) / 2) - ((fMinX + fMaxX) / 2); dy = exMinY - GAP - fMaxY; }
-      dx = Math.round(dx / 32) * 32;
-      dy = Math.round(dy / 32) * 32;
-      const tMinX = fMinX + dx, tMaxX = fMaxX + dx;
-      const tMinY = fMinY + dy, tMaxY = fMaxY + dy;
-      // Stay inside int16.
-      if (Math.abs(tMinX) > 30000 || Math.abs(tMaxX) > 30000 ||
-          Math.abs(tMinY) > 30000 || Math.abs(tMaxY) > 30000) continue;
-      // Strict bbox non-overlap with the existing map.
-      const M = 64;
-      const overlap = !(tMaxX + M < exMinX || exMaxX + M < tMinX ||
-                        tMaxY + M < exMinY || exMaxY + M < tMinY);
-      if (overlap) continue;
-      chosen = { fresh, dx, dy, side, tMinX, tMaxX, tMinY, tMaxY };
-      break;
+      for (const slide of slideOffsets) {
+        let dx, dy;
+        if (side === 'E')      { dx = exMaxX + GAP - fMinX; dy = ((exMinY + exMaxY) / 2) - ((fMinY + fMaxY) / 2) + slide; }
+        else if (side === 'W') { dx = exMinX - GAP - fMaxX; dy = ((exMinY + exMaxY) / 2) - ((fMinY + fMaxY) / 2) + slide; }
+        else if (side === 'N') { dx = ((exMinX + exMaxX) / 2) - ((fMinX + fMaxX) / 2) + slide; dy = exMaxY + GAP - fMinY; }
+        else                   { dx = ((exMinX + exMaxX) / 2) - ((fMinX + fMaxX) / 2) + slide; dy = exMinY - GAP - fMaxY; }
+        dx = Math.round(dx / 32) * 32;
+        dy = Math.round(dy / 32) * 32;
+        const tMinX = fMinX + dx, tMaxX = fMaxX + dx;
+        const tMinY = fMinY + dy, tMaxY = fMaxY + dy;
+        if (Math.abs(tMinX) > 30000 || Math.abs(tMaxX) > 30000 ||
+            Math.abs(tMinY) > 30000 || Math.abs(tMaxY) > 30000) continue;
+        const M = 64;
+        const overlap = !(tMaxX + M < exMinX || exMaxX + M < tMinX ||
+                          tMaxY + M < exMinY || exMaxY + M < tMinY);
+        if (overlap) continue;
+        // Build the combined map for this candidate and try to connect.
+        const candidate = { fresh, dx, dy, side };
+        const built = buildCombinedForCandidate(existing, candidate);
+        const connected = tryConnectClusters(built.combined, existing, built.vOffset, side, GAP);
+        if (connected) {
+          chosen = candidate;
+          chosenCombined = connected;
+          break;
+        }
+        // Remember a valid placement in case no connection ever works.
+        if (!lastValidPlacement) {
+          lastValidPlacement = { candidate, combined: built.combined };
+        }
+      }
+      if (chosen) break;
     }
     if (chosen) break;
   }
-  if (!chosen) return existing;
-  const { fresh, dx, dy, side } = chosen;
+  if (chosenCombined) return chosenCombined;
+  if (lastValidPlacement) return lastValidPlacement.combined;
+  return existing;
+}
+
+// Splice a fresh dungeon onto the existing map at the given translation,
+// remapping all IDs to avoid collisions. Returns { combined, vOffset } so the
+// caller can pass vOffset to tryConnectClusters to identify "new" lines.
+function buildCombinedForCandidate(existing, candidate) {
+  const { fresh, dx, dy } = candidate;
 
   // Remap fresh IDs onto an offset that won't clash with existing IDs.
   const vOffset = existing.vertices.length;
@@ -2100,21 +2138,14 @@ function buildAddedRooms(existing) {
       ...t, id: 't' + (tOffset + i),
       x: t.x + dx, y: t.y + dy,
     }));
-  let combined = {
+  const combined = {
     vertices: [...existing.vertices, ...newVertices],
     linedefs: [...existing.linedefs, ...newLinedefs],
     sidedefs: [...existing.sidedefs, ...newSidedefs],
     sectors: [...existing.sectors, ...newSectors],
     things: [...existing.things, ...newThings],
   };
-  // Carve a connecting corridor with proper doors so the new wing is
-  // reachable from the player's start. Picks the best matching pair of
-  // one-sided axis-aligned walls — one on existing, one on the new cluster
-  // — that face each other across the gap, with enough overlap to fit a
-  // 64-unit doorway. If no pair fits, return the unconnected combined map
-  // and the user can wire it manually.
-  const connected = tryConnectClusters(combined, existing, vOffset, side, GAP);
-  return connected || combined;
+  return { combined, vOffset };
 }
 
 // Carve a connecting corridor with proper DR-1 doors between the existing
@@ -2151,7 +2182,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     if (!g) continue;
     if (wantVert && !g.vert) continue;
     if (!wantVert && !g.horiz) continue;
-    if (g.hi - g.lo < 96) continue;
+    if (g.hi - g.lo < 64) continue;
     const isExisting = existingLineIds.has(l.id);
     if (isExisting) {
       if (side === 'E' && (!existingPick || g.perp > existingPick.g.perp)) existingPick = { line: l, g };
@@ -2170,10 +2201,11 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
   const eg = existingPick.g, ng = newPick.g;
   const ovLo = Math.max(eg.lo, ng.lo);
   const ovHi = Math.min(eg.hi, ng.hi);
-  if (ovHi - ovLo < 96) return null;
+  if (ovHi - ovLo < 64) return null;
   const cMid = Math.round((ovLo + ovHi) / 2 / 32) * 32;
   const c0 = cMid - 32, c1 = cMid + 32;
-  if (c0 < eg.lo || c1 > eg.hi || c0 < ng.lo || c1 > ng.hi) return null;
+  // Pull cMid in if rounding pushed the doorway past a wall endpoint.
+  if (c0 < eg.lo + 0.5 || c0 < ng.lo + 0.5 || c1 > eg.hi - 0.5 || c1 > ng.hi - 0.5) return null;
 
   const THICK = 16;
   const Ex = eg.perp;
@@ -2184,7 +2216,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
   const eRoomSec = map.sectors.find(s => s.id === eFront.sector);
   const nRoomSec = map.sectors.find(s => s.id === nFront.sector);
   if (!eRoomSec || !nRoomSec) return null;
-  if (Math.abs(eRoomSec.floorH - nRoomSec.floorH) > 24) return null;
+  if (Math.abs(eRoomSec.floorH - nRoomSec.floorH) > 48) return null;
   const corridorFloorH = Math.max(eRoomSec.floorH, nRoomSec.floorH);
   const corridorCeilH = corridorFloorH + 96;
 
@@ -2397,6 +2429,52 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
 // ============================================================================
 // TOPOLOGY RESOLVER
 // ============================================================================
+// Split any existing linedef that passes through vertex vId's position.
+// WADED behaviour: drawing a line whose endpoint lands mid-segment on an
+// existing wall must SPLIT that wall so the new vertex becomes a shared
+// junction. Without this, findPotentialSectors can't close cycles that
+// mix new lines with existing ones.
+function splitLinesAtVertex(map, vId) {
+  const vmap = new Map(map.vertices.map(v => [v.id, v]));
+  const v = vmap.get(vId);
+  if (!v) return map;
+  const EPS = 1.5;
+  const eps2 = EPS * EPS;
+  let sidedefs = map.sidedefs.slice();
+  let sdCounter = sidedefs.length;
+  const mintSdId = () => 'sd' + (sdCounter++);
+  let lCounter = map.linedefs.length;
+  const mintLId = () => 'l' + (lCounter++);
+  const cloneSd = (sdId) => {
+    if (!sdId || sdId === -1) return sdId ?? -1;
+    const src = sidedefs.find(s => s.id === sdId);
+    if (!src) return -1;
+    const clone = { ...src, id: mintSdId() };
+    sidedefs.push(clone);
+    return clone.id;
+  };
+  const newLines = [];
+  let changed = false;
+  for (const l of map.linedefs) {
+    if (l.v1 === vId || l.v2 === vId) { newLines.push(l); continue; }
+    const a = vmap.get(l.v1), b = vmap.get(l.v2);
+    if (!a || !b) { newLines.push(l); continue; }
+    // Skip if the vertex is at one of the endpoints (already a junction).
+    if (dist2(v.x, v.y, a.x, a.y) < eps2 || dist2(v.x, v.y, b.x, b.y) < eps2) { newLines.push(l); continue; }
+    const d2 = pointToSegmentDist2(v.x, v.y, a.x, a.y, b.x, b.y);
+    if (d2 > eps2) { newLines.push(l); continue; }
+    // Split into two halves. Clone sidedefs for the second half so each line
+    // owns its own sidedef objects (same sector, same textures, distinct ID).
+    const half2Front = cloneSd(l.front);
+    const half2Back = cloneSd(l.back);
+    newLines.push({ ...l, v2: vId });
+    newLines.push({ ...l, id: mintLId(), v1: vId, front: half2Front, back: half2Back });
+    changed = true;
+  }
+  if (!changed) return map;
+  return { ...map, linedefs: newLines, sidedefs };
+}
+
 function buildSectorFromLoop(map, chain, opts = {}) {
   if (chain.length < 4) return null;
   if (chain[0] !== chain[chain.length - 1]) return null;
@@ -3028,6 +3106,9 @@ export default function WadEditor() {
         }
       }
       let staged = { ...m, vertices: nextV, linedefs: nextL };
+      // Split any existing line that passes through useVid mid-segment, so
+      // the new vertex becomes a real junction shared with that wall.
+      staged = splitLinesAtVertex(staged, useVid);
       if (isClosing) {
         const result = buildSectorFromLoop(staged, newChain);
         if (result) {
@@ -4032,7 +4113,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.14</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.15</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -5155,7 +5236,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.14</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.15</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

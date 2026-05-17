@@ -583,7 +583,7 @@ function generateRandomWorld() {
   let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => {
     seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-    return (seed >>> 8) / 0xffffff;
+    return (seed >>> 8) / 0x800000;
   };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 
@@ -672,7 +672,7 @@ function generateRandomWorld() {
 // with the lower-unpegged flag set so the side textures don't slide.
 function generateDungeon() {
   let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
-  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
   const sn = v => Math.round(v / 32) * 32;
 
@@ -698,17 +698,32 @@ function generateDungeon() {
     }
     return out;
   }
+  // Hexagon with vertices at 0°, 60°, 120°, 180°, 240°, 300°. The sides
+  // between vertices at 60°↔120° and 240°↔300° are HORIZONTAL — flat north
+  // and south. East and west are pointy vertices, so hexagons can only
+  // host corridors on their N/S side.
+  function hexagonPoly(cx, cy, r) {
+    const out = [];
+    for (let i = 0; i < 6; i++) {
+      const a = (i * 60) * Math.PI / 180;
+      out.push({ x: Math.round(cx + Math.cos(a) * r), y: Math.round(cy + Math.sin(a) * r) });
+    }
+    return out;
+  }
   function roomPoly(room, shrink = 0) {
     if (room.type === 'octagon') return octagonPoly(room.cx, room.cy, room.r - shrink);
+    if (room.type === 'hexagon') return hexagonPoly(room.cx, room.cy, room.r - shrink);
     return squarePoly(room.cx, room.cy, room.w - 2 * shrink, room.h - 2 * shrink);
   }
-  // Effective bbox = the rectangle that bounds the cardinal-aligned doorway
-  // edges (used for placement and corridor feasibility). For octagons at
-  // 22.5° offset, that's ±0.924r in both dimensions.
   function roomBBox(room, shrink = 0) {
     if (room.type === 'octagon') {
       const er = (room.r - shrink) * 0.924;
       return { minX: room.cx - er, maxX: room.cx + er, minY: room.cy - er, maxY: room.cy + er };
+    }
+    if (room.type === 'hexagon') {
+      const er = room.r - shrink;
+      const ey = er * 0.866;
+      return { minX: room.cx - er, maxX: room.cx + er, minY: room.cy - ey, maxY: room.cy + ey };
     }
     return {
       minX: room.cx - room.w / 2 + shrink, maxX: room.cx + room.w / 2 - shrink,
@@ -719,11 +734,11 @@ function generateDungeon() {
     return !(a.maxX + margin < b.minX || b.maxX + margin < a.minX ||
              a.maxY + margin < b.minY || b.maxY + margin < a.minY);
   }
-  // Half-span of the axis-aligned flat segment available for a doorway on a
-  // given cardinal side. Squares: full half-dimension. Octagons at 22.5°
-  // offset: only ±0.383r is actually flat-walled — the rest is diagonal.
   function cardinalSpan(room, side) {
     if (room.type === 'octagon') return room.r * 0.383;
+    if (room.type === 'hexagon') {
+      return (side === 'N' || side === 'S') ? room.r * 0.5 : 0;
+    }
     return (side === 'E' || side === 'W') ? room.h / 2 : room.w / 2;
   }
 
@@ -731,9 +746,17 @@ function generateDungeon() {
   const rooms = [];
   const PLACE_R = 1500;
   const MARGIN = 96;
-  function tryPlace(maker, attempts = 200) {
+  // Two-stage placement so the size distribution isn't biased by collisions:
+  // sizeMaker is called ONCE per room (committing the size), then up to
+  // `attempts` random positions are tried for that size. Without this, every
+  // failed attempt re-rolls the size and smaller rooms dominate because they
+  // succeed more often.
+  function tryPlace(sizeMaker, attempts = 300) {
+    const base = sizeMaker();
     for (let i = 0; i < attempts; i++) {
-      const r = maker();
+      const cx = sn((rand() - 0.5) * 2 * PLACE_R);
+      const cy = sn((rand() - 0.5) * 2 * PLACE_R);
+      const r = { ...base, cx, cy };
       const bb = roomBBox(r);
       if (bb.minX < -PLACE_R || bb.maxX > PLACE_R || bb.minY < -PLACE_R || bb.maxY > PLACE_R) continue;
       if (rooms.some(o => bboxOverlap(roomBBox(o), bb, MARGIN))) continue;
@@ -758,21 +781,21 @@ function generateDungeon() {
     if (r < 0.90) return (7 + Math.floor(rand() * 3)) * 64;  // medium 448–576
     return (10 + Math.floor(rand() * 3)) * 64;               // large  640–768
   }
-  for (let i = 0; i < 4; i++) {
-    tryPlace(() => ({
-      type: 'square',
-      cx: sn((rand() - 0.5) * 2 * PLACE_R),
-      cy: sn((rand() - 0.5) * 2 * PLACE_R),
-      w: pickSquareSize(), h: pickSquareSize(),
-    }));
-  }
-  for (let i = 0; i < 2; i++) {
-    tryPlace(() => ({
-      type: 'octagon',
-      cx: sn((rand() - 0.5) * 2 * PLACE_R),
-      cy: sn((rand() - 0.5) * 2 * PLACE_R),
-      r: pickOctRadius(),
-    }));
+  // Place large rooms first so they get priority on the placement field;
+  // smaller rooms then fill the gaps. Sort by expected footprint so a 1024
+  // huge room doesn't have to find space after four 768 rooms.
+  const sizedRequests = [];
+  for (let i = 0; i < 4; i++) sizedRequests.push({ type: 'square', w: pickSquareSize(), h: pickSquareSize() });
+  for (let i = 0; i < 2; i++) sizedRequests.push({ type: 'octagon', r: pickOctRadius() });
+  const hexCount = 1 + Math.floor(rand() * 2);
+  for (let i = 0; i < hexCount; i++) sizedRequests.push({ type: 'hexagon', r: pickOctRadius() });
+  sizedRequests.sort((a, b) => {
+    const sa = a.type === 'square' ? Math.min(a.w, a.h) : (a.type === 'octagon' ? a.r * 1.848 : a.r * 1.732);
+    const sb = b.type === 'square' ? Math.min(b.w, b.h) : (b.type === 'octagon' ? b.r * 1.848 : b.r * 1.732);
+    return sb - sa;
+  });
+  for (const req of sizedRequests) {
+    tryPlace(() => req);
   }
   if (rooms.length < 3) {
     [{ cx: -512, cy: 0 }, { cx: 512, cy: 0 }, { cx: 0, cy: 512 }, { cx: 0, cy: -512 }].forEach(p => {
@@ -953,7 +976,9 @@ function generateDungeon() {
     // Concentric trim layers stepping up toward the centre. Cap by room size
     // so the deepest inset polygon stays positive — small rooms get fewer
     // layers (or none) to avoid degenerate inverted-winding geometry.
-    const minDim = r.type === 'octagon' ? r.r * 2 * 0.924 : Math.min(r.w, r.h);
+    const minDim = r.type === 'octagon' ? r.r * 2 * 0.924
+                 : r.type === 'hexagon' ? r.r * 2 * 0.866
+                 : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
     r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     // Outer sector: lowest floor, faces corridors. This is what doorways connect to.
@@ -1006,17 +1031,32 @@ function generateDungeon() {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (minDim >= 768 && r.feature === 'none') {
-      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 48 });
-    } else if (minDim >= 1024 && r.feature === 'none') {
-      const off = Math.floor(minDim / 4 / 32) * 32;
-      r.pillars.push({ cx: r.cx - off, cy: r.cy - off, radius: 48 });
-      r.pillars.push({ cx: r.cx + off, cy: r.cy - off, radius: 48 });
-      r.pillars.push({ cx: r.cx - off, cy: r.cy + off, radius: 48 });
-      r.pillars.push({ cx: r.cx + off, cy: r.cy + off, radius: 48 });
+    if (r.feature === 'none') {
+      if (minDim >= 1024) {
+        const off = Math.floor(minDim / 5 / 32) * 32;
+        r.pillars.push({ cx: r.cx - off, cy: r.cy - off, radius: 48 });
+        r.pillars.push({ cx: r.cx + off, cy: r.cy - off, radius: 48 });
+        r.pillars.push({ cx: r.cx - off, cy: r.cy + off, radius: 48 });
+        r.pillars.push({ cx: r.cx + off, cy: r.cy + off, radius: 48 });
+      } else if (minDim >= 640) {
+        r.pillars.push({ cx: r.cx, cy: r.cy, radius: 40 });
+      }
+    } else if (minDim >= 1024 && r.type === 'square') {
+      // Big square room with a central feature: two side pillars on the
+      // room's longer axis, far enough out that they don't crowd the
+      // feature ring.
+      const longAxisX = r.w >= r.h;
+      const off = Math.floor((longAxisX ? r.w : r.h) * 0.32 / 32) * 32;
+      const innerRadius = TRIM_W * r.trimLayers + INNER_INSET;
+      if (off - 48 > innerRadius + 64) {
+        const dx = longAxisX ? off : 0;
+        const dy = longAxisX ? 0 : off;
+        r.pillars.push({ cx: r.cx - dx, cy: r.cy - dy, radius: 40 });
+        r.pillars.push({ cx: r.cx + dx, cy: r.cy + dy, radius: 40 });
+      }
     }
     r.pillarSecIds = r.pillars.map(() => allocSec({
-      floorH: r.ceilH, ceilH: r.ceilH, // closed sector reads as solid column
+      floorH: r.ceilH, ceilH: r.ceilH,
       floorTex: r.palette.floor, ceilTex: r.palette.ceil,
       light: r.light, special: 0,
     }));
@@ -1376,6 +1416,41 @@ function generateDungeon() {
     }
   }
 
+  // Secrets — mark 1–2 non-start non-exit rooms with sector special 9 on
+  // their innermost trim layer (or outer if no trim). Doom counts entry
+  // into a secret-marked sector as a "secret found" stat. We avoid the
+  // start room (player would auto-find on spawn) and the exit room
+  // (player's already there for the exit, no surprise).
+  if (rooms.length >= 4) {
+    const candidates = rooms
+      .map((r, i) => ({ r, i }))
+      .filter(({ i }) => i !== 0 && i !== exitIdx);
+    // Shuffle deterministically using the local RNG.
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
+    const numSecrets = 1 + Math.floor(rand() * 2); // 1 or 2
+    for (let k = 0; k < Math.min(numSecrets, candidates.length); k++) {
+      const room = candidates[k].r;
+      const secretSecId = (room.trimIds && room.trimIds.length)
+        ? room.trimIds[room.trimIds.length - 1]
+        : room.outerId;
+      const sec = sectors.find(s => s.id === secretSecId);
+      // Don't clobber an existing special (e.g. flicker/glow) — fall back
+      // to the next layer outward.
+      if (sec && !sec.special) {
+        sec.special = 9; // Doom "secret" sector special
+      } else {
+        const allCandidates = [...(room.trimIds || []), room.outerId];
+        for (const sid of allCandidates) {
+          const s = sectors.find(x => x.id === sid);
+          if (s && !s.special) { s.special = 9; break; }
+        }
+      }
+    }
+  }
+
   return { vertices: verts, linedefs, sidedefs, sectors, things };
 }
 
@@ -1678,6 +1753,40 @@ function validateMap(map) {
   }
   if (homCount > 5) issues.push({ kind: 'warning', text: `(+${homCount - 5} more HOM-risk lines hidden)` });
 
+  // Vanilla / engine count limits. Modern source ports (GZDoom, Crispy)
+  // raise these, but warning at vanilla thresholds keeps the map portable.
+  if (map.vertices.length  > 32767) issues.push({ kind: 'error',   text: `${map.vertices.length} vertices exceeds the 32767 hard limit` });
+  else if (map.vertices.length  > 8000) issues.push({ kind: 'warning', text: `${map.vertices.length} vertices (>8000) — beyond Doom v1.9 reliable load` });
+  if (map.linedefs.length > 32767) issues.push({ kind: 'error',   text: `${map.linedefs.length} linedefs exceeds the 32767 hard limit` });
+  else if (map.linedefs.length > 8000) issues.push({ kind: 'warning', text: `${map.linedefs.length} linedefs (>8000) — node-build time and BLOCKMAP risk` });
+  if (map.sidedefs.length > 65535) issues.push({ kind: 'error',   text: `${map.sidedefs.length} sidedefs exceeds the 65535 uint16 index limit` });
+  else if (map.sidedefs.length > 32000) issues.push({ kind: 'warning', text: `${map.sidedefs.length} sidedefs (>32000) — approaching uint16 index limit` });
+  if (map.sectors.length  > 32767) issues.push({ kind: 'error',   text: `${map.sectors.length} sectors exceeds the 32767 hard limit` });
+  else if (map.sectors.length  > 2000) issues.push({ kind: 'warning', text: `${map.sectors.length} sectors (>2000) — visplane / overdraw risk on weaker ports` });
+  if (map.things.length   > 32767) issues.push({ kind: 'error',   text: `${map.things.length} things exceeds the 32767 hard limit` });
+
+  // Map extent. Doom's BLOCKMAP is indexed at 128 units per cell and the
+  // entire blockmap header is uint16-indexed; very large maps (extent
+  // > ~16384 units on a side) push vanilla and risk the famous 64 KiB
+  // blockmap overflow.
+  if (map.vertices.length > 0) {
+    let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+    for (const v of map.vertices) {
+      if (v.x < xmin) xmin = v.x; if (v.x > xmax) xmax = v.x;
+      if (v.y < ymin) ymin = v.y; if (v.y > ymax) ymax = v.y;
+    }
+    const spanX = xmax - xmin, spanY = ymax - ymin;
+    if (spanX > 32000 || spanY > 32000) {
+      issues.push({ kind: 'warning', text: `Map extent ${spanX}×${spanY} — vanilla BLOCKMAP overflow risk past ~32000 units on either axis` });
+    }
+    // BLOCKMAP cell estimate: (spanX/128) × (spanY/128) cells, each ≥4 bytes
+    // before list contents. >64 KiB header alone trips vanilla.
+    const cells = Math.ceil(spanX / 128) * Math.ceil(spanY / 128);
+    if (cells > 32768) {
+      issues.push({ kind: 'warning', text: `BLOCKMAP cell count ${cells} (>32768) — vanilla load may fail` });
+    }
+  }
+
   return issues;
 }
 
@@ -1784,7 +1893,7 @@ function buildAddedRooms(existing) {
   }
   if (!isFinite(minX)) return existing;
   let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
-  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0xffffff; };
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
   // Pick a side with space — the new cluster will be GAP units past the
   // existing bbox in that direction.
   const GAP = 256;
@@ -3470,7 +3579,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.11</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.12</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -4620,7 +4729,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.11</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.12</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

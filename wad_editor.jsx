@@ -534,7 +534,6 @@ const DOOM_TEXTURES = {
     'BIGDOOR1', 'BIGDOOR2', 'BIGDOOR3', 'BIGDOOR4', 'BIGDOOR5', 'BIGDOOR7',
     'DOOR1', 'DOOR3', 'DOORBLU', 'DOORRED', 'DOORYEL', 'DOORTRAK',
     'EXITDOOR', 'EXITSIGN', 'EXITSTON',
-    'SW1COMM', 'SW1STON1', 'SW1WOOD', 'SW1BRN1', 'SW2COMM', 'SW2STON1', 'SW2WOOD',
     'GRAY1', 'GRAY2', 'GRAY4', 'GRAY5', 'GRAY7', 'GRAYBIG', 'GRAYTALL',
     'COMPSTA1', 'COMPSTA2', 'COMPWERD', 'COMPBLUE', 'COMPSPAN',
     'MIDGRATE', 'MIDBARS1', 'MIDBARS3', 'MIDBRN1', 'MIDSPACE',
@@ -543,6 +542,10 @@ const DOOM_TEXTURES = {
     'PIPE1', 'PIPE2', 'PIPE4', 'PIPE6',
     'CRATE1', 'CRATE2', 'CRATELIT', 'CRATWIDE',
     'SLADWALL', 'TANROCK2', 'TANROCK4', 'TANROCK5',
+  ],
+  switches: [
+    'SW1COMM', 'SW1STON1', 'SW1WOOD', 'SW1BRN1', 'SW1EXIT',
+    'SW2COMM', 'SW2STON1', 'SW2WOOD', 'SW2BRN1',
   ],
   floors: [
     'FLOOR0_1', 'FLOOR0_2', 'FLOOR0_3', 'FLOOR0_5', 'FLOOR0_6', 'FLOOR0_7',
@@ -1003,9 +1006,16 @@ function _generateDungeonOnce() {
     }
     const roll = rand();
     if (r.hasSky)          r.feature = 'sky';
-    else if (roll < 0.45)  r.feature = 'platform';
-    else if (roll < 0.6)   r.feature = 'pit';
+    else if (roll < 0.25)  r.feature = 'platform';     // altar-like dais
+    else if (roll < 0.40)  r.feature = 'pit';          // hazard pit
+    else if (roll < 0.52)  r.feature = 'altar';        // tall pillar atop a dais
+    else if (roll < 0.62)  r.feature = 'cathedral';    // vaulted ceiling, no centre
+    else if (roll < 0.72)  r.feature = 'crusher';      // oppressively low ceiling
     else                   r.feature = 'none';
+    // Cathedral: pull the ceiling much higher so the trim step-up vaults
+    // even more. Crusher: clamp the ceiling low for oppressive combat.
+    if (r.feature === 'cathedral') r.ceilH = r.floorH + 256 + Math.floor(rand() * 3) * 32;
+    if (r.feature === 'crusher')   r.ceilH = r.floorH + 96;
     r.special = rand() < 0.15 ? 8 : (rand() < 0.06 ? 17 : 0);
   });
 
@@ -1049,13 +1059,14 @@ function _generateDungeonOnce() {
       floorTex: r.palette.floor, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
       light: r.light, special: r.special,
     });
-    // Concentric trim layers — each step IN drops the floor and ceiling by
-    // 8 units, carving a concave bowl toward the centre with a corresponding
-    // ceiling soffit. Lower / upper textures get filled by the resolve pass.
+    // Concentric trim layers — each step IN drops the floor by 8 and RAISES
+    // the ceiling by 8, so rooms read as expansive bowls: a concave sunken
+    // centre under a vaulted ceiling that opens up overhead as you walk in.
+    // Lower / upper textures get filled by the resolve pass.
     r.trimIds = [];
     for (let i = 1; i <= r.trimLayers; i++) {
       r.trimIds.push(allocSec({
-        floorH: r.floorH - i * 8, ceilH: r.hasSky ? r.ceilH : r.ceilH - i * 8,
+        floorH: r.floorH - i * 8, ceilH: r.hasSky ? r.ceilH : r.ceilH + i * 8,
         floorTex: r.palette.trim,
         ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
         light: Math.max(64, r.light - i * 6), special: 0,
@@ -1067,7 +1078,7 @@ function _generateDungeonOnce() {
     if (minDim < featureMinSize) r.feature = 'none';
     // Centre feature, sits inside the deepest (lowest) trim layer.
     const deepestFloor = r.floorH - r.trimLayers * 8;
-    const deepestCeil = r.hasSky ? r.ceilH : r.ceilH - r.trimLayers * 8;
+    const deepestCeil = r.hasSky ? r.ceilH : r.ceilH + r.trimLayers * 8;
     if (r.feature === 'platform') {
       // A small rise in the centre of the concave bowl — like an altar.
       r.featureId = allocSec({
@@ -1088,14 +1099,35 @@ function _generateDungeonOnce() {
         ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
         light: Math.max(64, r.light - 24), special: 7,
       });
+    } else if (r.feature === 'altar') {
+      // A raised platform with a solid column rising to the ceiling at its
+      // centre — like a temple altar. Platform itself; the column is added
+      // to r.pillars below so it stamps as a closed sub-sector.
+      r.featureId = allocSec({
+        floorH: deepestFloor + 24, ceilH: deepestCeil,
+        floorTex: r.palette.accent, ceilTex: r.palette.accent,
+        light: Math.min(255, r.light + 24), special: 0,
+      });
     }
+    // 'cathedral' and 'crusher' have no centre sub-sector — the height
+    // change applied above is the whole feature.
     // Pillars in larger rooms — small closed sub-sectors that act as
     // visual breakup and combat cover. Place 1 (in large rooms) or 4
     // (in huge rooms with a 2x2 grid offset from centre). Pillar is a
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r.feature === 'none') {
+    if (r.feature === 'altar') {
+      // Tall column at the centre of the altar dais.
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
+    } else if (r.feature === 'cathedral' && minDim >= 512) {
+      // Four-corner colonnade — pillars supporting the vaulted ceiling.
+      const off = Math.floor(minDim / 4 / 32) * 32;
+      r.pillars.push({ cx: r.cx - off, cy: r.cy - off, radius: 40 });
+      r.pillars.push({ cx: r.cx + off, cy: r.cy - off, radius: 40 });
+      r.pillars.push({ cx: r.cx - off, cy: r.cy + off, radius: 40 });
+      r.pillars.push({ cx: r.cx + off, cy: r.cy + off, radius: 40 });
+    } else if (r.feature === 'none') {
       if (minDim >= 1024) {
         const off = Math.floor(minDim / 5 / 32) * 32;
         r.pillars.push({ cx: r.cx - off, cy: r.cy - off, radius: 48 });
@@ -1545,30 +1577,35 @@ function _generateDungeonOnce() {
       if (!fs || !bs) continue;
       const backIsBody = bs.sector === co.doorAId || bs.sector === co.doorBId;
       const frontIsBody = fs.sector === co.doorAId || fs.sector === co.doorBId;
-      // Door-face line: between corridor mainBody and a door body.
+      // Door-face line: between corridor mainBody and a door body. Use
+      // BIGDOOR4 (64×128) — wide enough to not tile vertically on a 96-tall
+      // panel — and set UPPER_UNPEGGED so the door image anchors at the
+      // moving (lower) ceiling and rides up with the door as it opens.
       if (fs.sector === co.mainBodyId && backIsBody) {
         l.special = 1;
-        fs.upper = 'DOOR3';
-        bs.upper = 'DOOR3';
+        l.flags = (l.flags | 8);
+        fs.upper = 'BIGDOOR4';
+        bs.upper = 'BIGDOOR4';
         continue;
       }
       // Room-side line: between a HEADER strip and a door body. DR-1 opens
-      // from this side, and DOOR3 on both uppers paints the door panel
-      // across the header's 96-tall ceiling — clearly visible from the
-      // room while the surrounding lintel (header ↔ outerId) still blends
-      // with the wall.
+      // from this side, BIGDOOR4 on both uppers paints the door panel across
+      // the header's 96-tall ceiling — clearly visible from the room while
+      // the surrounding lintel (header ↔ outerId) still blends with the wall.
       if (backIsBody && fs.sector !== co.mainBodyId && !doorBodyIds.has(fs.sector)) {
         l.special = 1;
-        fs.upper = 'DOOR3';
-        bs.upper = 'DOOR3';
+        l.flags = (l.flags | 8);
+        fs.upper = 'BIGDOOR4';
+        bs.upper = 'BIGDOOR4';
         continue;
       }
       if (frontIsBody && bs.sector !== co.mainBodyId && !doorBodyIds.has(bs.sector)) {
         const tmp = l.front; l.front = l.back; l.back = tmp;
         const tmpV = l.v1; l.v1 = l.v2; l.v2 = tmpV;
         l.special = 1;
-        fs.upper = 'DOOR3';
-        bs.upper = 'DOOR3';
+        l.flags = (l.flags | 8);
+        fs.upper = 'BIGDOOR4';
+        bs.upper = 'BIGDOOR4';
         continue;
       }
     }
@@ -2468,7 +2505,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     // Door face — walks south so front=room, back=door body. DR-1 will
     // raise the back sector's ceiling = the door body.
     emit(vWU, vWL, westRoomSec, westDoorId, {
-      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+      special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4', flags: 8,
     });
 
     // Split the east wall similarly, but walking NORTH so the east room
@@ -2479,7 +2516,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     emit(eSouthV, vEL2, eastRoomSec, null, { middle: eastMiddle });
     emit(vEU2, eNorthV, eastRoomSec, null, { middle: eastMiddle });
     emit(vEL2, vEU2, eastRoomSec, eastDoorId, {
-      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+      special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4', flags: 8,
     });
 
     // West door body — south track walks west, north track walks east, both
@@ -2489,12 +2526,12 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     emit(vWU, vWBU, westDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // north track
     // Corridor interface for west door body — walks NORTH so the corridor
     // is on the right (east of west door body), door body on the left.
-    emit(vWBL, vWBU, corridorId, westDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
+    emit(vWBL, vWBU, corridorId, westDoorId, { flags: 24, special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4' });
 
     // East door body tracks (mirror)
     emit(vEL2, vEBL, eastDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // south track
     emit(vEBU, vEU2, eastDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // north track
-    emit(vEBU, vEBL, corridorId, eastDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
+    emit(vEBU, vEBL, corridorId, eastDoorId, { flags: 24, special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4' });
 
     // Corridor body's two long walls — south wall walks west, north walks
     // east, both with corridor on the right.
@@ -2529,7 +2566,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     emit(sWestV, vSL, southRoomSec, null, { middle: southMiddle });
     emit(vSU, sEastV, southRoomSec, null, { middle: southMiddle });
     emit(vSL, vSU, southRoomSec, southDoorId, {
-      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+      special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4', flags: 8,
     });
 
     // Split north wall walking WEST so room (north side) is on the right.
@@ -2539,7 +2576,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     emit(nEastV, vNU2, northRoomSec, null, { middle: northMiddle });
     emit(vNL2, nWestV, northRoomSec, null, { middle: northMiddle });
     emit(vNU2, vNL2, northRoomSec, northDoorId, {
-      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+      special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4', flags: 8,
     });
 
     // South door body tracks. Door body interior is at y ∈ (southY,
@@ -2550,7 +2587,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     // of y=southY+THICK) ends up on the right.
     emit(vSL, vSBL, southDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // west track, north
     emit(vSBU, vSU, southDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // east track, south
-    emit(vSBU, vSBL, corridorId, southDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
+    emit(vSBU, vSBL, corridorId, southDoorId, { flags: 24, special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4' });
 
     // North door body interior at y ∈ (northY-THICK, northY), x ∈ (c0,c1).
     // West track at x=c0 walks north (interior east); east track at x=c1
@@ -2558,7 +2595,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     // walks east so corridor body (south of that line) is on the right.
     emit(vNBL, vNL2, northDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // west track, north
     emit(vNU2, vNBU, northDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // east track, south
-    emit(vNBL, vNBU, corridorId, northDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
+    emit(vNBL, vNBU, corridorId, northDoorId, { flags: 24, special: 1, upper: 'BIGDOOR4', backUpper: 'BIGDOOR4' });
 
     // Corridor body's long walls — west wall walks north, east wall walks
     // south, both with the corridor body on the right of v1→v2.
@@ -4256,7 +4293,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.17</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.18</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -5379,7 +5416,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.17</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.18</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

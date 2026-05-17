@@ -1060,6 +1060,77 @@ function generateDungeon() {
       floorTex: r.palette.floor, ceilTex: r.palette.ceil,
       light: r.light, special: 0,
     }));
+    // Wall alcoves — small outward niches on cardinal sides. Square rooms
+    // only (octagon/hexagon flat-side spans are tight). Skip sides that
+    // already host corridor attachments. Cap at 2 per room.
+    r.alcoves = [];
+    if (r.type === 'square' && r.w >= 384 && r.h >= 384) {
+      const roomIdx = rooms.indexOf(r);
+      const ALCOVE_W = 96, ALCOVE_D = 56, ALCOVE_MARGIN = 96;
+      const sideHasCorridor = (side) => {
+        for (const co of corridors) {
+          if (co.orient === 'H' && co.wIdx === roomIdx && side === 'E') return true;
+          if (co.orient === 'H' && co.eIdx === roomIdx && side === 'W') return true;
+          if (co.orient === 'V' && co.sIdx === roomIdx && side === 'N') return true;
+          if (co.orient === 'V' && co.nIdx === roomIdx && side === 'S') return true;
+        }
+        return false;
+      };
+      const sides = ['N', 'S', 'E', 'W'].filter(s => !sideHasCorridor(s));
+      // Shuffle deterministically
+      for (let i = sides.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [sides[i], sides[j]] = [sides[j], sides[i]];
+      }
+      const maxAlcoves = Math.min(2, sides.length);
+      let placed = 0;
+      for (const side of sides) {
+        if (placed >= maxAlcoves) break;
+        if (rand() > 0.55) continue;
+        const isHoriz = side === 'N' || side === 'S';
+        const edgeLen = isHoriz ? r.w : r.h;
+        if (edgeLen < ALCOVE_W + ALCOVE_MARGIN * 2) continue;
+        const halfW = r.w / 2, halfH = r.h / 2;
+        let axisCoord, outwardSign;
+        if (side === 'N') { axisCoord = r.cy + halfH; outwardSign = +1; }
+        else if (side === 'S') { axisCoord = r.cy - halfH; outwardSign = -1; }
+        else if (side === 'E') { axisCoord = r.cx + halfW; outwardSign = +1; }
+        else { axisCoord = r.cx - halfW; outwardSign = -1; }
+        const edgeStart = isHoriz ? (r.cx - halfW) : (r.cy - halfH);
+        const edgeEnd = isHoriz ? (r.cx + halfW) : (r.cy + halfH);
+        const slack = edgeLen - ALCOVE_MARGIN * 2 - ALCOVE_W;
+        const center = edgeStart + ALCOVE_MARGIN + ALCOVE_W / 2 + Math.round((rand() * slack) / 8) * 8;
+        const aLow = center - ALCOVE_W / 2;
+        const aHigh = center + ALCOVE_W / 2;
+        // Bbox of the alcove's protrusion — must not poke into any other
+        // room or corridor.
+        let albb;
+        if (side === 'N') albb = { minX: aLow, maxX: aHigh, minY: axisCoord, maxY: axisCoord + ALCOVE_D };
+        else if (side === 'S') albb = { minX: aLow, maxX: aHigh, minY: axisCoord - ALCOVE_D, maxY: axisCoord };
+        else if (side === 'E') albb = { minX: axisCoord, maxX: axisCoord + ALCOVE_D, minY: aLow, maxY: aHigh };
+        else albb = { minX: axisCoord - ALCOVE_D, maxX: axisCoord, minY: aLow, maxY: aHigh };
+        if (rooms.some((o, oi) => oi !== roomIdx && bboxOverlap(roomBBox(o), albb, 16))) continue;
+        if (corridors.some(co => bboxOverlap(co, albb, 16))) continue;
+        // Shelf (raised) or nook (recessed). Shelves brighter, nooks dimmer.
+        const isShelf = rand() < 0.6;
+        const alcSec = allocSec({
+          floorH: r.floorH + (isShelf ? 16 : -8),
+          ceilH: isShelf ? r.ceilH : r.floorH + 96,
+          floorTex: isShelf ? r.palette.accent : r.palette.trim,
+          ceilTex: r.hasSky ? r.palette.ceil : r.palette.ceil,
+          light: isShelf ? Math.min(255, r.light + 40) : Math.max(64, r.light - 40),
+          special: 0,
+        });
+        r.alcoves.push({
+          side, isHoriz, axisCoord, outwardSign,
+          aLow, aHigh, depth: ALCOVE_D,
+          sectorId: alcSec,
+          wallTex: r.palette.wall,
+          isShelf,
+        });
+        placed++;
+      }
+    }
   });
 
   // Corridors: floor = max of two rooms' floors, ceiling = floor + 96 (canon).
@@ -1179,6 +1250,53 @@ function generateDungeon() {
       atts.push({ a: range[0], b: range[1], corridor: co, doorBodyId });
     }
     if (atts.length === 0) {
+      // Optional alcove detour on this edge.
+      let alcove = null;
+      if (room.alcoves) {
+        for (const a of room.alcoves) {
+          if (a.isHoriz !== isHoriz) continue;
+          if (isHoriz) {
+            if (Math.abs(p1.y - a.axisCoord) > 0.5) continue;
+            const eMin = Math.min(p1.x, p2.x), eMax = Math.max(p1.x, p2.x);
+            if (a.aLow < eMin - 0.5 || a.aHigh > eMax + 0.5) continue;
+          } else {
+            if (Math.abs(p1.x - a.axisCoord) > 0.5) continue;
+            const eMin = Math.min(p1.y, p2.y), eMax = Math.max(p1.y, p2.y);
+            if (a.aLow < eMin - 0.5 || a.aHigh > eMax + 0.5) continue;
+          }
+          alcove = a;
+          break;
+        }
+      }
+      if (alcove) {
+        const walkDir = isHoriz ? Math.sign(p2.x - p1.x) : Math.sign(p2.y - p1.y);
+        const near = walkDir > 0 ? alcove.aLow : alcove.aHigh;
+        const far = walkDir > 0 ? alcove.aHigh : alcove.aLow;
+        const ortho = isHoriz ? p1.y : p1.x;
+        const outOrtho = ortho + alcove.outwardSign * alcove.depth;
+        const A1 = isHoriz ? { x: near, y: ortho } : { x: ortho, y: near };
+        const A2 = isHoriz ? { x: far, y: ortho } : { x: ortho, y: far };
+        const B1 = isHoriz ? { x: near, y: outOrtho } : { x: outOrtho, y: near };
+        const B2 = isHoriz ? { x: far, y: outOrtho } : { x: outOrtho, y: far };
+        // 1. p1 → A1: straight wall (room outer, void).
+        if (Math.abs((isHoriz ? p1.x : p1.y) - near) > 0.5) {
+          emitWall(p1.x, p1.y, A1.x, A1.y, room.outerId, null, { middle: room.palette.wall });
+        }
+        // 2. A1 → B1: outward side wall (alcove, void). Front = alcove.
+        emitWall(A1.x, A1.y, B1.x, B1.y, alcove.sectorId, null, { middle: alcove.wallTex });
+        // 3. B1 → B2: far wall (alcove, void).
+        emitWall(B1.x, B1.y, B2.x, B2.y, alcove.sectorId, null, { middle: alcove.wallTex });
+        // 4. B2 → A2: inward side wall (alcove, void).
+        emitWall(B2.x, B2.y, A2.x, A2.y, alcove.sectorId, null, { middle: alcove.wallTex });
+        // 5. A1 → A2: 2-sided opening, front = room outer (interior), back = alcove.
+        //    LOWER_UNPEGGED so step textures don't slide.
+        emitWall(A1.x, A1.y, A2.x, A2.y, room.outerId, alcove.sectorId, { flags: 16 });
+        // 6. A2 → p2: straight wall continuation.
+        if (Math.abs((isHoriz ? p2.x : p2.y) - far) > 0.5) {
+          emitWall(A2.x, A2.y, p2.x, p2.y, room.outerId, null, { middle: room.palette.wall });
+        }
+        return;
+      }
       emitWall(p1.x, p1.y, p2.x, p2.y, room.outerId, null, { middle: room.palette.wall });
       return;
     }
@@ -1364,7 +1482,19 @@ function generateDungeon() {
 
   // -------- 9. Place things --------
   const things = [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
-  const MONSTERS = [3001, 3002, 3004, 9, 3005];
+  // Per-zone monster archetypes — combat theme matches palette. Techbase
+  // walls draw human grunts; hellish stone draws demons and cacos. Doom
+  // type IDs: 3001 imp, 3002 pinky, 3003 baron, 3004 zombie, 9 sergeant,
+  // 3005 caco, 3006 lost soul, 65 chaingunner, 69 hell knight.
+  const MONSTERS_BY_WALL = {
+    STARTAN2: [3004, 9, 3001, 3001, 65],          // techbase: humans + imps
+    BROWN1:   [9, 3001, 3002, 3004],              // industrial: mixed grunts
+    METAL:    [3002, 3001, 9, 65],                // metal: pinkies + chainguns
+    STONE2:   [3005, 3003, 3001, 3006, 69],       // hellstone: cacos/barons
+    WOOD1:    [9, 3001, 3004, 3002],              // wood: armory grunts
+    GRAY5:    [69, 3002, 3001, 3005],             // gray castle: knights+demons
+  };
+  const MONSTERS_DEFAULT = [3001, 3002, 3004, 9, 3005];
   const ITEMS = [2007, 2008, 2011, 2014, 2018, 2002];
   // Vary monster count by room size — bigger rooms host more.
   rooms.forEach((r, i) => {
@@ -1372,6 +1502,7 @@ function generateDungeon() {
     const bb = roomBBox(r);
     const area = (bb.maxX - bb.minX) * (bb.maxY - bb.minY);
     const monsterCount = Math.min(4, Math.floor(area / (300 * 300)) + (rand() < 0.4 ? 1 : 0));
+    const pool = MONSTERS_BY_WALL[r.palette && r.palette.wall] || MONSTERS_DEFAULT;
     for (let m = 0; m < monsterCount; m++) {
       const off = 64 + rand() * 96;
       const ang = rand() * Math.PI * 2;
@@ -1380,7 +1511,7 @@ function generateDungeon() {
         x: Math.round(r.cx + Math.cos(ang) * off),
         y: Math.round(r.cy + Math.sin(ang) * off),
         angle: Math.floor(rand() * 8) * 45,
-        type: pick(MONSTERS), flags: 7,
+        type: pick(pool), flags: 7,
       });
     }
     if (rand() < 0.55) {
@@ -3901,7 +4032,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.13</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.14</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -5024,7 +5155,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.13</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.14</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

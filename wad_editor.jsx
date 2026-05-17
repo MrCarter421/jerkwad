@@ -1005,25 +1005,37 @@ function _generateDungeonOnce() {
       r.light = pick([208, 224, 240]);
     }
     const roll = rand();
-    if (r.hasSky)          r.feature = 'sky';
-    else if (roll < 0.18)  r.feature = 'platform';     // altar-like dais
-    else if (roll < 0.30)  r.feature = 'pit';          // hazard pit
-    else if (roll < 0.40)  r.feature = 'altar';        // tall pillar atop a dais
-    else if (roll < 0.50)  r.feature = 'cathedral';    // vaulted ceiling, colonnade
-    else if (roll < 0.58)  r.feature = 'crusher';      // oppressively low ceiling
-    else if (roll < 0.68)  r.feature = 'colonnade';    // line of columns across centre
-    else if (roll < 0.76)  r.feature = 'pool';         // central liquid pool
-    else if (roll < 0.84)  r.feature = 'crypt';        // dim stone with raised tomb
-    else                   r.feature = 'none';
-    // Cathedral: pull the ceiling much higher so the trim step-up vaults
-    // even more. Crusher: clamp the ceiling low for oppressive combat.
-    // Crypt: dim and stony, low ceiling.
+    // Large rooms get a shot at being "The Lake" — a dramatic centerpiece
+    // with a recessed pool, scattered islands and a 4-pillar temple.
+    const rmDim = r.type === 'octagon' ? r.r * 2 * 0.924
+                : r.type === 'hexagon' ? r.r * 2 * 0.866
+                : Math.min(r.w, r.h);
+    const isLargeRoom = rmDim >= 896;
+    if (r.hasSky)              r.feature = 'sky';
+    else if (isLargeRoom && roll < 0.20) r.feature = 'lake';
+    else if (roll < 0.16)      r.feature = 'platform';   // altar-like dais
+    else if (roll < 0.26)      r.feature = 'pit';        // hazard pit
+    else if (roll < 0.34)      r.feature = 'altar';      // tall pillar on a dais
+    else if (roll < 0.42)      r.feature = 'cathedral';  // vaulted ceiling, colonnade
+    else if (roll < 0.48)      r.feature = 'crusher';    // low ceiling
+    else if (roll < 0.56)      r.feature = 'colonnade';  // line of columns
+    else if (roll < 0.63)      r.feature = 'pool';       // small central pool
+    else if (roll < 0.70)      r.feature = 'crypt';      // dim stone tomb
+    else if (roll < 0.76)      r.feature = 'liminal';    // backrooms-style bright void
+    else if (roll < 0.81)      r.feature = 'reactor';    // glowing tech core
+    else if (roll < 0.86)      r.feature = 'gallery';    // long raised central walkway
+    else                       r.feature = 'none';
+    // Cathedral/crusher/crypt/liminal/reactor adjust ceiling height directly.
     if (r.feature === 'cathedral') r.ceilH = r.floorH + 256 + Math.floor(rand() * 3) * 32;
     if (r.feature === 'crusher')   r.ceilH = r.floorH + 96;
-    if (r.feature === 'crypt') {
-      r.ceilH = r.floorH + 128;
-      r.light = Math.max(64, r.light - 64);
-    }
+    if (r.feature === 'crypt')   { r.ceilH = r.floorH + 128; r.light = Math.max(64, r.light - 64); }
+    // Liminal — backrooms aesthetic: oppressive low ceiling, blown-out bright
+    // ceiling lights, tan/yellow walls. Disorienting and dreamlike.
+    if (r.feature === 'liminal') { r.ceilH = r.floorH + 112; r.light = 240; }
+    // Reactor — bright glowing tech core: tall ceiling, cool lights.
+    if (r.feature === 'reactor')  { r.ceilH = r.floorH + 192; r.light = 200; }
+    // Lake — large hall with vaulted ceiling and pool. Ceiling pushed up.
+    if (r.feature === 'lake')     { r.ceilH = r.floorH + 224; r.light = 176; }
     r.special = rand() < 0.15 ? 8 : (rand() < 0.06 ? 17 : 0);
   });
 
@@ -1136,6 +1148,39 @@ function _generateDungeonOnce() {
         floorTex: 'FLAT5_4', ceilTex: 'CEIL3_3',
         light: Math.max(64, r.light - 16), special: 0,
       });
+    } else if (r.feature === 'lake') {
+      // The Lake — a deep recessed pool of water at the centre. Islands
+      // (small raised platforms) and a 4-pillar temple are added below
+      // via r.islands and r.pillars.
+      r.featureId = allocSec({
+        floorH: deepestFloor - 32, ceilH: deepestCeil,
+        floorTex: 'FWATER1', ceilTex: r.palette.ceil,
+        light: Math.max(96, r.light - 32), special: 0,
+      });
+    } else if (r.feature === 'reactor') {
+      // Glowing reactor core — a recessed cell-tech well at the centre.
+      r.featureId = allocSec({
+        floorH: deepestFloor - 16, ceilH: deepestCeil,
+        floorTex: 'NUKAGE1', ceilTex: 'TLITE6_1',
+        light: 240, special: 8,
+      });
+    } else if (r.feature === 'gallery') {
+      // Long raised walkway down the centre — like a museum nave.
+      r.featureId = allocSec({
+        floorH: deepestFloor + 16, ceilH: deepestCeil,
+        floorTex: r.palette.trim, ceilTex: r.palette.ceil,
+        light: Math.min(255, r.light + 24), special: 0,
+      });
+    } else if (r.feature === 'liminal') {
+      // Backrooms-style "off" sub-area — same floor but a different,
+      // garish tile pattern, sickly bright lights, low ceiling. The
+      // disorienting "wrong place" feel.
+      r.featureId = allocSec({
+        floorH: deepestFloor, ceilH: deepestCeil,
+        floorTex: pick(['FLAT22', 'FLAT19', 'FLOOR4_1']),
+        ceilTex: 'TLITE6_5',
+        light: 255, special: 0,
+      });
     }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
@@ -1148,6 +1193,18 @@ function _generateDungeonOnce() {
     if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
+    } else if (r.feature === 'lake' && minDim >= 768) {
+      // Four temple pillars at the centre of the pool — a tight square
+      // structure rising from the water.
+      const t = Math.floor(minDim / 8 / 32) * 32;
+      r.pillars.push({ cx: r.cx - t, cy: r.cy - t, radius: 32 });
+      r.pillars.push({ cx: r.cx + t, cy: r.cy - t, radius: 32 });
+      r.pillars.push({ cx: r.cx - t, cy: r.cy + t, radius: 32 });
+      r.pillars.push({ cx: r.cx + t, cy: r.cy + t, radius: 32 });
+      // Two extra outer pillars suggesting scattered islands.
+      const o = Math.floor(minDim / 3 / 32) * 32;
+      r.pillars.push({ cx: r.cx - o, cy: r.cy, radius: 24 });
+      r.pillars.push({ cx: r.cx + o, cy: r.cy, radius: 24 });
     } else if (r.feature === 'colonnade' && minDim >= 384) {
       // A row of 3 pillars across the room's longer axis — feels like a
       // temple nave.
@@ -1288,29 +1345,30 @@ function _generateDungeonOnce() {
     // body's ceiling rises and the player can pass through to the room.
     co.doorAId = allocSec({
       floorH: fh, ceilH: fh,
-      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      floorTex: ra.palette.floor, ceilTex: 'CEIL3_5',
       light: Math.max(80, baseLight - 64), special: 0,
     });
     co.doorBId = allocSec({
       floorH: fh, ceilH: fh,
-      floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      floorTex: rb.palette.floor, ceilTex: 'CEIL3_5',
       light: Math.max(80, baseLight - 64), special: 0,
     });
-    // Header sectors: 16-deep "lintel strip" inside each room at the
-    // doorway position with ceil 72 above floor — matching DOOR1's 72-tall
-    // image so the panel fills the upper exactly. The strip's far edge
-    // (between strip and the rest of the room) shows a soffit trim in
-    // the room's wall texture and frames the door from inside.
+    // Header sectors: a 16-deep "lintel strip" inside each room at the
+    // doorway. Ceiling = fh + 72 (NOT ra.floor + 72) — this guarantees
+    // the door body opens to fh + 68 above its floor, giving the 56-tall
+    // player full headroom regardless of room floor mismatch. The DOOR1
+    // panel still fills exactly 72 units when floors match, and a clean
+    // step when they don't.
     co.headerAId = allocSec({
-      floorH: ra.floorH, ceilH: ra.floorH + 72,
+      floorH: ra.floorH, ceilH: fh + 72,
       floorTex: ra.palette.floor,
-      ceilTex: ra.hasSky ? ra.palette.ceil : ra.palette.ceil,
+      ceilTex: ra.palette.ceil,
       light: ra.light, special: 0,
     });
     co.headerBId = allocSec({
-      floorH: rb.floorH, ceilH: rb.floorH + 72,
+      floorH: rb.floorH, ceilH: fh + 72,
       floorTex: rb.palette.floor,
-      ceilTex: rb.hasSky ? rb.palette.ceil : rb.palette.ceil,
+      ceilTex: rb.palette.ceil,
       light: rb.light, special: 0,
     });
   });
@@ -4389,7 +4447,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.19</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.20</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -5512,7 +5570,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.19</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.20</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

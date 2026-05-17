@@ -671,6 +671,18 @@ function generateRandomWorld() {
 // Door texture is DOOR3 (64-wide canonical) and door tracks use DOORTRAK
 // with the lower-unpegged flag set so the side textures don't slide.
 function generateDungeon() {
+  // Up to 6 attempts to produce a dungeon with at least 3 reachable rooms
+  // (≥ 1 corridor with doors). Otherwise the dungeon is unplayable and the
+  // user sees stranded rooms.
+  let last = null;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    last = _generateDungeonOnce();
+    const hasDoor = last.linedefs.some(l => l.special === 1);
+    if (hasDoor && last.sectors.length >= 8) return last;
+  }
+  return last;
+}
+function _generateDungeonOnce() {
   let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
@@ -880,6 +892,55 @@ function generateDungeon() {
       return (ta === a && tb === b) || (ta === b && tb === a);
     });
     if (!dup && rand() < 0.6) corridors.push(co);
+  }
+
+  // -------- 3b. prune unreachable rooms --------
+  // The spanning tree above may give up when no candidate corridor can bridge
+  // a room into the connected set (axis alignment fails, blocked by another
+  // room's bbox, etc.). Rooms left disconnected from room 0 would render as
+  // sealed "floating" rooms with no way in. Drop them and re-index corridors
+  // so the geometry pass only emits reachable rooms.
+  {
+    const reachable = new Set([0]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const co of corridors) {
+        const [a, b] = ends(co);
+        if (reachable.has(a) && !reachable.has(b)) { reachable.add(b); grew = true; }
+        else if (reachable.has(b) && !reachable.has(a)) { reachable.add(a); grew = true; }
+      }
+    }
+    // Bail on pruning if it would leave too few rooms — better to show a
+    // few floating islands than a one-room dungeon. This happens in the
+    // unlucky placements where no axis-aligned corridor candidate exists.
+    if (reachable.size < rooms.length && reachable.size >= 3) {
+      const indexMap = new Map();
+      const keptRooms = [];
+      rooms.forEach((r, i) => {
+        if (reachable.has(i)) {
+          indexMap.set(i, keptRooms.length);
+          keptRooms.push(r);
+        }
+      });
+      rooms.length = 0;
+      rooms.push(...keptRooms);
+      const keptCorridors = [];
+      for (const co of corridors) {
+        if (co.orient === 'H') {
+          if (!indexMap.has(co.wIdx) || !indexMap.has(co.eIdx)) continue;
+          co.wIdx = indexMap.get(co.wIdx);
+          co.eIdx = indexMap.get(co.eIdx);
+        } else {
+          if (!indexMap.has(co.sIdx) || !indexMap.has(co.nIdx)) continue;
+          co.sIdx = indexMap.get(co.sIdx);
+          co.nIdx = indexMap.get(co.nIdx);
+        }
+        keptCorridors.push(co);
+      }
+      corridors.length = 0;
+      corridors.push(...keptCorridors);
+    }
   }
 
   // -------- 4. room properties --------
@@ -1422,32 +1483,64 @@ function generateDungeon() {
   });
 
   // -------- 8. Apply door specials --------
-  // Each line between mainBody and a doorBody becomes a DR-1 door. DOOR3
-  // upper goes on the mainBody side (front) so the player approaching from
-  // the corridor sees the door image stretched from corridor ceiling down
-  // to the closed door body. Do NOT set lower-unpegged on the door face —
-  // the door image must ride with the moving ceiling.
+  // Each line touching a doorBody becomes a DR-1 door so USE opens it from
+  // EITHER side (corridor or room). The line's back must be the door body
+  // for DR-1 to raise that body's ceiling. The corridor-side face shows
+  // the DOOR3 image stretched between corridor ceiling and closed body
+  // floor; the room-side face uses the room's wall texture on the upper
+  // (set by the resolve pass below) so it blends into the surrounding wall
+  // as a natural door frame.
   const sdMap = new Map(sidedefs.map(s => [s.id, s]));
+  const doorBodyIds = new Set();
+  corridors.forEach((co) => {
+    doorBodyIds.add(co.doorAId);
+    doorBodyIds.add(co.doorBId);
+  });
   corridors.forEach((co) => {
     for (const l of linedefs) {
       if (l.front === -1 || l.back === -1) continue;
       const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
       if (!fs || !bs) continue;
-      const isDoorFace = fs.sector === co.mainBodyId &&
-        (bs.sector === co.doorAId || bs.sector === co.doorBId);
-      if (!isDoorFace) continue;
-      l.special = 1; // DR Open Door — operates on the BACK sector (door body)
-      const doorTex = 'DOOR3'; // 64-wide canonical
-      fs.upper = doorTex;
-      bs.upper = doorTex;
+      const backIsBody = bs.sector === co.doorAId || bs.sector === co.doorBId;
+      const frontIsBody = fs.sector === co.doorAId || fs.sector === co.doorBId;
+      // Door-face line: between corridor mainBody and a door body.
+      if (fs.sector === co.mainBodyId && backIsBody) {
+        l.special = 1;
+        fs.upper = 'DOOR3';
+        bs.upper = 'DOOR3';
+        continue;
+      }
+      // Room-side line: between a room and a door body. Flip so the door
+      // body is the BACK (DR-1 operates on back sector) if it isn't already.
+      // The room's wall texture above the door is set by the resolve pass.
+      if (backIsBody && fs.sector !== co.mainBodyId && !doorBodyIds.has(fs.sector)) {
+        l.special = 1;
+        continue;
+      }
+      if (frontIsBody && bs.sector !== co.mainBodyId && !doorBodyIds.has(bs.sector)) {
+        // Swap sides so the door body becomes the back.
+        const tmp = l.front; l.front = l.back; l.back = tmp;
+        const tmpV = l.v1; l.v1 = l.v2; l.v2 = tmpV;
+        l.special = 1;
+        continue;
+      }
     }
   });
 
   // -------- 8b. Resolve upper / lower textures on every two-sided line --------
   // For every two-sided line with a floor or ceiling step, set a wall texture
-  // on the visible side (lower texture on the side with the lower floor,
-  // upper texture on the side with the higher ceiling). Skips sides already
-  // textured (preserves door image, DOORTRAK tracks, etc.) and sky-to-sky.
+  // on the visible side. The upper above a door/step uses the SURROUNDING
+  // ROOM'S wall texture, not a generic STARTAN2 — that's the "door frame
+  // blends into the wall" look. We index sector → preferred wall texture
+  // for every room sub-sector.
+  const wallTexBySector = new Map();
+  rooms.forEach((r) => {
+    wallTexBySector.set(r.outerId, r.palette.wall);
+    for (const id of r.trimIds || []) wallTexBySector.set(id, r.palette.wall);
+    if (r.featureId) wallTexBySector.set(r.featureId, r.palette.wall);
+    for (const id of r.pillarSecIds || []) wallTexBySector.set(id, r.palette.wall);
+    for (const a of r.alcoves || []) wallTexBySector.set(a.sectorId, a.wallTex);
+  });
   const secMap = new Map(sectors.map(s => [s.id, s]));
   for (const l of linedefs) {
     if (l.front === -1 || l.back === -1) continue;
@@ -1475,7 +1568,10 @@ function generateDungeon() {
       const bothSky = fsec.ceilTex === 'F_SKY1' && bsec.ceilTex === 'F_SKY1';
       if (!bothSky) {
         const highSide = fsec.ceilH > bsec.ceilH ? fs : bs;
-        if (!highSide.upper || highSide.upper === '-') highSide.upper = 'STARTAN2';
+        const highSec = fsec.ceilH > bsec.ceilH ? fsec : bsec;
+        if (!highSide.upper || highSide.upper === '-') {
+          highSide.upper = wallTexBySector.get(highSec.id) || 'STARTAN2';
+        }
       }
     }
   }
@@ -2346,12 +2442,12 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     emit(vWU, vWBU, westDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // north track
     // Corridor interface for west door body — walks NORTH so the corridor
     // is on the right (east of west door body), door body on the left.
-    emit(vWBL, vWBU, corridorId, westDoorId, { flags: 16, upper: 'STARTAN2' });
+    emit(vWBL, vWBU, corridorId, westDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
 
     // East door body tracks (mirror)
     emit(vEL2, vEBL, eastDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // south track
     emit(vEBU, vEU2, eastDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // north track
-    emit(vEBU, vEBL, corridorId, eastDoorId, { flags: 16, upper: 'STARTAN2' });
+    emit(vEBU, vEBL, corridorId, eastDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
 
     // Corridor body's two long walls — south wall walks west, north walks
     // east, both with corridor on the right.
@@ -2407,7 +2503,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     // of y=southY+THICK) ends up on the right.
     emit(vSL, vSBL, southDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // west track, north
     emit(vSBU, vSU, southDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // east track, south
-    emit(vSBU, vSBL, corridorId, southDoorId, { flags: 16, upper: 'STARTAN2' });
+    emit(vSBU, vSBL, corridorId, southDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
 
     // North door body interior at y ∈ (northY-THICK, northY), x ∈ (c0,c1).
     // West track at x=c0 walks north (interior east); east track at x=c1
@@ -2415,7 +2511,7 @@ function tryConnectClusters(map, existing, vOffset, side, GAP) {
     // walks east so corridor body (south of that line) is on the right.
     emit(vNBL, vNL2, northDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // west track, north
     emit(vNU2, vNBU, northDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // east track, south
-    emit(vNBL, vNBU, corridorId, northDoorId, { flags: 16, upper: 'STARTAN2' });
+    emit(vNBL, vNBU, corridorId, northDoorId, { flags: 16, special: 1, upper: 'DOOR3', backUpper: 'DOOR3' });
 
     // Corridor body's long walls — west wall walks north, east wall walks
     // south, both with the corridor body on the right of v1→v2.
@@ -4113,7 +4209,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.15</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.16</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -5236,7 +5332,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.15</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.16</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

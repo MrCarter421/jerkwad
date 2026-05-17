@@ -1042,45 +1042,48 @@ function _generateDungeonOnce() {
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
     r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
-    // Outer sector: lowest floor, faces corridors. This is what doorways connect to.
+    // Outer sector: the ring at the room wall. Floor matches room floor and
+    // ceiling matches room ceiling — this is the layer doors connect to.
     r.outerId = allocSec({
       floorH: r.floorH, ceilH: r.ceilH,
       floorTex: r.palette.floor, ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
       light: r.light, special: r.special,
     });
-    // Concentric trim layers. Each layer steps up 8 units and uses the trim
-    // texture. Lower texture between layers is set automatically by the
-    // resolveTwoSidedTextures post-pass.
+    // Concentric trim layers — each step IN drops the floor and ceiling by
+    // 8 units, carving a concave bowl toward the centre with a corresponding
+    // ceiling soffit. Lower / upper textures get filled by the resolve pass.
     r.trimIds = [];
     for (let i = 1; i <= r.trimLayers; i++) {
       r.trimIds.push(allocSec({
-        floorH: r.floorH + i * 8, ceilH: r.ceilH,
+        floorH: r.floorH - i * 8, ceilH: r.hasSky ? r.ceilH : r.ceilH - i * 8,
         floorTex: r.palette.trim,
         ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
-        light: Math.min(255, r.light + i * 6), special: 0,
+        light: Math.max(64, r.light - i * 6), special: 0,
       }));
     }
     // Skip the centre feature if it wouldn't fit inside the innermost trim
     // (negative-size polygon = inverted winding = broken topology).
     const featureMinSize = 2 * (TRIM_W * r.trimLayers + INNER_INSET) + 64;
     if (minDim < featureMinSize) r.feature = 'none';
-    // Optional centre feature, sits inside the innermost trim.
-    const centerBaseFloor = r.floorH + (r.trimLayers + 1) * 8;
+    // Centre feature, sits inside the deepest (lowest) trim layer.
+    const deepestFloor = r.floorH - r.trimLayers * 8;
+    const deepestCeil = r.hasSky ? r.ceilH : r.ceilH - r.trimLayers * 8;
     if (r.feature === 'platform') {
+      // A small rise in the centre of the concave bowl — like an altar.
       r.featureId = allocSec({
-        floorH: centerBaseFloor + 8, ceilH: r.ceilH,
+        floorH: deepestFloor + 16, ceilH: deepestCeil,
         floorTex: r.palette.accent, ceilTex: r.palette.accent,
-        light: Math.min(255, r.light + 32), special: 0,
+        light: Math.min(255, r.light + 16), special: 0,
       });
     } else if (r.feature === 'sky') {
       r.featureId = allocSec({
-        floorH: centerBaseFloor, ceilH: r.floorH + 384,
+        floorH: deepestFloor, ceilH: r.floorH + 384,
         floorTex: r.palette.floor, ceilTex: 'F_SKY1',
         light: Math.min(255, r.light + 48), special: 0,
       });
     } else if (r.feature === 'pit') {
       r.featureId = allocSec({
-        floorH: r.floorH - 16, ceilH: r.ceilH,
+        floorH: deepestFloor - 16, ceilH: deepestCeil,
         floorTex: pick(['BLOOD1', 'NUKAGE1', 'LAVA1', 'FWATER1']),
         ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
         light: Math.max(64, r.light - 24), special: 7,
@@ -1221,6 +1224,24 @@ function _generateDungeonOnce() {
       floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
       light: Math.max(80, baseLight - 64), special: 0,
     });
+    // Header sectors: a 16-deep "lintel strip" inside each room at the
+    // doorway position, with ceil 96 above floor. The doorway line lives
+    // between this strip and the door body so the DOOR3 panel is a
+    // proper 96-tall door — not stretched up to the full room ceiling.
+    // The strip's far side (between strip and the rest of the room) shows
+    // a small soffit/header trim and frames the door from inside.
+    co.headerAId = allocSec({
+      floorH: ra.floorH, ceilH: ra.floorH + 96,
+      floorTex: ra.palette.floor,
+      ceilTex: ra.hasSky ? ra.palette.ceil : ra.palette.ceil,
+      light: ra.light, special: 0,
+    });
+    co.headerBId = allocSec({
+      floorH: rb.floorH, ceilH: rb.floorH + 96,
+      floorTex: rb.palette.floor,
+      ceilTex: rb.hasSky ? rb.palette.ceil : rb.palette.ceil,
+      light: rb.light, special: 0,
+    });
   });
 
   // -------- 7. build geometry --------
@@ -1305,10 +1326,12 @@ function _generateDungeonOnce() {
       }
       // For corridor doorways, the segment shares with the adjacent DOOR BODY
       // sector (not the corridor main body) so the door geometry frames the
-      // opening cleanly.
+      // opening cleanly. headerId is the lintel strip allocated inside the
+      // room for this doorway.
       const isFirstRoom = (co.orient === 'H' ? co.wIdx : co.sIdx) === rooms.indexOf(room);
       const doorBodyId = isFirstRoom ? co.doorAId : co.doorBId;
-      atts.push({ a: range[0], b: range[1], corridor: co, doorBodyId });
+      const headerId = isFirstRoom ? co.headerAId : co.headerBId;
+      atts.push({ a: range[0], b: range[1], corridor: co, doorBodyId, headerId });
     }
     if (atts.length === 0) {
       // Optional alcove detour on this edge.
@@ -1373,11 +1396,30 @@ function _generateDungeonOnce() {
         if (isHoriz) emitWall(cur, ortho, near, ortho, room.outerId, null, { middle: room.palette.wall });
         else emitWall(ortho, cur, ortho, near, room.outerId, null, { middle: room.palette.wall });
       }
-      // Doorway segment: two-sided room outer ↔ door body. Mark
-      // lower-unpegged because the door body's ceiling rises and we don't
-      // want the side textures to slide.
-      if (isHoriz) emitWall(near, ortho, far, ortho, room.outerId, att.doorBodyId, { flags: 16 });
-      else emitWall(ortho, near, ortho, far, room.outerId, att.doorBodyId, { flags: 16 });
+      // Header strip — a 16-deep lintel sub-sector inside the room at the
+      // doorway position. Its 3 inner walls form a U from outerId into
+      // header (outerId on outside, header on inside); the doorway segment
+      // is now header ↔ doorBody, which caps the DOOR3 panel at 96 tall.
+      const HEADER_DEPTH = 16;
+      // Inward direction: right of v1→v2 (CW walk = room interior on right).
+      const inX = isHoriz ? 0 : Math.sign(dy);
+      const inY = isHoriz ? -Math.sign(dx) : 0;
+      const A1x = isHoriz ? near : ortho;
+      const A1y = isHoriz ? ortho : near;
+      const A2x = isHoriz ? far  : ortho;
+      const A2y = isHoriz ? ortho : far;
+      const B1x = A1x + inX * HEADER_DEPTH;
+      const B1y = A1y + inY * HEADER_DEPTH;
+      const B2x = A2x + inX * HEADER_DEPTH;
+      const B2y = A2y + inY * HEADER_DEPTH;
+      // U lines (outerId | header). Walking each so outerId is the right
+      // side of v1→v2 — that places outerId outside the header rectangle.
+      emitWall(A1x, A1y, B1x, B1y, room.outerId, att.headerId);
+      emitWall(B1x, B1y, B2x, B2y, room.outerId, att.headerId);
+      emitWall(B2x, B2y, A2x, A2y, room.outerId, att.headerId);
+      // Doorway segment: header ↔ doorBody. The DOOR3 panel spans the
+      // header's 96-tall ceiling so the door image is proportional.
+      emitWall(A1x, A1y, A2x, A2y, att.headerId, att.doorBodyId, { flags: 16 });
       cur = far;
     }
     if (Math.abs(cur - end) > 0.5) {
@@ -1510,18 +1552,23 @@ function _generateDungeonOnce() {
         bs.upper = 'DOOR3';
         continue;
       }
-      // Room-side line: between a room and a door body. Flip so the door
-      // body is the BACK (DR-1 operates on back sector) if it isn't already.
-      // The room's wall texture above the door is set by the resolve pass.
+      // Room-side line: between a HEADER strip and a door body. DR-1 opens
+      // from this side, and DOOR3 on both uppers paints the door panel
+      // across the header's 96-tall ceiling — clearly visible from the
+      // room while the surrounding lintel (header ↔ outerId) still blends
+      // with the wall.
       if (backIsBody && fs.sector !== co.mainBodyId && !doorBodyIds.has(fs.sector)) {
         l.special = 1;
+        fs.upper = 'DOOR3';
+        bs.upper = 'DOOR3';
         continue;
       }
       if (frontIsBody && bs.sector !== co.mainBodyId && !doorBodyIds.has(bs.sector)) {
-        // Swap sides so the door body becomes the back.
         const tmp = l.front; l.front = l.back; l.back = tmp;
         const tmpV = l.v1; l.v1 = l.v2; l.v2 = tmpV;
         l.special = 1;
+        fs.upper = 'DOOR3';
+        bs.upper = 'DOOR3';
         continue;
       }
     }
@@ -4209,7 +4256,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.16</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.17</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -5332,7 +5379,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.16</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.17</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

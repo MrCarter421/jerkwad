@@ -1886,37 +1886,60 @@ function findPotentialSectors(map) {
 }
 
 function buildAddedRooms(existing) {
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  let exMinX = Infinity, exMaxX = -Infinity, exMinY = Infinity, exMaxY = -Infinity;
   for (const v of existing.vertices) {
-    if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
-    if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
+    if (v.x < exMinX) exMinX = v.x; if (v.x > exMaxX) exMaxX = v.x;
+    if (v.y < exMinY) exMinY = v.y; if (v.y > exMaxY) exMaxY = v.y;
   }
-  if (!isFinite(minX)) return existing;
-  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
-  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
-  // Pick a side with space — the new cluster will be GAP units past the
-  // existing bbox in that direction.
+  if (!isFinite(exMinX)) return existing;
   const GAP = 256;
-  const sides = ['E', 'W', 'N', 'S'];
-  let offX = 0, offY = 0;
-  for (let i = 0; i < 4; i++) {
-    const side = sides[Math.floor(rand() * sides.length)];
-    if (side === 'E' && maxX + GAP + 1024 < 32000) { offX = maxX + GAP + 768; offY = (minY + maxY) / 2; break; }
-    if (side === 'W' && minX - GAP - 1024 > -32000) { offX = minX - GAP - 768; offY = (minY + maxY) / 2; break; }
-    if (side === 'N' && maxY + GAP + 1024 < 32000) { offX = (minX + maxX) / 2; offY = maxY + GAP + 768; break; }
-    if (side === 'S' && minY - GAP - 1024 > -32000) { offX = (minX + maxX) / 2; offY = minY - GAP - 768; break; }
+
+  // Generate up to 8 candidate fresh dungeons and pick the first one whose
+  // translated bounding box is fully outside the existing map's bbox in some
+  // cardinal direction. Translation is edge-to-edge: the fresh bbox's near
+  // edge lands at the existing bbox's edge + GAP. (The prior version used a
+  // centre-with-guessed-half-width offset that could leave the fresh dungeon
+  // overlapping when its actual extent was bigger than expected.)
+  let chosen = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const fresh = generateDungeon();
+    let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
+    for (const v of fresh.vertices) {
+      if (v.x < fMinX) fMinX = v.x; if (v.x > fMaxX) fMaxX = v.x;
+      if (v.y < fMinY) fMinY = v.y; if (v.y > fMaxY) fMaxY = v.y;
+    }
+    const sides = ['E', 'W', 'N', 'S'];
+    for (let i = sides.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [sides[i], sides[j]] = [sides[j], sides[i]];
+    }
+    for (const side of sides) {
+      let dx, dy;
+      if (side === 'E')      { dx = exMaxX + GAP - fMinX; dy = ((exMinY + exMaxY) / 2) - ((fMinY + fMaxY) / 2); }
+      else if (side === 'W') { dx = exMinX - GAP - fMaxX; dy = ((exMinY + exMaxY) / 2) - ((fMinY + fMaxY) / 2); }
+      else if (side === 'N') { dx = ((exMinX + exMaxX) / 2) - ((fMinX + fMaxX) / 2); dy = exMaxY + GAP - fMinY; }
+      else                   { dx = ((exMinX + exMaxX) / 2) - ((fMinX + fMaxX) / 2); dy = exMinY - GAP - fMaxY; }
+      dx = Math.round(dx / 32) * 32;
+      dy = Math.round(dy / 32) * 32;
+      const tMinX = fMinX + dx, tMaxX = fMaxX + dx;
+      const tMinY = fMinY + dy, tMaxY = fMaxY + dy;
+      // Stay inside int16.
+      if (Math.abs(tMinX) > 30000 || Math.abs(tMaxX) > 30000 ||
+          Math.abs(tMinY) > 30000 || Math.abs(tMaxY) > 30000) continue;
+      // Strict bbox non-overlap with the existing map.
+      const M = 64;
+      const overlap = !(tMaxX + M < exMinX || exMaxX + M < tMinX ||
+                        tMaxY + M < exMinY || exMaxY + M < tMinY);
+      if (overlap) continue;
+      chosen = { fresh, dx, dy, side, tMinX, tMaxX, tMinY, tMaxY };
+      break;
+    }
+    if (chosen) break;
   }
-  // Generate a fresh dungeon and translate it to the chosen offset.
-  const fresh = generateDungeon();
-  // Centre fresh on origin then shift to (offX, offY).
-  let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
-  for (const v of fresh.vertices) {
-    if (v.x < fMinX) fMinX = v.x; if (v.x > fMaxX) fMaxX = v.x;
-    if (v.y < fMinY) fMinY = v.y; if (v.y > fMaxY) fMaxY = v.y;
-  }
-  const fCx = (fMinX + fMaxX) / 2, fCy = (fMinY + fMaxY) / 2;
-  const dx = Math.round(offX - fCx), dy = Math.round(offY - fCy);
-  // Remap IDs to avoid clashes with the existing map.
+  if (!chosen) return existing;
+  const { fresh, dx, dy, side } = chosen;
+
+  // Remap fresh IDs onto an offset that won't clash with existing IDs.
   const vOffset = existing.vertices.length;
   const sdOffset = existing.sidedefs.length;
   const sOffset = existing.sectors.length;
@@ -1925,13 +1948,13 @@ function buildAddedRooms(existing) {
   const vIdMap = new Map(fresh.vertices.map((v, i) => [v.id, 'v' + (vOffset + i)]));
   const sdIdMap = new Map(fresh.sidedefs.map((sd, i) => [sd.id, 'sd' + (sdOffset + i)]));
   const sIdMap = new Map(fresh.sectors.map((s, i) => [s.id, 's' + (sOffset + i)]));
-  const newVertices = fresh.vertices.map((v, i) => ({
+  const newVertices = fresh.vertices.map((v) => ({
     id: vIdMap.get(v.id), x: v.x + dx, y: v.y + dy,
   }));
-  const newSidedefs = fresh.sidedefs.map((sd, i) => ({
+  const newSidedefs = fresh.sidedefs.map((sd) => ({
     ...sd, id: sdIdMap.get(sd.id), sector: sIdMap.get(sd.sector),
   }));
-  const newSectors = fresh.sectors.map((s, i) => ({
+  const newSectors = fresh.sectors.map((s) => ({
     ...s, id: sIdMap.get(s.id),
   }));
   const newLinedefs = fresh.linedefs.map((l, i) => ({
@@ -1940,20 +1963,304 @@ function buildAddedRooms(existing) {
     front: l.front === -1 ? -1 : sdIdMap.get(l.front),
     back: l.back === -1 ? -1 : sdIdMap.get(l.back),
   }));
-  // Drop any duplicate player-1-start; keep the player in the existing map.
   const newThings = fresh.things
     .filter(t => t.type !== 1)
     .map((t, i) => ({
       ...t, id: 't' + (tOffset + i),
       x: t.x + dx, y: t.y + dy,
     }));
-  return {
+  let combined = {
     vertices: [...existing.vertices, ...newVertices],
     linedefs: [...existing.linedefs, ...newLinedefs],
     sidedefs: [...existing.sidedefs, ...newSidedefs],
     sectors: [...existing.sectors, ...newSectors],
     things: [...existing.things, ...newThings],
   };
+  // Carve a connecting corridor with proper doors so the new wing is
+  // reachable from the player's start. Picks the best matching pair of
+  // one-sided axis-aligned walls — one on existing, one on the new cluster
+  // — that face each other across the gap, with enough overlap to fit a
+  // 64-unit doorway. If no pair fits, return the unconnected combined map
+  // and the user can wire it manually.
+  const connected = tryConnectClusters(combined, existing, vOffset, side, GAP);
+  return connected || combined;
+}
+
+// Carve a connecting corridor with proper DR-1 doors between the existing
+// map and the just-grafted fresh cluster. Picks the closest pair of opposing
+// one-sided axis-aligned walls (existing on one side of the growth, fresh on
+// the other), splits each at the doorway endpoints, builds two 16-deep
+// closed door bodies and a 64-tall corridor body between them, with DOOR3
+// upper textures, DOORTRAK + LOWER_UNPEGGED on the tracks, and the door
+// special on the back-side door-body sector so the ceiling rises correctly.
+function tryConnectClusters(map, existing, vOffset, side, GAP) {
+  const existingLineIds = new Set(existing.linedefs.map(l => l.id));
+  const vById = new Map(map.vertices.map(v => [v.id, v]));
+
+  function lineGeom(l) {
+    const a = vById.get(l.v1), b = vById.get(l.v2);
+    if (!a || !b) return null;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const horiz = Math.abs(dy) < 0.5;
+    const vert  = Math.abs(dx) < 0.5;
+    if (!horiz && !vert) return null;
+    return {
+      a, b, horiz, vert,
+      perp: horiz ? a.y : a.x,
+      lo: horiz ? Math.min(a.x, b.x) : Math.min(a.y, b.y),
+      hi: horiz ? Math.max(a.x, b.x) : Math.max(a.y, b.y),
+    };
+  }
+
+  const wantVert = side === 'E' || side === 'W';
+  let existingPick = null, newPick = null;
+  for (const l of map.linedefs) {
+    if (l.back !== -1) continue;
+    const g = lineGeom(l);
+    if (!g) continue;
+    if (wantVert && !g.vert) continue;
+    if (!wantVert && !g.horiz) continue;
+    if (g.hi - g.lo < 96) continue;
+    const isExisting = existingLineIds.has(l.id);
+    if (isExisting) {
+      if (side === 'E' && (!existingPick || g.perp > existingPick.g.perp)) existingPick = { line: l, g };
+      else if (side === 'W' && (!existingPick || g.perp < existingPick.g.perp)) existingPick = { line: l, g };
+      else if (side === 'N' && (!existingPick || g.perp > existingPick.g.perp)) existingPick = { line: l, g };
+      else if (side === 'S' && (!existingPick || g.perp < existingPick.g.perp)) existingPick = { line: l, g };
+    } else {
+      if (side === 'E' && (!newPick || g.perp < newPick.g.perp)) newPick = { line: l, g };
+      else if (side === 'W' && (!newPick || g.perp > newPick.g.perp)) newPick = { line: l, g };
+      else if (side === 'N' && (!newPick || g.perp < newPick.g.perp)) newPick = { line: l, g };
+      else if (side === 'S' && (!newPick || g.perp > newPick.g.perp)) newPick = { line: l, g };
+    }
+  }
+  if (!existingPick || !newPick) return null;
+
+  const eg = existingPick.g, ng = newPick.g;
+  const ovLo = Math.max(eg.lo, ng.lo);
+  const ovHi = Math.min(eg.hi, ng.hi);
+  if (ovHi - ovLo < 96) return null;
+  const cMid = Math.round((ovLo + ovHi) / 2 / 32) * 32;
+  const c0 = cMid - 32, c1 = cMid + 32;
+  if (c0 < eg.lo || c1 > eg.hi || c0 < ng.lo || c1 > ng.hi) return null;
+
+  const THICK = 16;
+  const Ex = eg.perp;
+  const Nx = ng.perp;
+  const eFront = map.sidedefs.find(s => s.id === existingPick.line.front);
+  const nFront = map.sidedefs.find(s => s.id === newPick.line.front);
+  if (!eFront || !nFront) return null;
+  const eRoomSec = map.sectors.find(s => s.id === eFront.sector);
+  const nRoomSec = map.sectors.find(s => s.id === nFront.sector);
+  if (!eRoomSec || !nRoomSec) return null;
+  if (Math.abs(eRoomSec.floorH - nRoomSec.floorH) > 24) return null;
+  const corridorFloorH = Math.max(eRoomSec.floorH, nRoomSec.floorH);
+  const corridorCeilH = corridorFloorH + 96;
+
+  const verts = [...map.vertices];
+  const sidedefs = [...map.sidedefs];
+  const sectors = [...map.sectors];
+  const linedefs = [...map.linedefs];
+  const vmap2 = new Map(verts.map(v => [v.id, v]));
+  const getV = (x, y) => {
+    x = Math.round(x); y = Math.round(y);
+    for (const v of verts) if (v.x === x && v.y === y) return v.id;
+    const id = 'v' + verts.length;
+    const obj = { id, x, y };
+    verts.push(obj); vmap2.set(id, obj);
+    return id;
+  };
+  const newSec = (props) => {
+    const id = 's' + sectors.length;
+    sectors.push({
+      id, floorH: 0, ceilH: 128, floorTex: 'FLOOR4_8', ceilTex: 'CEIL3_5',
+      light: 112, special: 0, tag: 0, ...props,
+    });
+    return id;
+  };
+  const newSd = (secId, props = {}) => {
+    const id = 'sd' + sidedefs.length;
+    sidedefs.push({
+      id, xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-',
+      sector: secId, ...props,
+    });
+    return id;
+  };
+  function emit(v1, v2, frontSec, backSec, opts = {}) {
+    // Skip degenerate segments — these arise when the doorway centre
+    // happens to coincide with a wall's endpoint, producing a zero-length
+    // wall-segment in the split.
+    if (v1 === v2) return null;
+    const front = newSd(frontSec, {
+      middle: opts.middle ?? '-',
+      upper: opts.upper ?? '-',
+      lower: opts.lower ?? '-',
+    });
+    const back = backSec == null ? -1 : newSd(backSec, {
+      middle: '-', upper: opts.backUpper ?? '-',
+    });
+    linedefs.push({
+      id: 'l' + linedefs.length,
+      v1, v2,
+      flags: (back === -1 ? 1 : 4) | (opts.flags || 0),
+      special: opts.special || 0, tag: 0, front, back,
+    });
+    return linedefs[linedefs.length - 1];
+  }
+  const doorEId = newSec({ floorH: corridorFloorH, ceilH: corridorFloorH });
+  const corridorId = newSec({ floorH: corridorFloorH, ceilH: corridorCeilH });
+  const doorNId = newSec({ floorH: corridorFloorH, ceilH: corridorFloorH });
+
+  const exLineId = existingPick.line.id;
+  const nwLineId = newPick.line.id;
+  const exOrigFront = map.sidedefs.find(s => s.id === existingPick.line.front);
+  const nwOrigFront = map.sidedefs.find(s => s.id === newPick.line.front);
+  const exMiddle = exOrigFront?.middle && exOrigFront.middle !== '-' ? exOrigFront.middle : 'STARTAN2';
+  const nwMiddle = nwOrigFront?.middle && nwOrigFront.middle !== '-' ? nwOrigFront.middle : 'STARTAN2';
+
+  // Drop the original walls — they're being replaced with three segments each.
+  const dropIdx = linedefs.findIndex(l => l.id === exLineId);
+  if (dropIdx >= 0) linedefs.splice(dropIdx, 1);
+  const dropIdx2 = linedefs.findIndex(l => l.id === nwLineId);
+  if (dropIdx2 >= 0) linedefs.splice(dropIdx2, 1);
+
+  if (wantVert) {
+    // Horizontal growth (E/W). Walls are vertical. For E: existing room
+    // sits west of the existing wall (walks SOUTH so the room is on the
+    // RIGHT = west of v1→v2). For W: mirrored.
+    // We resolve once which wall is the "western boundary of the gap" and
+    // which is the "eastern boundary"; their absolute geometry decides.
+    const westExisting = side === 'E';
+    const westX = westExisting ? Ex : Nx;     // wall at lower x
+    const eastX = westExisting ? Nx : Ex;     // wall at higher x
+    const westRoomSec = westExisting ? eRoomSec.id : nRoomSec.id;
+    const eastRoomSec = westExisting ? nRoomSec.id : eRoomSec.id;
+    const westOrig = westExisting ? existingPick.line : newPick.line;
+    const eastOrig = westExisting ? newPick.line : existingPick.line;
+    const westMiddle = westExisting ? exMiddle : nwMiddle;
+    const eastMiddle = westExisting ? nwMiddle : exMiddle;
+    const westDoorId = westExisting ? doorEId : doorNId;
+    const eastDoorId = westExisting ? doorNId : doorEId;
+
+    // Endpoints. vWL/vWU = west wall split points at (westX, c0/c1).
+    // vEL_/vEU_ = east wall split points at (eastX, c0/c1).
+    // vWBL/vWBU = west door body's corridor-side corners (westX+THICK, c0/c1).
+    // vEBL_/vEBU_ = east door body's corridor-side corners (eastX-THICK, c0/c1).
+    const vWL  = getV(westX, c0),       vWU  = getV(westX, c1);
+    const vWBL = getV(westX + THICK, c0), vWBU = getV(westX + THICK, c1);
+    const vEBL = getV(eastX - THICK, c0), vEBU = getV(eastX - THICK, c1);
+    const vEL2 = getV(eastX, c0),       vEU2 = getV(eastX, c1);
+
+    // Split the west wall into [northSeg, doorFace, southSeg]. The west
+    // wall walks SOUTH (room on right = west of wall, so front=room).
+    // Identify which original endpoint is north/south.
+    const wV1 = vmap2.get(westOrig.v1), wV2 = vmap2.get(westOrig.v2);
+    const wNorthV = wV1.y > wV2.y ? westOrig.v1 : westOrig.v2;
+    const wSouthV = wV1.y > wV2.y ? westOrig.v2 : westOrig.v1;
+    emit(wNorthV, vWU, westRoomSec, null, { middle: westMiddle });
+    emit(vWL, wSouthV, westRoomSec, null, { middle: westMiddle });
+    // Door face — walks south so front=room, back=door body. DR-1 will
+    // raise the back sector's ceiling = the door body.
+    emit(vWU, vWL, westRoomSec, westDoorId, {
+      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+    });
+
+    // Split the east wall similarly, but walking NORTH so the east room
+    // ends up on the right of v1→v2 (= east of wall, where the room is).
+    const eV1 = vmap2.get(eastOrig.v1), eV2 = vmap2.get(eastOrig.v2);
+    const eNorthV = eV1.y > eV2.y ? eastOrig.v1 : eastOrig.v2;
+    const eSouthV = eV1.y > eV2.y ? eastOrig.v2 : eastOrig.v1;
+    emit(eSouthV, vEL2, eastRoomSec, null, { middle: eastMiddle });
+    emit(vEU2, eNorthV, eastRoomSec, null, { middle: eastMiddle });
+    emit(vEL2, vEU2, eastRoomSec, eastDoorId, {
+      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+    });
+
+    // West door body — south track walks west, north track walks east, both
+    // with the door body on the right of v1→v2. DOORTRAK middle + lower
+    // unpegged so the texture stays anchored to floor as the ceiling moves.
+    emit(vWBL, vWL, westDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // south track
+    emit(vWU, vWBU, westDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // north track
+    // Corridor interface for west door body — walks NORTH so the corridor
+    // is on the right (east of west door body), door body on the left.
+    emit(vWBL, vWBU, corridorId, westDoorId, { flags: 16, upper: 'STARTAN2' });
+
+    // East door body tracks (mirror)
+    emit(vEL2, vEBL, eastDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // south track
+    emit(vEBU, vEU2, eastDoorId, null, { middle: 'DOORTRAK', flags: 16 });   // north track
+    emit(vEBU, vEBL, corridorId, eastDoorId, { flags: 16, upper: 'STARTAN2' });
+
+    // Corridor body's two long walls — south wall walks west, north walks
+    // east, both with corridor on the right.
+    emit(vEBL, vWBL, corridorId, null, { middle: westMiddle });
+    emit(vWBU, vEBU, corridorId, null, { middle: westMiddle });
+  } else {
+    // Vertical growth (N/S). Walls are horizontal. For N growth the
+    // existing wall is south of the new wall. We need the south wall to
+    // walk EAST (room south of wall is on the right of east-going), and
+    // the north wall to walk WEST.
+    const southExisting = side === 'N';
+    const southY = southExisting ? Ex : Nx;
+    const northY = southExisting ? Nx : Ex;
+    const southRoomSec = southExisting ? eRoomSec.id : nRoomSec.id;
+    const northRoomSec = southExisting ? nRoomSec.id : eRoomSec.id;
+    const southOrig = southExisting ? existingPick.line : newPick.line;
+    const northOrig = southExisting ? newPick.line : existingPick.line;
+    const southMiddle = southExisting ? exMiddle : nwMiddle;
+    const northMiddle = southExisting ? nwMiddle : exMiddle;
+    const southDoorId = southExisting ? doorEId : doorNId;
+    const northDoorId = southExisting ? doorNId : doorEId;
+
+    const vSL  = getV(c0, southY),         vSU  = getV(c1, southY);
+    const vSBL = getV(c0, southY + THICK), vSBU = getV(c1, southY + THICK);
+    const vNBL = getV(c0, northY - THICK), vNBU = getV(c1, northY - THICK);
+    const vNL2 = getV(c0, northY),         vNU2 = getV(c1, northY);
+
+    // Split south wall walking EAST so room (south side) is on the right.
+    const sV1 = vmap2.get(southOrig.v1), sV2 = vmap2.get(southOrig.v2);
+    const sWestV = sV1.x < sV2.x ? southOrig.v1 : southOrig.v2;
+    const sEastV = sV1.x < sV2.x ? southOrig.v2 : southOrig.v1;
+    emit(sWestV, vSL, southRoomSec, null, { middle: southMiddle });
+    emit(vSU, sEastV, southRoomSec, null, { middle: southMiddle });
+    emit(vSL, vSU, southRoomSec, southDoorId, {
+      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+    });
+
+    // Split north wall walking WEST so room (north side) is on the right.
+    const nV1 = vmap2.get(northOrig.v1), nV2 = vmap2.get(northOrig.v2);
+    const nWestV = nV1.x < nV2.x ? northOrig.v1 : northOrig.v2;
+    const nEastV = nV1.x < nV2.x ? northOrig.v2 : northOrig.v1;
+    emit(nEastV, vNU2, northRoomSec, null, { middle: northMiddle });
+    emit(vNL2, nWestV, northRoomSec, null, { middle: northMiddle });
+    emit(vNU2, vNL2, northRoomSec, northDoorId, {
+      special: 1, upper: 'DOOR3', backUpper: 'DOOR3',
+    });
+
+    // South door body tracks. Door body interior is at y ∈ (southY,
+    // southY+THICK), x ∈ (c0, c1). West track at x=c0 must walk north so
+    // the interior (east of x=c0) is on the right; east track at x=c1
+    // walks south so interior (west of x=c1) is on the right. Corridor
+    // interface at y=southY+THICK walks west so the corridor body (north
+    // of y=southY+THICK) ends up on the right.
+    emit(vSL, vSBL, southDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // west track, north
+    emit(vSBU, vSU, southDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // east track, south
+    emit(vSBU, vSBL, corridorId, southDoorId, { flags: 16, upper: 'STARTAN2' });
+
+    // North door body interior at y ∈ (northY-THICK, northY), x ∈ (c0,c1).
+    // West track at x=c0 walks north (interior east); east track at x=c1
+    // walks south (interior west). Corridor interface at y=northY-THICK
+    // walks east so corridor body (south of that line) is on the right.
+    emit(vNBL, vNL2, northDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // west track, north
+    emit(vNU2, vNBU, northDoorId, null, { middle: 'DOORTRAK', flags: 16 });  // east track, south
+    emit(vNBL, vNBU, corridorId, northDoorId, { flags: 16, upper: 'STARTAN2' });
+
+    // Corridor body's long walls — west wall walks north, east wall walks
+    // south, both with the corridor body on the right of v1→v2.
+    emit(vSBL, vNBL, corridorId, null, { middle: southMiddle });
+    emit(vNBU, vSBU, corridorId, null, { middle: southMiddle });
+  }
+
+  return { ...map, vertices: verts, linedefs, sidedefs, sectors };
 }
 
 // ============================================================================
@@ -3556,9 +3863,24 @@ export default function WadEditor() {
       }
       case 'stamp-shape': setStampSheet('shapes'); break;
       case 'make-sector': {
-        if (!r.potential) break;
+        // Two paths into this action:
+        //   1. Long-press landed on a cyan potential-sector overlay — use
+        //      the cycle stored on the radial directly.
+        //   2. Long-press on empty space (no overlay there) — find the
+        //      cycle whose polygon contains the touch point.
+        let cycle = r.potential ? r.potential.loop : null;
+        if (!cycle) {
+          const w = screenToWorld(r.sx, r.sy);
+          const containing = potentialSectors.find(p => pointInPolygon(w.x, w.y, p.vertices));
+          if (containing) cycle = containing.loop;
+        }
+        if (!cycle) {
+          setHint('No closed shape under the touch — draw a loop first');
+          break;
+        }
+        const finalCycle = cycle;
         updateMap(m => {
-          const chain = [...r.potential.loop, r.potential.loop[0]];
+          const chain = [...finalCycle, finalCycle[0]];
           const result = buildSectorFromLoop(m, chain);
           if (!result || result.selectedExistingId) return m;
           setSelection({ type: 'sector', id: result.createdSectorId });
@@ -3579,7 +3901,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.12</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.13</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -3700,38 +4022,10 @@ export default function WadEditor() {
             style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack }}>{hint}</div>
         )}
 
-        {/* Floating "Make Sectors" action — only appears when there are
-            closed cycles in raw lines that aren't sectors yet. One tap
-            promotes them all (WADED's Make Sector flow). */}
-        {potentialSectors.length > 0 && (
-          <button
-            onClick={() => {
-              const list = potentialSectors;
-              let built = 0;
-              updateMap(m => {
-                let working = m;
-                for (const ps of list) {
-                  const chain = [...ps.loop, ps.loop[0]];
-                  const r = buildSectorFromLoop(working, chain);
-                  if (r && !r.selectedExistingId) {
-                    working = r;
-                    built++;
-                  }
-                }
-                return working;
-              });
-              setHint('Made ' + built + ' sector' + (built === 1 ? '' : 's'));
-            }}
-            className="absolute px-3 py-2 rounded font-semibold shadow-lg"
-            style={{
-              top: 8, left: '50%', transform: 'translateX(-50%)',
-              background: COLORS.accent, color: COLORS.bg,
-              border: '2px solid ' + COLORS.accent,
-              fontFamily: monoStack, fontSize: 12, letterSpacing: '0.05em',
-            }}>
-            ◇ MAKE {potentialSectors.length} SECTOR{potentialSectors.length === 1 ? '' : 'S'}
-          </button>
-        )}
+        {/* The Make Sector tool now lives on the long-press radial as
+            ◇ Make — operates on the touch point and only promotes the
+            cycle containing it, giving the user explicit control over
+            which closed shape becomes a sector. */}
 
         {selObj && selection.type === 'sector' && !propsOpen && (
           <QuickEditPills sector={selObj}
@@ -4096,6 +4390,7 @@ function RadialMenu({ radial, onAction, onClose }) {
       { id: 'delete', label: 'Delete', glyph: '✕' },
     ],
     empty: [
+      { id: 'make-sector', label: 'Make', glyph: '◇' },
       { id: 'start-draw', label: 'Draw', glyph: '✎' },
       { id: 'place-thing', label: 'Thing', glyph: '◉' },
       { id: 'stamp-shape', label: 'Shape', glyph: '◫' },
@@ -4729,7 +5024,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.12</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.13</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

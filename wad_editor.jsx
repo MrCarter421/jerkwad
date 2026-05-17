@@ -742,23 +742,36 @@ function generateDungeon() {
     }
     return false;
   }
-  // 4 square rooms, sizes 512–1024 (combat-room canon)
+  // Long-tailed size distribution: most rooms are small/medium, with a few
+  // big "great hall" rooms. The variety is what makes the dungeon feel
+  // hand-mapped instead of grid-generated.
+  function pickSquareSize() {
+    const r = rand();
+    if (r < 0.45) return (4 + Math.floor(rand() * 4)) * 64;  // small  256–448
+    if (r < 0.80) return (8 + Math.floor(rand() * 5)) * 64;  // medium 512–768
+    if (r < 0.95) return (13 + Math.floor(rand() * 4)) * 64; // large  832–1024
+    return (17 + Math.floor(rand() * 6)) * 64;               // huge   1088–1408
+  }
+  function pickOctRadius() {
+    const r = rand();
+    if (r < 0.55) return (4 + Math.floor(rand() * 3)) * 64;  // small  256–384
+    if (r < 0.90) return (7 + Math.floor(rand() * 3)) * 64;  // medium 448–576
+    return (10 + Math.floor(rand() * 3)) * 64;               // large  640–768
+  }
   for (let i = 0; i < 4; i++) {
     tryPlace(() => ({
       type: 'square',
       cx: sn((rand() - 0.5) * 2 * PLACE_R),
       cy: sn((rand() - 0.5) * 2 * PLACE_R),
-      w: (8 + Math.floor(rand() * 9)) * 64,
-      h: (8 + Math.floor(rand() * 9)) * 64,
+      w: pickSquareSize(), h: pickSquareSize(),
     }));
   }
-  // 2 octagon rooms (radius 384–576 keeps doorways ≥ 64 long)
   for (let i = 0; i < 2; i++) {
     tryPlace(() => ({
       type: 'octagon',
       cx: sn((rand() - 0.5) * 2 * PLACE_R),
       cy: sn((rand() - 0.5) * 2 * PLACE_R),
-      r: (6 + Math.floor(rand() * 4)) * 64,
+      r: pickOctRadius(),
     }));
   }
   if (rooms.length < 3) {
@@ -858,8 +871,44 @@ function generateDungeon() {
     { wall: 'WOOD1',    floor: 'FLOOR5_2', ceil: 'CEIL5_1', trim: 'FLOOR5_4', accent: 'TLITE6_4' },
     { wall: 'GRAY5',    floor: 'FLAT5_4',  ceil: 'CEIL3_1', trim: 'STEP1',    accent: 'TLITE6_6' },
   ];
+  // Themed zones: cluster rooms by proximity into 2–3 zones, each zone gets a
+  // shared palette. Adjacent rooms in the same zone read as one "area" — a
+  // techbase wing, a hellish wing, a wood-floored armory — which is the
+  // single most important cue for "this map was hand-built". Uses a small
+  // K-means with random centroids drawn from the room set.
+  const NUM_ZONES = Math.min(rooms.length, 2 + Math.floor(rand() * 2));
+  const zonePalettes = [];
+  const used = new Set();
+  for (let i = 0; i < NUM_ZONES; i++) {
+    let idx;
+    do { idx = Math.floor(rand() * PALETTES.length); } while (used.has(idx) && used.size < PALETTES.length);
+    used.add(idx);
+    zonePalettes.push(PALETTES[idx]);
+  }
+  const centroids = [];
+  const shuffledRooms = rooms.slice().sort(() => rand() - 0.5);
+  for (let i = 0; i < NUM_ZONES; i++) {
+    centroids.push({ x: shuffledRooms[i].cx, y: shuffledRooms[i].cy });
+  }
+  for (let iter = 0; iter < 5; iter++) {
+    rooms.forEach((r) => {
+      let bestZone = 0, bestDist = Infinity;
+      for (let z = 0; z < centroids.length; z++) {
+        const dx = r.cx - centroids[z].x, dy = r.cy - centroids[z].y;
+        const d = dx * dx + dy * dy;
+        if (d < bestDist) { bestDist = d; bestZone = z; }
+      }
+      r.zone = bestZone;
+    });
+    for (let z = 0; z < centroids.length; z++) {
+      const members = rooms.filter(r => r.zone === z);
+      if (members.length === 0) continue;
+      centroids[z].x = members.reduce((s, r) => s + r.cx, 0) / members.length;
+      centroids[z].y = members.reduce((s, r) => s + r.cy, 0) / members.length;
+    }
+  }
   rooms.forEach((r) => {
-    r.palette = pick(PALETTES);
+    r.palette = zonePalettes[r.zone || 0];
     r.floorH = Math.floor(rand() * 4) * 8;                  // 0/8/16/24
     r.ceilH = r.floorH + 128 + Math.floor(rand() * 3) * 32; // 128/160/192 above
     r.light = pick([128, 144, 160, 176, 192]);
@@ -901,8 +950,12 @@ function generateDungeon() {
   };
 
   rooms.forEach((r) => {
-    // Number of concentric trim layers stepping up toward the centre.
-    r.trimLayers = 1 + Math.floor(rand() * 3);  // 1..3
+    // Concentric trim layers stepping up toward the centre. Cap by room size
+    // so the deepest inset polygon stays positive — small rooms get fewer
+    // layers (or none) to avoid degenerate inverted-winding geometry.
+    const minDim = r.type === 'octagon' ? r.r * 2 * 0.924 : Math.min(r.w, r.h);
+    const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
+    r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     // Outer sector: lowest floor, faces corridors. This is what doorways connect to.
     r.outerId = allocSec({
       floorH: r.floorH, ceilH: r.ceilH,
@@ -921,6 +974,10 @@ function generateDungeon() {
         light: Math.min(255, r.light + i * 6), special: 0,
       }));
     }
+    // Skip the centre feature if it wouldn't fit inside the innermost trim
+    // (negative-size polygon = inverted winding = broken topology).
+    const featureMinSize = 2 * (TRIM_W * r.trimLayers + INNER_INSET) + 64;
+    if (minDim < featureMinSize) r.feature = 'none';
     // Optional centre feature, sits inside the innermost trim.
     const centerBaseFloor = r.floorH + (r.trimLayers + 1) * 8;
     if (r.feature === 'platform') {
@@ -943,6 +1000,26 @@ function generateDungeon() {
         light: Math.max(64, r.light - 24), special: 7,
       });
     }
+    // Pillars in larger rooms — small closed sub-sectors that act as
+    // visual breakup and combat cover. Place 1 (in large rooms) or 4
+    // (in huge rooms with a 2x2 grid offset from centre). Pillar is a
+    // tiny octagon with ceil == floor at room ceiling height so it
+    // reads as a solid floor-to-ceiling column.
+    r.pillars = [];
+    if (minDim >= 768 && r.feature === 'none') {
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 48 });
+    } else if (minDim >= 1024 && r.feature === 'none') {
+      const off = Math.floor(minDim / 4 / 32) * 32;
+      r.pillars.push({ cx: r.cx - off, cy: r.cy - off, radius: 48 });
+      r.pillars.push({ cx: r.cx + off, cy: r.cy - off, radius: 48 });
+      r.pillars.push({ cx: r.cx - off, cy: r.cy + off, radius: 48 });
+      r.pillars.push({ cx: r.cx + off, cy: r.cy + off, radius: 48 });
+    }
+    r.pillarSecIds = r.pillars.map(() => allocSec({
+      floorH: r.ceilH, ceilH: r.ceilH, // closed sector reads as solid column
+      floorTex: r.palette.floor, ceilTex: r.palette.ceil,
+      light: r.light, special: 0,
+    }));
   });
 
   // Corridors: floor = max of two rooms' floors, ceiling = floor + 96 (canon).
@@ -1123,6 +1200,23 @@ function generateDungeon() {
         }
       }
     }
+    // Pillars — small closed sub-sectors inside the innermost interior.
+    // Each pillar is a CCW octagon walked with the enclosing sector on the
+    // outside and the pillar (closed) sector on the inside. The
+    // resolveTwoSidedTextures pass below will set a SUPPORT2 column texture
+    // on the room's side because of the big floor-to-ceiling delta.
+    if (room.pillars && room.pillars.length) {
+      const enclosing = layerIds[layerIds.length - 1];
+      for (let k = 0; k < room.pillars.length; k++) {
+        const p = room.pillars[k];
+        const pillarSecId = room.pillarSecIds[k];
+        const pillarPoly = octagonPoly(p.cx, p.cy, p.radius);
+        for (let j = 0; j < pillarPoly.length; j++) {
+          const q1 = pillarPoly[j], q2 = pillarPoly[(j + 1) % pillarPoly.length];
+          emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId);
+        }
+      }
+    }
   });
 
   // Corridor walls: three sectors per corridor — doorBodyA at one end, the
@@ -1206,7 +1300,17 @@ function generateDungeon() {
     // Lower texture: on the side adjacent to the LOWER floor (visible from there).
     if (fsec.floorH !== bsec.floorH) {
       const lowSide = fsec.floorH < bsec.floorH ? fs : bs;
-      if (!lowSide.lower || lowSide.lower === '-') lowSide.lower = 'STEP1';
+      if (!lowSide.lower || lowSide.lower === '-') {
+        // Closed sub-sector with floor == ceil reads as a SOLID column
+        // (pillar) — give the visible face a tall column texture instead
+        // of a step texture.
+        const highSec = fsec.floorH > bsec.floorH ? fsec : bsec;
+        const isPillar = highSec && highSec.floorH === highSec.ceilH;
+        const delta = Math.abs(fsec.floorH - bsec.floorH);
+        if (isPillar) lowSide.lower = 'SUPPORT2';
+        else if (delta >= 72) lowSide.lower = 'STARTAN2';
+        else lowSide.lower = 'STEP1';
+      }
     }
     // Upper texture: on the side adjacent to the HIGHER ceiling (visible from there).
     if (fsec.ceilH !== bsec.ceilH) {
@@ -1588,58 +1692,86 @@ function validateMap(map) {
 // the user promotes it. This is WADED's "Make Sector" workflow.
 function findPotentialSectors(map) {
   if (!map.linedefs.length || !map.vertices.length) return [];
-  // Augment: for every linedef with a missing side, attach a virtual sidedef
-  // belonging to a virtual "__void" sector. buildSectorLoops then traces the
-  // boundary of every void region as if it were a real sector.
-  const augSidedefs = map.sidedefs.slice();
-  const augLines = map.linedefs.map(ld => {
-    let { front, back } = ld;
-    if (!front || front === -1) {
-      const id = '__vf_' + ld.id;
-      augSidedefs.push({ id, sector: '__void', xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-' });
-      front = id;
-    }
-    if (!back || back === -1) {
-      const id = '__vb_' + ld.id;
-      augSidedefs.push({ id, sector: '__void', xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-' });
-      back = id;
-    }
-    return { ...ld, front, back };
-  });
-  const augMap = {
-    vertices: map.vertices,
-    sidedefs: augSidedefs,
-    sectors: map.sectors.concat([{ id: '__void' }]),
-    linedefs: augLines,
-    things: map.things,
+  // Always-left-turn face traversal on the planar graph of unfilled-side
+  // edges. Each linedef contributes a directed edge per missing side; for
+  // fully-raw lines (both sides empty) both directions are enqueued. At
+  // each junction we pick the most counterclockwise next edge relative to
+  // the reverse of the incoming edge, which traces the face that's on the
+  // LEFT of the walk direction. Visited-set on directed edges prevents
+  // double-traversal. A traversal that returns to its start is a closed
+  // face = potential sector.
+  const vmap = new Map(map.vertices.map(v => [v.id, v]));
+  const edges = [];
+  for (const l of map.linedefs) {
+    const frontVoid = !l.front || l.front === -1;
+    const backVoid = !l.back || l.back === -1;
+    // Walking v2->v1 puts the FRONT side on the LEFT of the walk (since front
+    // is on the right of v1->v2). For void on the front, that's our void
+    // walk. Mirror for back-void.
+    if (frontVoid) edges.push({ from: l.v2, to: l.v1, line: l, key: l.id + '|F' });
+    if (backVoid)  edges.push({ from: l.v1, to: l.v2, line: l, key: l.id + '|B' });
+  }
+  if (edges.length < 3) return [];
+  const byFrom = new Map();
+  for (const e of edges) {
+    if (!byFrom.has(e.from)) byFrom.set(e.from, []);
+    byFrom.get(e.from).push(e);
+  }
+  const ang = (from, to) => {
+    const fv = vmap.get(from), tv = vmap.get(to);
+    return Math.atan2(tv.y - fv.y, tv.x - fv.x);
   };
-  const loops = buildSectorLoops(augMap);
-  const voidLoops = loops.get('__void') || [];
-  if (!voidLoops.length) return [];
-  // Existing-sector signatures so we don't suggest making a sector where one
-  // already exists.
+  const TAU = 2 * Math.PI;
+  function nextEdge(e) {
+    const cands = (byFrom.get(e.to) || []).filter(c => !(c.line === e.line && c.from === e.to));
+    if (!cands.length) return null;
+    const revAng = ang(e.to, e.from);
+    let best = null, bestD = Infinity;
+    for (const c of cands) {
+      const a = ang(c.from, c.to);
+      let d = a - revAng;
+      while (d <= 1e-9) d += TAU;
+      while (d > TAU)   d -= TAU;
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return best;
+  }
+
+  // Existing sector loops — used to dedupe candidates that already exist.
   const existingSigs = new Set();
-  for (const [secId, ls] of loops) {
-    if (secId === '__void') continue;
+  const existingLoops = buildSectorLoops(map);
+  for (const [, ls] of existingLoops) {
     for (const loop of ls) existingSigs.add([...loop].sort().join('|'));
   }
-  const vmap = new Map(map.vertices.map(v => [v.id, v]));
-  const seen = new Set();
+
+  const visited = new Set();
+  const seenSigs = new Set();
   const result = [];
-  for (const loop of voidLoops) {
-    if (loop.length < 3) continue;
-    const sig = [...loop].sort().join('|');
-    if (seen.has(sig) || existingSigs.has(sig)) continue;
-    seen.add(sig);
-    const pts = loop.map(id => vmap.get(id)).filter(Boolean);
+  for (const start of edges) {
+    if (visited.has(start.key)) continue;
+    const cycle = [];
+    let cur = start;
+    let safety = edges.length + 4;
+    while (safety-- > 0) {
+      if (visited.has(cur.key)) { cycle.length = 0; break; }
+      visited.add(cur.key);
+      cycle.push(cur.from);
+      const next = nextEdge(cur);
+      if (!next) { cycle.length = 0; break; }
+      if (next === start) break; // closed cycle
+      cur = next;
+    }
+    if (cycle.length < 3) continue;
+    const sig = [...cycle].sort().join('|');
+    if (seenSigs.has(sig) || existingSigs.has(sig)) continue;
+    seenSigs.add(sig);
+    const pts = cycle.map(id => vmap.get(id)).filter(Boolean);
     if (pts.length < 3) continue;
     const area = polygonSignedArea(pts);
-    if (Math.abs(area) < 64) continue; // skip degenerate slivers
-    // Keep only CCW orientation (the "inside" region). buildSectorFromLoop
-    // would normalize CW on conversion either way, but skipping the CW
-    // twin avoids duplicate highlights.
-    if (area < 0) continue;
-    result.push({ loop, vertices: pts, centroid: polygonCentroid(pts), area });
+    if (Math.abs(area) < 64) continue;
+    // Don't filter by orientation — buildSectorFromLoop normalizes the walk
+    // direction when converting, so either CW or CCW cycle works.
+    result.push({ loop: cycle, vertices: pts, centroid: polygonCentroid(pts), area });
   }
   return result;
 }
@@ -1911,7 +2043,13 @@ function stampShape(map, snap, worldPts, overrides) {
 function macroDoor(map, lineId, kind = 'normal') {
   const ld = map.linedefs.find(l => l.id === lineId);
   if (!ld) return null;
-  if (!ld.back || ld.back === -1) return { error: 'Door needs a two-sided line.' };
+  // If the wall is one-sided (faces void), carve a proper door body behind
+  // it — split the wall into wall + door-face + wall, add a 16-deep closet
+  // door body sector, wire DR-1 + DOOR3 + DOORTRAK tracks + correct pegging.
+  if (!ld.back || ld.back === -1) {
+    return macroDoorOneSided(map, lineId, kind);
+  }
+  // Two-sided wall: existing "convert back sector into door body" behaviour.
   const backSd = map.sidedefs.find(s => s.id === ld.back);
   if (!backSd) return { error: 'Missing back sidedef.' };
   const doorSecId = backSd.sector;
@@ -1932,11 +2070,136 @@ function macroDoor(map, lineId, kind = 'normal') {
     sd.sector === doorSecId ? { ...sd, middle: 'DOORTRAK' } : sd);
   const trackLines = nextLines.map(l => adj.has(l.id) ? { ...l, flags: l.flags | 16 } : l);
   const finalSidedefs = trackSidedefs.map(sd => {
-    if (sd.id === ld.front) return { ...sd, upper: 'BIGDOOR2' };
-    if (sd.id === ld.back) return { ...sd, upper: 'BIGDOOR2' };
+    if (sd.id === ld.front) return { ...sd, upper: 'DOOR3' };
+    if (sd.id === ld.back) return { ...sd, upper: 'DOOR3' };
     return sd;
   });
   return { ...map, linedefs: trackLines, sidedefs: finalSidedefs, sectors: nextSectors };
+}
+
+// Carve a proper door body into the void behind a one-sided wall, then wire
+// it as a DR-1 door. The wall is split into [wall, door-face, wall] at the
+// door's width (64 by default), a 16-deep closet sector is built behind the
+// door face, and the closet's three outward walls become DOORTRAK tracks
+// with lower-unpegged pegging. Door image is DOOR3 (64-wide canonical) on
+// the door face's upper texture, with standard pegging so it rides with the
+// rising ceiling.
+function macroDoorOneSided(map, lineId, kind = 'normal') {
+  const ld = map.linedefs.find(l => l.id === lineId);
+  if (!ld) return { error: 'Line not found' };
+  if (ld.back && ld.back !== -1) return { error: 'Use macroDoor on a two-sided wall' };
+  const v1 = map.vertices.find(v => v.id === ld.v1);
+  const v2 = map.vertices.find(v => v.id === ld.v2);
+  if (!v1 || !v2) return { error: 'Wall vertices missing' };
+  const dx = v2.x - v1.x, dy = v2.y - v1.y;
+  const len = Math.hypot(dx, dy);
+  const WIDTH = 64, THICK = 16, MARGIN = 16;
+  if (len < WIDTH + MARGIN * 2) return { error: 'Wall too short for a 64-unit door' };
+  if (Math.abs(dx) > 0.5 && Math.abs(dy) > 0.5) return { error: 'Door tool requires an axis-aligned wall' };
+  const origFront = map.sidedefs.find(s => s.id === ld.front);
+  if (!origFront) return { error: 'Front sidedef missing' };
+  const roomSec = map.sectors.find(s => s.id === origFront.sector);
+  if (!roomSec) return { error: 'Room sector missing' };
+
+  const ux = dx / len, uy = dy / len;
+  const bx = -uy, by = ux; // BACK direction (left of v1->v2); for one-sided
+                            // walls this is the void side.
+  const sn = v => Math.round(v / 8) * 8;
+  const tCenter = len / 2;
+  const t0 = tCenter - WIDTH / 2;
+  const t1 = tCenter + WIDTH / 2;
+
+  const at_t0 = { x: sn(v1.x + ux * t0), y: sn(v1.y + uy * t0) };
+  const at_t1 = { x: sn(v1.x + ux * t1), y: sn(v1.y + uy * t1) };
+  const at_bk0 = { x: sn(at_t0.x + bx * THICK), y: sn(at_t0.y + by * THICK) };
+  const at_bk1 = { x: sn(at_t1.x + bx * THICK), y: sn(at_t1.y + by * THICK) };
+
+  const verts = map.vertices.slice();
+  const findV = (p) => {
+    const ex = verts.find(v => v.x === p.x && v.y === p.y);
+    if (ex) return ex.id;
+    const id = 'v' + verts.length;
+    verts.push({ id, x: p.x, y: p.y });
+    return id;
+  };
+  const vT0 = findV(at_t0);
+  const vT1 = findV(at_t1);
+  const vBk0 = findV(at_bk0);
+  const vBk1 = findV(at_bk1);
+
+  const doorSecId = 's' + map.sectors.length;
+  const sectors = [...map.sectors, {
+    id: doorSecId,
+    floorH: roomSec.floorH, ceilH: roomSec.floorH, // closed
+    floorTex: roomSec.floorTex, ceilTex: roomSec.floorTex,
+    light: Math.max(64, (roomSec.light ?? 160) - 32),
+    special: 0, tag: 0,
+  }];
+
+  const sidedefs = map.sidedefs.slice();
+  const addSd = (secId, props = {}) => {
+    const id = 'sd' + sidedefs.length;
+    sidedefs.push({ id, xOff: 0, yOff: 0, upper: '-', lower: '-', middle: '-', sector: secId, ...props });
+    return id;
+  };
+  const wallTex = origFront.middle && origFront.middle !== '-' ? origFront.middle : 'STARTAN2';
+  // Separate front sidedefs per segment so we can texture them independently.
+  const sdSeg1 = addSd(roomSec.id, { middle: wallTex });
+  const sdSeg3 = addSd(roomSec.id, { middle: wallTex });
+  // Door face: front = room side (upper = DOOR3, door image), back = door body.
+  const sdFaceFront = addSd(roomSec.id, { middle: '-', upper: 'DOOR3' });
+  const sdFaceBack = addSd(doorSecId, { middle: '-', upper: 'DOOR3' });
+  // Door body's outward walls (one-sided).
+  const sdBackWall = addSd(doorSecId, { middle: wallTex });
+  const sdTrack1 = addSd(doorSecId, { middle: 'DOORTRAK' });
+  const sdTrack2 = addSd(doorSecId, { middle: 'DOORTRAK' });
+
+  const doorSpecials = { normal: 1, red: 28, blue: 26, yellow: 27 };
+  const doorSpecial = doorSpecials[kind] ?? 1;
+
+  const linedefs = map.linedefs.slice();
+  const ldIdx = linedefs.findIndex(l => l.id === lineId);
+  // Segment 1: v1 → vT0 (keeps original line ID).
+  linedefs[ldIdx] = { ...ld, v2: vT0, front: sdSeg1, flags: (ld.flags | 1) & ~4 };
+  // Segment 2: vT0 → vT1 (the door face).
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vT0, v2: vT1,
+    flags: 4, // two-sided only — no lower-unpegged so DOOR3 rides with ceiling
+    special: doorSpecial, tag: 0,
+    front: sdFaceFront, back: sdFaceBack,
+  });
+  // Segment 3: vT1 → v2.
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vT1, v2: ld.v2,
+    flags: (ld.flags | 1) & ~4, special: 0, tag: 0,
+    front: sdSeg3, back: -1,
+  });
+  // Track 1: vT0 → vBk0 (one of the door's perpendicular walls).
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vT0, v2: vBk0,
+    flags: 1 | 16, // impassable + lower-unpegged (texture stays put as door rises)
+    special: 0, tag: 0,
+    front: sdTrack1, back: -1,
+  });
+  // Back wall: vBk0 → vBk1 (far side of the closet).
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vBk0, v2: vBk1,
+    flags: 1, special: 0, tag: 0,
+    front: sdBackWall, back: -1,
+  });
+  // Track 2: vBk1 → vT1.
+  linedefs.push({
+    id: 'l' + linedefs.length,
+    v1: vBk1, v2: vT1,
+    flags: 1 | 16, special: 0, tag: 0,
+    front: sdTrack2, back: -1,
+  });
+
+  return { ...map, vertices: verts, linedefs, sidedefs, sectors };
 }
 function macroWindow(map, lineId) {
   const ld = map.linedefs.find(l => l.id === lineId);
@@ -3207,7 +3470,7 @@ export default function WadEditor() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="text-xs font-bold tracking-widest flex items-center gap-1.5" style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
             JERKWAD
-            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.9</span>
+            <span style={{ fontSize: 9, color: COLORS.textDim, letterSpacing: '0.15em', fontFamily: monoStack }}>V0.11</span>
           </div>
           <button onClick={() => setMapMenuOpen(o => !o)}
             className="px-2 py-1 rounded text-xs flex items-center gap-1"
@@ -3326,6 +3589,39 @@ export default function WadEditor() {
         {hint && (
           <div className="absolute top-2 left-2 px-2.5 py-1 rounded text-xs"
             style={{ background: COLORS.amber, color: COLORS.bg, fontFamily: monoStack }}>{hint}</div>
+        )}
+
+        {/* Floating "Make Sectors" action — only appears when there are
+            closed cycles in raw lines that aren't sectors yet. One tap
+            promotes them all (WADED's Make Sector flow). */}
+        {potentialSectors.length > 0 && (
+          <button
+            onClick={() => {
+              const list = potentialSectors;
+              let built = 0;
+              updateMap(m => {
+                let working = m;
+                for (const ps of list) {
+                  const chain = [...ps.loop, ps.loop[0]];
+                  const r = buildSectorFromLoop(working, chain);
+                  if (r && !r.selectedExistingId) {
+                    working = r;
+                    built++;
+                  }
+                }
+                return working;
+              });
+              setHint('Made ' + built + ' sector' + (built === 1 ? '' : 's'));
+            }}
+            className="absolute px-3 py-2 rounded font-semibold shadow-lg"
+            style={{
+              top: 8, left: '50%', transform: 'translateX(-50%)',
+              background: COLORS.accent, color: COLORS.bg,
+              border: '2px solid ' + COLORS.accent,
+              fontFamily: monoStack, fontSize: 12, letterSpacing: '0.05em',
+            }}>
+            ◇ MAKE {potentialSectors.length} SECTOR{potentialSectors.length === 1 ? '' : 'S'}
+          </button>
         )}
 
         {selObj && selection.type === 'sector' && !propsOpen && (
@@ -4324,7 +4620,7 @@ function WelcomeOverlay({ onOpen, onNewOutdoor, onNewInterior, onNewRandom, onNe
       style={{ background: COLORS.bg + 'f0', backdropFilter: 'blur(6px)' }}>
       <div className="max-w-sm w-full rounded-lg p-6"
         style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.border }}>
-        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.9</div>
+        <div className="text-xs tracking-widest mb-1" style={{ color: COLORS.amber, letterSpacing: '0.2em' }}>JERKWAD V0.11</div>
         <div className="text-2xl font-bold mb-3" style={{ color: COLORS.text }}>Touch-first DOOM editor</div>
         <div className="text-sm mb-5" style={{ color: COLORS.textDim, fontFamily: monoStack, lineHeight: 1.5 }}>
           Long-press for menus. Two-finger tap = undo. Random dungeon drops a closed playable map with corridors and doors.

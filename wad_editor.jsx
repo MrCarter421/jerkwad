@@ -58,7 +58,10 @@ const COLORS = {
   thing: '#ff5c5c',
   text: '#c5d4e8', textDim: '#6b7d99',
   accent: '#7fffd4', amber: '#ff9d3d', border: '#243759', danger: '#ff5c5c',
+  cyan: '#7fffd4',
 };
+const fontStack = "'Bricolage Grotesque', system-ui, sans-serif";
+const monoStack = "'JetBrains Mono', ui-monospace, monospace";
 
 // Curated Doom flat color palette — flat name → fill RGB.
 const FLAT_COLORS = {

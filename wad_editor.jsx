@@ -685,7 +685,50 @@ function generateDungeon() {
   }
   return last;
 }
-function _generateDungeonOnce() {
+
+// ShapeShifter: drive the dungeon generator from user-placed rooms.
+// Each spec has { type, cx, cy, w/h or r, feature }. Returns a full map
+// in the same shape as generateDungeon().
+function generateShapeShifterMap(roomSpecs) {
+  const rooms = roomSpecs.map((s, i) => ({
+    type: s.type,
+    cx: s.cx | 0, cy: s.cy | 0,
+    w: s.w, h: s.h, r: s.r,
+    _userFeature: s.feature || null,
+  }));
+  return _generateDungeonOnce({ rooms });
+}
+
+// Room presets — the predefined "library" the user picks from in
+// ShapeShifter. Each entry knows how to render a preview thumbnail and
+// supplies the (type, default size, feature) for placement.
+const SHAPESHIFTER_PRESETS = [
+  { id: 'combat',      label: 'Combat Arena', type: 'square',  w: 512, h: 512, feature: 'none' },
+  { id: 'cathedral',   label: 'Cathedral',    type: 'square',  w: 768, h: 768, feature: 'cathedral' },
+  { id: 'garden',      label: 'Garden',       type: 'octagon', r: 512,         feature: 'garden' },
+  { id: 'lake',        label: 'The Lake',     type: 'octagon', r: 576,         feature: 'lake' },
+  { id: 'throne',      label: 'Throne Room',  type: 'square',  w: 576, h: 640, feature: 'throne' },
+  { id: 'mausoleum',   label: 'Mausoleum',    type: 'square',  w: 448, h: 448, feature: 'mausoleum' },
+  { id: 'foundry',     label: 'Foundry',      type: 'square',  w: 512, h: 512, feature: 'foundry' },
+  { id: 'observatory', label: 'Observatory',  type: 'hexagon', r: 448,         feature: 'observatory' },
+  { id: 'reactor',     label: 'Reactor',      type: 'octagon', r: 448,         feature: 'reactor' },
+  { id: 'crypt',       label: 'Crypt',        type: 'square',  w: 384, h: 384, feature: 'crypt' },
+  { id: 'liminal',     label: 'Liminal',      type: 'square',  w: 768, h: 384, feature: 'liminal' },
+  { id: 'colonnade',   label: 'Colonnade',    type: 'square',  w: 768, h: 384, feature: 'colonnade' },
+  { id: 'gallery',     label: 'Gallery',      type: 'square',  w: 768, h: 320, feature: 'gallery' },
+  { id: 'sewer',       label: 'Sewer',        type: 'square',  w: 448, h: 576, feature: 'sewer' },
+  { id: 'altar',       label: 'Altar',        type: 'octagon', r: 384,         feature: 'altar' },
+  { id: 'pit',         label: 'Pit Room',     type: 'square',  w: 512, h: 512, feature: 'pit' },
+  { id: 'pool',        label: 'Pool Room',    type: 'square',  w: 512, h: 512, feature: 'pool' },
+  { id: 'crusher',     label: 'Crusher',      type: 'square',  w: 448, h: 448, feature: 'crusher' },
+  { id: 'platform',    label: 'Platform',     type: 'square',  w: 512, h: 512, feature: 'platform' },
+  { id: 'sky',         label: 'Sky Room',     type: 'octagon', r: 448,         feature: 'sky' },
+];
+function _generateDungeonOnce(opts) {
+  // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
+  // feature preselected). When present, skip the random placement section
+  // and respect each room's chosen feature/palette downstream.
+  const userRooms = opts && opts.rooms;
   let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
@@ -761,6 +804,10 @@ function _generateDungeonOnce() {
   const rooms = [];
   const PLACE_R = 1500;
   const MARGIN = 96;
+  if (userRooms && userRooms.length) {
+    // ShapeShifter: rooms are already placed by the user. Just clone them in.
+    for (const r of userRooms) rooms.push({ ...r });
+  } else {
   // Two-stage placement so the size distribution isn't biased by collisions:
   // sizeMaker is called ONCE per room (committing the size), then up to
   // `attempts` random positions are tried for that size. Without this, every
@@ -818,6 +865,7 @@ function _generateDungeonOnce() {
       if (!rooms.some(o => bboxOverlap(roomBBox(o), roomBBox(r), MARGIN))) rooms.push(r);
     });
   }
+  } // end random placement branch
 
   // -------- 2. pairwise corridor feasibility --------
   const ends = co => co.orient === 'H' ? [co.wIdx, co.eIdx] : [co.sIdx, co.nIdx];
@@ -1005,6 +1053,9 @@ function _generateDungeonOnce() {
       r.light = pick([208, 224, 240]);
     }
     const roll = rand();
+    // ShapeShifter: if the user already chose a feature for this room
+    // (preset), keep it. Otherwise pick randomly.
+    const userFeature = r._userFeature || null;
     // Large rooms get a shot at being "The Lake" or "The Garden" —
     // dramatic centerpieces requiring real floor area.
     const rmDim = r.type === 'octagon' ? r.r * 2 * 0.924
@@ -1012,7 +1063,8 @@ function _generateDungeonOnce() {
                 : Math.min(r.w, r.h);
     const isLargeRoom = rmDim >= 896;
     const isMidRoom = rmDim >= 512;
-    if (r.hasSky)                            r.feature = 'sky';
+    if (userFeature)                         r.feature = userFeature;
+    else if (r.hasSky)                       r.feature = 'sky';
     else if (isLargeRoom && roll < 0.10)     r.feature = 'lake';
     else if (isLargeRoom && roll < 0.18)     r.feature = 'garden';
     else if (roll < 0.13)                    r.feature = 'platform';
@@ -3340,12 +3392,321 @@ function macroLift(map, sectorId, tag) {
 }
 
 // ============================================================================
+// SHAPESHIFTER — preset-driven dungeon builder
+// ============================================================================
+// A pre-built map handoff slot. ShapeShifter generates a map, stashes it
+// here, then the WadEditor reads it on mount instead of opening a blank
+// starter. Cleared once consumed.
+let _shapeShifterHandoff = null;
+
+function shapeShifterRoomPolygon(r) {
+  if (r.type === 'square') {
+    const hw = r.w / 2, hh = r.h / 2;
+    return [
+      { x: r.cx - hw, y: r.cy - hh }, { x: r.cx + hw, y: r.cy - hh },
+      { x: r.cx + hw, y: r.cy + hh }, { x: r.cx - hw, y: r.cy + hh },
+    ];
+  }
+  if (r.type === 'octagon') {
+    const pts = [];
+    for (let i = 0; i < 8; i++) {
+      const a = Math.PI / 8 + i * Math.PI / 4;
+      pts.push({ x: r.cx + r.r * Math.cos(a), y: r.cy + r.r * Math.sin(a) });
+    }
+    return pts;
+  }
+  // hexagon
+  const pts = [];
+  for (let i = 0; i < 6; i++) {
+    const a = i * Math.PI / 3 + Math.PI / 2;
+    pts.push({ x: r.cx + r.r * Math.cos(a), y: r.cy + r.r * Math.sin(a) });
+  }
+  return pts;
+}
+
+function shapeShifterRoomBBox(r) {
+  const pts = shapeShifterRoomPolygon(r);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  return { minX, maxX, minY, maxY };
+}
+
+function ShapeShifter({ onBuild }) {
+  const [rooms, setRooms] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
+  const [hint, setHint] = useState('Pick a room style to add it to the canvas.');
+  const [building, setBuilding] = useState(false);
+  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
+  const pointersRef = useRef(new Map());
+  const gestureRef = useRef(null);
+
+  const screenToWorld = useCallback((sx, sy) => {
+    const c = canvasRef.current; if (!c) return { x: 0, y: 0 };
+    const rect = c.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2;
+    return { x: view.x + (sx - cx) / view.zoom, y: view.y - (sy - cy) / view.zoom };
+  }, [view]);
+  const worldToScreen = useCallback((wx, wy) => {
+    const c = canvasRef.current; if (!c) return { x: 0, y: 0 };
+    const rect = c.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2;
+    return { x: cx + (wx - view.x) * view.zoom, y: cy - (wy - view.y) * view.zoom };
+  }, [view]);
+
+  function nextRoomId() { return 'ssr' + Date.now() + '_' + Math.floor(Math.random() * 1e6); }
+
+  const addPreset = (preset) => {
+    // Place at viewport centre, offset to avoid overlap with existing rooms.
+    const target = { type: preset.type, cx: view.x, cy: view.y,
+      w: preset.w, h: preset.h, r: preset.r };
+    const SPACING = 96;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const test = { ...target };
+      const bb = shapeShifterRoomBBox(test);
+      const overlap = rooms.some((o) => {
+        const ob = shapeShifterRoomBBox(o);
+        return !(bb.maxX + SPACING < ob.minX || ob.maxX + SPACING < bb.minX ||
+                 bb.maxY + SPACING < ob.minY || ob.maxY + SPACING < bb.minY);
+      });
+      if (!overlap) {
+        target.cx = test.cx; target.cy = test.cy; break;
+      }
+      const ang = attempt * 0.7;
+      const dist = 384 + attempt * 96;
+      target.cx = (view.x + Math.cos(ang) * dist) | 0;
+      target.cy = (view.y + Math.sin(ang) * dist) | 0;
+      target.cx = Math.round(target.cx / 32) * 32;
+      target.cy = Math.round(target.cy / 32) * 32;
+    }
+    const r = { ...target, id: nextRoomId(), label: preset.label, feature: preset.feature, preset: preset.id };
+    setRooms(rs => [...rs, r]);
+    setSelectedId(r.id);
+    setHint(preset.label + ' placed — drag to move, tap empty space to deselect.');
+  };
+
+  const deleteSelected = () => {
+    if (!selectedId) return;
+    setRooms(rs => rs.filter(r => r.id !== selectedId));
+    setSelectedId(null);
+    setHint('Room removed.');
+  };
+
+  const connectAndBuild = () => {
+    if (rooms.length < 2) { setHint('Place at least 2 rooms before connecting.'); return; }
+    setBuilding(true);
+    try {
+      const specs = rooms.map(r => ({
+        type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature,
+      }));
+      const map = generateShapeShifterMap(specs);
+      const hasDoor = map.linedefs.some(l => l.special === 1);
+      if (!hasDoor) {
+        setHint('Could not connect — try repositioning rooms so their walls align.');
+        setBuilding(false);
+        return;
+      }
+      onBuild(map);
+    } catch (e) {
+      setHint('Build failed: ' + e.message);
+      setBuilding(false);
+    }
+  };
+
+  function hitRoom(sx, sy) {
+    const w = screenToWorld(sx, sy);
+    for (let i = rooms.length - 1; i >= 0; i--) {
+      const pts = shapeShifterRoomPolygon(rooms[i]);
+      if (pointInPolygon(w.x, w.y, pts)) return rooms[i];
+    }
+    return null;
+  }
+
+  const onPointerDown = (e) => {
+    canvasRef.current?.setPointerCapture(e.pointerId);
+    const rect = canvasRef.current.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    pointersRef.current.set(e.pointerId, { sx, sy, startX: sx, startY: sy });
+    if (pointersRef.current.size === 2) {
+      const [a, b] = [...pointersRef.current.values()];
+      gestureRef.current = {
+        kind: 'pinch',
+        startDist: Math.hypot(a.sx - b.sx, a.sy - b.sy),
+        startZoom: view.zoom,
+        startView: { x: view.x, y: view.y },
+        startCenter: { x: (a.sx + b.sx) / 2, y: (a.sy + b.sy) / 2 },
+      };
+    } else if (pointersRef.current.size === 1) {
+      const hit = hitRoom(sx, sy);
+      if (hit) {
+        setSelectedId(hit.id);
+        const w = screenToWorld(sx, sy);
+        gestureRef.current = { kind: 'drag', id: hit.id, offsetX: hit.cx - w.x, offsetY: hit.cy - w.y };
+      } else {
+        gestureRef.current = { kind: 'pan', startView: { x: view.x, y: view.y } };
+      }
+    }
+  };
+  const onPointerMove = (e) => {
+    const rec = pointersRef.current.get(e.pointerId);
+    if (!rec) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    rec.sx = e.clientX - rect.left; rec.sy = e.clientY - rect.top;
+    const g = gestureRef.current;
+    if (!g) return;
+    if (g.kind === 'pinch' && pointersRef.current.size === 2) {
+      const [a, b] = [...pointersRef.current.values()];
+      const d = Math.hypot(a.sx - b.sx, a.sy - b.sy);
+      if (g.startDist > 4) {
+        const zoom = Math.max(0.03, Math.min(2, g.startZoom * (d / g.startDist)));
+        setView(v => ({ ...v, zoom }));
+      }
+    } else if (g.kind === 'pan' && pointersRef.current.size === 1) {
+      const dx = (rec.sx - rec.startX) / view.zoom;
+      const dy = (rec.sy - rec.startY) / view.zoom;
+      setView({ x: g.startView.x - dx, y: g.startView.y + dy, zoom: view.zoom });
+    } else if (g.kind === 'drag' && pointersRef.current.size === 1) {
+      const w = screenToWorld(rec.sx, rec.sy);
+      const nx = Math.round((w.x + g.offsetX) / 32) * 32;
+      const ny = Math.round((w.y + g.offsetY) / 32) * 32;
+      setRooms(rs => rs.map(r => r.id === g.id ? { ...r, cx: nx, cy: ny } : r));
+    }
+  };
+  const onPointerUp = (e) => {
+    pointersRef.current.delete(e.pointerId);
+    if (pointersRef.current.size === 0) gestureRef.current = null;
+  };
+
+  useEffect(() => {
+    const c = canvasRef.current; if (!c) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = c.getBoundingClientRect();
+    c.width = rect.width * dpr; c.height = rect.height * dpr;
+    const ctx = c.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, rect.width, rect.height);
+    if (view.zoom > 0.04) {
+      const grid = 64;
+      const tl = screenToWorld(0, 0), br = screenToWorld(rect.width, rect.height);
+      ctx.strokeStyle = COLORS.grid; ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let x = Math.floor(tl.x / grid) * grid; x < br.x; x += grid) {
+        const s = worldToScreen(x, 0);
+        ctx.moveTo(s.x + 0.5, 0); ctx.lineTo(s.x + 0.5, rect.height);
+      }
+      for (let y = Math.floor(br.y / grid) * grid; y < tl.y; y += grid) {
+        const s = worldToScreen(0, y);
+        ctx.moveTo(0, s.y + 0.5); ctx.lineTo(rect.width, s.y + 0.5);
+      }
+      ctx.stroke();
+    }
+    for (const r of rooms) {
+      const pts = shapeShifterRoomPolygon(r);
+      ctx.beginPath();
+      pts.forEach((p, i) => { const s = worldToScreen(p.x, p.y); if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y); });
+      ctx.closePath();
+      const selected = r.id === selectedId;
+      ctx.fillStyle = selected ? COLORS.amber + '33' : COLORS.cyan + '22';
+      ctx.fill();
+      ctx.strokeStyle = selected ? COLORS.amber : COLORS.cyan;
+      ctx.lineWidth = selected ? 3 : 2;
+      ctx.stroke();
+      const c2 = worldToScreen(r.cx, r.cy);
+      ctx.fillStyle = COLORS.text;
+      ctx.font = '12px ui-monospace, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(r.label, c2.x, c2.y);
+    }
+  }, [rooms, selectedId, view, screenToWorld, worldToScreen]);
+
+  return (
+    <div ref={containerRef} className="w-full h-screen flex flex-col overflow-hidden select-none"
+      style={{ background: COLORS.bg, color: COLORS.text, fontFamily: fontStack, touchAction: 'none' }}>
+      <div className="flex items-center justify-between px-2 py-1.5 border-b"
+        style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
+        <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
+          style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.1</span>
+        </div>
+        <div className="flex gap-1.5">
+          <button onClick={connectAndBuild} disabled={building || rooms.length < 2}
+            className="px-3 py-1.5 text-xs font-bold rounded"
+            style={{ background: rooms.length >= 2 ? COLORS.amber : COLORS.bgPanel,
+                     color: rooms.length >= 2 ? COLORS.bg : COLORS.textDim,
+                     letterSpacing: '0.1em' }}>
+            CONNECT
+          </button>
+        </div>
+      </div>
+      <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                    overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
+        {SHAPESHIFTER_PRESETS.map(p => (
+          <button key={p.id} onClick={() => addPreset(p)}
+            style={{ display: 'inline-block', padding: '6px 10px', marginRight: 6,
+                     fontSize: 11, fontFamily: monoStack, color: COLORS.cyan,
+                     border: '1px solid ' + COLORS.border, borderRadius: 4,
+                     background: COLORS.bg }}>
+            + {p.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex-1 relative" style={{ minHeight: 0 }}>
+        <canvas ref={canvasRef} className="w-full h-full"
+          onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp} onPointerCancel={onPointerUp}
+          style={{ display: 'block', touchAction: 'none' }}/>
+        <div style={{ position: 'absolute', top: 8, left: 8, padding: '4px 8px',
+                      background: COLORS.bgPanel + 'ee', color: COLORS.amber,
+                      fontFamily: monoStack, fontSize: 11, border: '1px solid ' + COLORS.amber,
+                      borderRadius: 4 }}>
+          {hint}
+        </div>
+        {selectedId && (
+          <button onClick={deleteSelected}
+            style={{ position: 'absolute', top: 8, right: 8, padding: '6px 10px',
+                     background: COLORS.bgPanel, color: '#ff7676',
+                     border: '1px solid #ff7676', borderRadius: 4,
+                     fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>
+            DELETE
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// APP ROOT — boots into ShapeShifter, hands off to WadEditor on Connect.
+// ============================================================================
+export default function ShapeShifterApp() {
+  const [stage, setStage] = useState('shape'); // 'shape' or 'edit'
+  const onBuild = (map) => {
+    _shapeShifterHandoff = map;
+    setStage('edit');
+  };
+  if (stage === 'shape') return <ShapeShifter onBuild={onBuild}/>;
+  return <WadEditor/>;
+}
+
+// ============================================================================
 // MAIN COMPONENT
 // ============================================================================
-export default function WadEditor() {
-  const [doc, setDoc] = useState(() => ({
-    maps: { 'MAP01': outdoorStarter() }, currentMap: 'MAP01', fileName: 'untitled.wad'
-  }));
+function WadEditor() {
+  const [doc, setDoc] = useState(() => {
+    // ShapeShifter handed off a generated map — consume it as MAP01 instead
+    // of opening the blank outdoor starter.
+    if (_shapeShifterHandoff) {
+      const map = _shapeShifterHandoff;
+      _shapeShifterHandoff = null;
+      return { maps: { 'MAP01': map }, currentMap: 'MAP01', fileName: 'shapeshifter.wad' };
+    }
+    return { maps: { 'MAP01': outdoorStarter() }, currentMap: 'MAP01', fileName: 'untitled.wad' };
+  });
   const [mode, setMode] = useState('select');
   const [selection, setSelection] = useState(null);
   const [drawChain, setDrawChain] = useState([]);

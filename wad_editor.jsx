@@ -1565,6 +1565,15 @@ function _generateDungeonOnce(opts) {
       if (existing.back === -1) {
         existing.back = newSd(sectorId, { middle: '-', ...props.backSide });
         existing.flags = (existing.flags | 4) & ~1;
+        // Seam: the existing wall used to be one-sided (a room's outer
+        // wall) and we just attached a SECOND room's outer wall to its
+        // back. Clear the front's wall-texture middle so the passage
+        // reads as a clean opening instead of a glass-pane wall.
+        const frontSd = sidedefs.find(s => s.id === existing.front);
+        if (frontSd && frontSd.middle && frontSd.middle !== '-' &&
+            frontSd.middle !== 'DOORTRAK' && frontSd.middle !== 'SW1EXIT') {
+          frontSd.middle = '-';
+        }
       }
       if (props.flags) existing.flags |= props.flags;
       return existing;
@@ -3460,6 +3469,34 @@ function shapeShifterRoomBBox(r) {
   return { minX, maxX, minY, maxY };
 }
 
+// Find all wall segments where two rooms touch — the engine will merge
+// these into open seams in the build pass. Used for canvas highlighting
+// so the user can see which rooms are about to join.
+function findShapeShifterSeams(rooms) {
+  const seams = [];
+  for (let i = 0; i < rooms.length; i++) {
+    for (let j = i + 1; j < rooms.length; j++) {
+      const a = shapeShifterRoomBBox(rooms[i]);
+      const b = shapeShifterRoomBBox(rooms[j]);
+      if (Math.abs(a.maxX - b.minX) < 0.5) {
+        const y1 = Math.max(a.minY, b.minY), y2 = Math.min(a.maxY, b.maxY);
+        if (y2 - y1 >= 32) seams.push({ x1: a.maxX, y1, x2: a.maxX, y2 });
+      } else if (Math.abs(b.maxX - a.minX) < 0.5) {
+        const y1 = Math.max(a.minY, b.minY), y2 = Math.min(a.maxY, b.maxY);
+        if (y2 - y1 >= 32) seams.push({ x1: a.minX, y1, x2: a.minX, y2 });
+      }
+      if (Math.abs(a.maxY - b.minY) < 0.5) {
+        const x1 = Math.max(a.minX, b.minX), x2 = Math.min(a.maxX, b.maxX);
+        if (x2 - x1 >= 32) seams.push({ x1, y1: a.maxY, x2, y2: a.maxY });
+      } else if (Math.abs(b.maxY - a.minY) < 0.5) {
+        const x1 = Math.max(a.minX, b.minX), x2 = Math.min(a.maxX, b.maxX);
+        if (x2 - x1 >= 32) seams.push({ x1, y1: a.minY, x2, y2: a.minY });
+      }
+    }
+  }
+  return seams;
+}
+
 function ShapeShifter() {
   const [rooms, setRooms] = useState([]);
   const [connections, setConnections] = useState([]); // [{ id, fromId, toId, valid }]
@@ -3489,27 +3526,29 @@ function ShapeShifter() {
   function nextId(prefix) { return prefix + Date.now() + '_' + Math.floor(Math.random() * 1e6); }
   const roomById = useCallback((id) => rooms.find(r => r.id === id), [rooms]);
 
+  function bboxesOverlap(a, b) {
+    // Rooms must NOT overlap, but they may touch (shared edge is fine —
+    // that becomes a seam in the build pass).
+    return !(a.maxX <= b.minX || b.maxX <= a.minX ||
+             a.maxY <= b.minY || b.maxY <= a.minY);
+  }
+
   const addPreset = (preset) => {
     const target = { type: preset.type, cx: view.x, cy: view.y,
       w: preset.w, h: preset.h, r: preset.r };
-    const SPACING = 96;
-    for (let attempt = 0; attempt < 40; attempt++) {
+    for (let attempt = 0; attempt < 60; attempt++) {
       const bb = shapeShifterRoomBBox(target);
-      const overlap = rooms.some((o) => {
-        const ob = shapeShifterRoomBBox(o);
-        return !(bb.maxX + SPACING < ob.minX || ob.maxX + SPACING < bb.minX ||
-                 bb.maxY + SPACING < ob.minY || ob.maxY + SPACING < bb.minY);
-      });
+      const overlap = rooms.some((o) => bboxesOverlap(bb, shapeShifterRoomBBox(o)));
       if (!overlap) break;
-      const ang = attempt * 0.7;
-      const dist = 384 + attempt * 96;
+      const ang = attempt * 0.5;
+      const dist = 256 + attempt * 64;
       target.cx = Math.round((view.x + Math.cos(ang) * dist) / 32) * 32;
       target.cy = Math.round((view.y + Math.sin(ang) * dist) / 32) * 32;
     }
     const r = { ...target, id: nextId('ssr'), label: preset.label, feature: preset.feature };
     setRooms(rs => [...rs, r]);
     setSelectedId(r.id);
-    setHint(preset.label + ' placed — drag to move, switch to CONNECT to wire rooms.');
+    setHint(preset.label + ' placed — drag to move (touch walls form seams).');
   };
 
   const deleteSelected = () => {
@@ -3651,8 +3690,14 @@ function ShapeShifter() {
       const w = screenToWorld(sx, sy);
       gestureRef.current = { kind: 'drag', id: hit.id, offsetX: hit.cx - w.x, offsetY: hit.cy - w.y };
     } else {
-      setSelectedId(null);
-      gestureRef.current = { kind: 'pan', startView: { x: view.x, y: view.y } };
+      const co = hitConnection(sx, sy);
+      if (co) {
+        deleteConnection(co.id);
+        gestureRef.current = { kind: 'tap' };
+      } else {
+        setSelectedId(null);
+        gestureRef.current = { kind: 'pan', startView: { x: view.x, y: view.y } };
+      }
     }
   };
   const onPointerMove = (e) => {
@@ -3677,7 +3722,15 @@ function ShapeShifter() {
       const w = screenToWorld(rec.sx, rec.sy);
       const nx = Math.round((w.x + g.offsetX) / 32) * 32;
       const ny = Math.round((w.y + g.offsetY) / 32) * 32;
-      setRooms(rs => rs.map(r => r.id === g.id ? { ...r, cx: nx, cy: ny } : r));
+      setRooms(rs => {
+        const dragging = rs.find(r => r.id === g.id);
+        if (!dragging) return rs;
+        const moved = { ...dragging, cx: nx, cy: ny };
+        const movedBB = shapeShifterRoomBBox(moved);
+        const wouldOverlap = rs.some(o => o.id !== g.id && bboxesOverlap(movedBB, shapeShifterRoomBBox(o)));
+        if (wouldOverlap) return rs; // clamp — refuse the move
+        return rs.map(r => r.id === g.id ? moved : r);
+      });
     }
   };
   const onPointerUp = (e) => {
@@ -3753,6 +3806,20 @@ function ShapeShifter() {
         ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill();
       }
       return;
+    }
+    // Seams — green highlight where two rooms touch along an axis-aligned
+    // wall. The build pass merges these into open passages between rooms.
+    const seams = findShapeShifterSeams(rooms);
+    if (seams.length) {
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = COLORS.accent;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      for (const s of seams) {
+        const a = worldToScreen(s.x1, s.y1), b = worldToScreen(s.x2, s.y2);
+        ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      }
+      ctx.stroke();
     }
     // Connections (drawn before rooms so room outlines sit on top of endpoints)
     for (const c of connections) {

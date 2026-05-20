@@ -3459,6 +3459,109 @@ function shapeShifterRoomPolygon(r) {
   return pts;
 }
 
+// Touch-friendly thing palette for ShapeShifter's THINGS stage. Each
+// entry: type (Doom thing ID), label, and a marker colour. Categories are
+// the top-level tabs.
+const SHAPESHIFTER_THINGS = {
+  PLAYER: [
+    { type: 1,  label: 'P1 Start',  color: '#7fffd4' },
+    { type: 11, label: 'DM Start',  color: '#7fff7f' },
+    { type: 14, label: 'Teleport',  color: '#9966ff' },
+  ],
+  MONSTER: [
+    { type: 3004, label: 'Zombie',     color: '#a08070' },
+    { type: 9,    label: 'Sergeant',   color: '#5a4030' },
+    { type: 3001, label: 'Imp',        color: '#aa3030' },
+    { type: 3002, label: 'Pinky',      color: '#cc4444' },
+    { type: 3005, label: 'Cacodemon',  color: '#cc2222' },
+    { type: 3006, label: 'Lost Soul',  color: '#ffaa00' },
+    { type: 65,   label: 'Chaingunner',color: '#704020' },
+    { type: 69,   label: 'Hell Knight',color: '#ff8855' },
+    { type: 3003, label: 'Baron',      color: '#cc6644' },
+    { type: 68,   label: 'Arachnotron',color: '#aa66ff' },
+    { type: 71,   label: 'Pain Elem.', color: '#ff88ff' },
+    { type: 64,   label: 'Archvile',   color: '#ff0044' },
+    { type: 67,   label: 'Mancubus',   color: '#ddaa44' },
+    { type: 16,   label: 'Cyberdemon', color: '#ff00ff' },
+    { type: 7,    label: 'Spider',     color: '#dd2222' },
+    { type: 84,   label: 'Wolf SS',    color: '#666666' },
+  ],
+  WEAPON: [
+    { type: 2001, label: 'Shotgun',    color: '#cc8844' },
+    { type: 82,   label: 'Super SG',   color: '#ff8800' },
+    { type: 2002, label: 'Chaingun',   color: '#aaaaaa' },
+    { type: 2003, label: 'Rocket',     color: '#666666' },
+    { type: 2004, label: 'Plasma',     color: '#5577ff' },
+    { type: 2005, label: 'Chainsaw',   color: '#888800' },
+    { type: 2006, label: 'BFG9000',    color: '#00ff00' },
+  ],
+  AMMO: [
+    { type: 2007, label: 'Clip',         color: '#ffff00' },
+    { type: 2048, label: 'Bullet Box',   color: '#ffaa00' },
+    { type: 2008, label: 'Shells',       color: '#ff8800' },
+    { type: 2049, label: 'Shell Box',    color: '#ff6600' },
+    { type: 2010, label: 'Rocket',       color: '#666666' },
+    { type: 2046, label: 'Rocket Box',   color: '#444444' },
+    { type: 2047, label: 'Cell',         color: '#0088ff' },
+    { type: 17,   label: 'Cell Pack',    color: '#0066ff' },
+    { type: 8,    label: 'Backpack',     color: '#996644' },
+  ],
+  HEALTH: [
+    { type: 2011, label: 'Stimpak',     color: '#ff6666' },
+    { type: 2012, label: 'Medikit',     color: '#ff2222' },
+    { type: 2013, label: 'Soulsphere',  color: '#0066ff' },
+    { type: 2014, label: 'Health+',     color: '#ff8888' },
+    { type: 2015, label: 'Armor+',      color: '#88ff88' },
+    { type: 2018, label: 'Armor',       color: '#00aa00' },
+    { type: 2019, label: 'Mega Armor',  color: '#0044ff' },
+    { type: 83,   label: 'Megasphere',  color: '#ffaa00' },
+    { type: 2022, label: 'Invuln',      color: '#aa00ff' },
+    { type: 2023, label: 'Berserk',     color: '#aa0000' },
+    { type: 2024, label: 'Invis',       color: '#aaaaaa' },
+    { type: 2025, label: 'Rad Suit',    color: '#00aa44' },
+    { type: 2026, label: 'Comp Map',    color: '#ffaa44' },
+    { type: 2045, label: 'Light Amp',   color: '#00ff00' },
+  ],
+  KEY: [
+    { type: 5,  label: 'Blue Key',     color: '#0044ff' },
+    { type: 13, label: 'Red Key',      color: '#ff0000' },
+    { type: 6,  label: 'Yellow Key',   color: '#ffaa00' },
+    { type: 38, label: 'Blue Skull',   color: '#0044ff' },
+    { type: 39, label: 'Red Skull',    color: '#ff0000' },
+    { type: 40, label: 'Yellow Skull', color: '#ffaa00' },
+  ],
+  DECOR: [
+    { type: 2035, label: 'Barrel',         color: '#cc6644' },
+    { type: 70,   label: 'Burning Barrel', color: '#ff8800' },
+    { type: 30,   label: 'Tall Green Col', color: '#88dd88' },
+    { type: 31,   label: 'Short Green Col',color: '#44aa44' },
+    { type: 32,   label: 'Tall Red Col',   color: '#aa2222' },
+    { type: 33,   label: 'Short Red Col',  color: '#882222' },
+    { type: 34,   label: 'Candelabra',     color: '#aa8866' },
+    { type: 35,   label: 'Candle',         color: '#ffff88' },
+    { type: 44,   label: 'Blue Torch',     color: '#4488ff' },
+    { type: 45,   label: 'Green Torch',    color: '#44ff44' },
+    { type: 46,   label: 'Red Torch',      color: '#ff4444' },
+    { type: 55,   label: 'Short Red Tch',  color: '#ff8866' },
+    { type: 56,   label: 'Short Grn Tch',  color: '#88ff66' },
+    { type: 57,   label: 'Short Blu Tch',  color: '#6688ff' },
+    { type: 47,   label: 'Stalagmite',     color: '#888844' },
+    { type: 54,   label: 'Tree',           color: '#226622' },
+    { type: 41,   label: 'Evil Eye',       color: '#ff00ff' },
+    { type: 42,   label: 'Floating Skull', color: '#eeeeff' },
+    { type: 73,   label: 'Hanged Victim',  color: '#660000' },
+    { type: 85,   label: 'Tall Tech Lamp', color: '#ffffff' },
+    { type: 86,   label: 'Short Tech Lamp',color: '#ddddff' },
+  ],
+};
+const SHAPESHIFTER_THING_LOOKUP = (() => {
+  const m = new Map();
+  for (const cat of Object.keys(SHAPESHIFTER_THINGS)) {
+    for (const t of SHAPESHIFTER_THINGS[cat]) m.set(t.type, { ...t, cat });
+  }
+  return m;
+})();
+
 function shapeShifterRoomBBox(r) {
   const pts = shapeShifterRoomPolygon(r);
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -3506,6 +3609,10 @@ function ShapeShifter() {
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
   const [hint, setHint] = useState('Pick a room style to add it to the canvas.');
   const [previewMap, setPreviewMap] = useState(null);
+  const [thingsList, setThingsList] = useState([]); // editable things list in THINGS stage
+  const [thingCat, setThingCat] = useState('MONSTER'); // category in THINGS stage
+  const [pickedThingType, setPickedThingType] = useState(3001); // imp by default
+  const [selectedThingId, setSelectedThingId] = useState(null);
   const canvasRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef(null);
@@ -3527,8 +3634,6 @@ function ShapeShifter() {
   const roomById = useCallback((id) => rooms.find(r => r.id === id), [rooms]);
 
   function bboxesOverlap(a, b) {
-    // Rooms must NOT overlap, but they may touch (shared edge is fine —
-    // that becomes a seam in the build pass).
     return !(a.maxX <= b.minX || b.maxX <= a.minX ||
              a.maxY <= b.minY || b.maxY <= a.minY);
   }
@@ -3536,7 +3641,9 @@ function ShapeShifter() {
   const addPreset = (preset) => {
     const target = { type: preset.type, cx: view.x, cy: view.y,
       w: preset.w, h: preset.h, r: preset.r };
-    for (let attempt = 0; attempt < 60; attempt++) {
+    // Initial placement: nudge to a free spot but allow the user to drag
+    // it INTO another room — overlap is how rooms fuse.
+    for (let attempt = 0; attempt < 30; attempt++) {
       const bb = shapeShifterRoomBBox(target);
       const overlap = rooms.some((o) => bboxesOverlap(bb, shapeShifterRoomBBox(o)));
       if (!overlap) break;
@@ -3548,7 +3655,7 @@ function ShapeShifter() {
     const r = { ...target, id: nextId('ssr'), label: preset.label, feature: preset.feature };
     setRooms(rs => [...rs, r]);
     setSelectedId(r.id);
-    setHint(preset.label + ' placed — drag to move (touch walls form seams).');
+    setHint(preset.label + ' placed — drag rooms over each other to fuse them.');
   };
 
   const deleteSelected = () => {
@@ -3597,16 +3704,40 @@ function ShapeShifter() {
       }));
       const map = generateShapeShifterMap(specs, connections);
       setPreviewMap(map);
-      setHint('Built. Press PLAY to download the WAD, or BACK to keep editing.');
+      setThingsList(map.things.map(t => ({ ...t })));
+      setSelectedThingId(null);
+      setHint('Built. Tap a thing chip then tap the canvas to place it.');
     } catch (e) {
       setHint('Build failed: ' + e.message);
     }
   };
 
+  const placeThing = (wx, wy) => {
+    const nx = Math.round(wx), ny = Math.round(wy);
+    const t = { id: nextId('th'), x: nx, y: ny, angle: 0, type: pickedThingType, flags: 7 };
+    setThingsList(ts => [...ts, t]);
+    setSelectedThingId(t.id);
+  };
+  const deleteSelectedThing = () => {
+    if (!selectedThingId) return;
+    setThingsList(ts => ts.filter(t => t.id !== selectedThingId));
+    setSelectedThingId(null);
+  };
+  const rotateSelectedThing = () => {
+    if (!selectedThingId) return;
+    setThingsList(ts => ts.map(t => t.id === selectedThingId ? { ...t, angle: ((t.angle | 0) + 45) % 360 } : t));
+  };
+
   const playWad = async () => {
     if (!previewMap) return;
     try {
-      const buf = buildWad({ MAP01: previewMap });
+      // Substitute the edited thing list (with stable IDs) into the map.
+      const finalThings = thingsList.map((t, i) => ({
+        id: 't' + i, x: t.x | 0, y: t.y | 0,
+        angle: t.angle | 0, type: t.type, flags: t.flags | 7,
+      }));
+      const finalMap = { ...previewMap, things: finalThings };
+      const buf = buildWad({ MAP01: finalMap });
       const file = new File([buf], 'shapeshifter.wad', { type: 'application/octet-stream' });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         try { await navigator.share({ files: [file], title: 'shapeshifter.wad' }); return; }
@@ -3645,18 +3776,42 @@ function ShapeShifter() {
     return null;
   }
 
+  function hitThing(sx, sy) {
+    const w = screenToWorld(sx, sy);
+    const TOL = 18 / view.zoom;
+    for (let i = thingsList.length - 1; i >= 0; i--) {
+      const t = thingsList[i];
+      const dx = w.x - t.x, dy = w.y - t.y;
+      if (dx * dx + dy * dy < TOL * TOL) return t;
+    }
+    return null;
+  }
+
   const onPointerDown = (e) => {
     canvasRef.current?.setPointerCapture(e.pointerId);
     const rect = canvasRef.current.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     pointersRef.current.set(e.pointerId, { sx, sy, startX: sx, startY: sy, t: Date.now() });
     if (previewMap) {
-      gestureRef.current = { kind: pointersRef.current.size === 2 ? 'pinch' : 'pan',
-        startView: { x: view.x, y: view.y }, startZoom: view.zoom,
-        startDist: pointersRef.current.size === 2
-          ? Math.hypot([...pointersRef.current.values()][0].sx - [...pointersRef.current.values()][1].sx,
-                       [...pointersRef.current.values()][0].sy - [...pointersRef.current.values()][1].sy)
-          : 0 };
+      // THINGS stage
+      if (pointersRef.current.size === 2) {
+        const [a, b] = [...pointersRef.current.values()];
+        gestureRef.current = { kind: 'pinch',
+          startDist: Math.hypot(a.sx - b.sx, a.sy - b.sy),
+          startZoom: view.zoom, startView: { x: view.x, y: view.y } };
+        return;
+      }
+      const ht = hitThing(sx, sy);
+      if (ht) {
+        setSelectedThingId(ht.id);
+        const w = screenToWorld(sx, sy);
+        gestureRef.current = { kind: 'thingDrag', id: ht.id, offsetX: ht.x - w.x, offsetY: ht.y - w.y };
+      } else {
+        const w = screenToWorld(sx, sy);
+        // Tap empty canvas → drop the selected thing type here.
+        placeThing(w.x, w.y);
+        gestureRef.current = { kind: 'tap' };
+      }
       return;
     }
     if (pointersRef.current.size === 2) {
@@ -3722,15 +3877,14 @@ function ShapeShifter() {
       const w = screenToWorld(rec.sx, rec.sy);
       const nx = Math.round((w.x + g.offsetX) / 32) * 32;
       const ny = Math.round((w.y + g.offsetY) / 32) * 32;
-      setRooms(rs => {
-        const dragging = rs.find(r => r.id === g.id);
-        if (!dragging) return rs;
-        const moved = { ...dragging, cx: nx, cy: ny };
-        const movedBB = shapeShifterRoomBBox(moved);
-        const wouldOverlap = rs.some(o => o.id !== g.id && bboxesOverlap(movedBB, shapeShifterRoomBBox(o)));
-        if (wouldOverlap) return rs; // clamp — refuse the move
-        return rs.map(r => r.id === g.id ? moved : r);
-      });
+      // Overlap is the fusion mechanic — let it happen freely. The build
+      // pass merges coincident walls into open passages.
+      setRooms(rs => rs.map(r => r.id === g.id ? { ...r, cx: nx, cy: ny } : r));
+    } else if (g.kind === 'thingDrag' && pointersRef.current.size === 1) {
+      const w = screenToWorld(rec.sx, rec.sy);
+      const nx = Math.round(w.x);
+      const ny = Math.round(w.y);
+      setThingsList(ts => ts.map(t => t.id === g.id ? { ...t, x: nx, y: ny } : t));
     }
   };
   const onPointerUp = (e) => {
@@ -3798,14 +3952,44 @@ function ShapeShifter() {
         ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
       }
       ctx.stroke();
-      // Player start
-      const ps = previewMap.things.find(t => t.type === 1);
-      if (ps) {
-        const p = worldToScreen(ps.x, ps.y);
-        ctx.fillStyle = COLORS.accent; ctx.beginPath();
-        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill();
+      // Things (user-editable)
+      for (const t of thingsList) {
+        const info = SHAPESHIFTER_THING_LOOKUP.get(t.type);
+        const color = info?.color || COLORS.thing;
+        const p = worldToScreen(t.x, t.y);
+        const selected = t.id === selectedThingId;
+        const radius = selected ? 9 : 6;
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
+        ctx.lineWidth = selected ? 2 : 1;
+        ctx.strokeStyle = selected ? COLORS.amber : '#000';
+        ctx.stroke();
+        // facing-angle tick
+        const a = (t.angle || 0) * Math.PI / 180;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x + Math.cos(a) * (radius + 6), p.y - Math.sin(a) * (radius + 6));
+        ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
       }
       return;
+    }
+    // Overlap fusion — when room bboxes intersect, paint the intersection
+    // rectangle in accent so users can see where rooms are fusing.
+    for (let i = 0; i < rooms.length; i++) {
+      for (let j = i + 1; j < rooms.length; j++) {
+        const a = shapeShifterRoomBBox(rooms[i]), b = shapeShifterRoomBBox(rooms[j]);
+        const ix1 = Math.max(a.minX, b.minX), ix2 = Math.min(a.maxX, b.maxX);
+        const iy1 = Math.max(a.minY, b.minY), iy2 = Math.min(a.maxY, b.maxY);
+        if (ix2 > ix1 && iy2 > iy1) {
+          const tl = worldToScreen(ix1, iy2), br = worldToScreen(ix2, iy1);
+          ctx.fillStyle = COLORS.accent + '33';
+          ctx.fillRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+          ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+          ctx.setLineDash([]);
+        }
+      }
     }
     // Seams — green highlight where two rooms touch along an axis-aligned
     // wall. The build pass merges these into open passages between rooms.
@@ -3850,7 +4034,7 @@ function ShapeShifter() {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(r.label, c2.x, c2.y);
     }
-  }, [rooms, connections, selectedId, pendingConnect, view, previewMap, screenToWorld, worldToScreen, roomById]);
+  }, [rooms, connections, selectedId, pendingConnect, view, previewMap, thingsList, selectedThingId, screenToWorld, worldToScreen, roomById]);
 
   return (
     <div className="w-full h-screen flex flex-col overflow-hidden select-none"
@@ -3859,7 +4043,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.2</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.4</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (
@@ -3872,7 +4056,10 @@ function ShapeShifter() {
             </button>
           )}
           {previewMap && (<>
-            <button onClick={() => { setPreviewMap(null); setHint('Back to editing — drag rooms or draw more connections.'); }}
+            <button onClick={() => {
+                setPreviewMap(null); setThingsList([]); setSelectedThingId(null);
+                setHint('Back to editing — drag rooms to fuse, draw connections, then BUILD.');
+              }}
               style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
                        background: COLORS.bgPanel, color: COLORS.cyan,
                        border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>BACK</button>
@@ -3916,6 +4103,40 @@ function ShapeShifter() {
           ))}
         </div>
       )}
+      {previewMap && (
+        <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                      display: 'flex', gap: 4, padding: '6px 8px', overflowX: 'auto' }}>
+          {Object.keys(SHAPESHIFTER_THINGS).map(cat => (
+            <button key={cat} onClick={() => {
+                setThingCat(cat);
+                const first = SHAPESHIFTER_THINGS[cat][0];
+                if (first) setPickedThingType(first.type);
+              }}
+              style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
+                       color: thingCat === cat ? COLORS.bg : COLORS.cyan,
+                       background: thingCat === cat ? COLORS.cyan : COLORS.bg,
+                       border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>{cat}</button>
+          ))}
+        </div>
+      )}
+      {previewMap && (
+        <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                      overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
+          {(SHAPESHIFTER_THINGS[thingCat] || []).map(t => {
+            const isPicked = pickedThingType === t.type;
+            return (
+              <button key={t.type} onClick={() => setPickedThingType(t.type)}
+                style={{ display: 'inline-block', padding: '6px 10px', marginRight: 6,
+                         fontSize: 11, fontFamily: monoStack,
+                         color: isPicked ? COLORS.bg : t.color,
+                         background: isPicked ? t.color : COLORS.bg,
+                         border: '1px solid ' + t.color, borderRadius: 4 }}>
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <div className="flex-1 relative" style={{ minHeight: 0 }}>
         <canvas ref={canvasRef} className="w-full h-full"
           onPointerDown={onPointerDown} onPointerMove={onPointerMove}
@@ -3935,6 +4156,18 @@ function ShapeShifter() {
                      fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>
             DELETE
           </button>
+        )}
+        {previewMap && selectedThingId && (
+          <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 6 }}>
+            <button onClick={rotateSelectedThing}
+              style={{ padding: '6px 10px', background: COLORS.bgPanel, color: COLORS.cyan,
+                       border: '1px solid ' + COLORS.cyan, borderRadius: 4,
+                       fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>↻ 45°</button>
+            <button onClick={deleteSelectedThing}
+              style={{ padding: '6px 10px', background: COLORS.bgPanel, color: '#ff7676',
+                       border: '1px solid #ff7676', borderRadius: 4,
+                       fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>DELETE</button>
+          </div>
         )}
       </div>
     </div>

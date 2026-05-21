@@ -690,9 +690,9 @@ function generateDungeon() {
 }
 
 // ShapeShifter: drive the dungeon generator from user-placed rooms +
-// user-drawn corridor pairs. Returns a full map in the same shape as
-// generateDungeon().
-function generateShapeShifterMap(roomSpecs, connectionSpecs) {
+// user-drawn corridor pairs + (optional) user-placed things. Returns a
+// full map in the same shape as generateDungeon().
+function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
   const rooms = roomSpecs.map((s) => ({
     type: s.type,
     cx: s.cx | 0, cy: s.cy | 0,
@@ -708,7 +708,8 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs) {
       corridors.push({ a, b });
     }
   }
-  return _generateDungeonOnce({ rooms, corridors });
+  const userThings = thingSpecs && thingSpecs.length ? thingSpecs : null;
+  return _generateDungeonOnce({ rooms, corridors, userThings });
 }
 
 // Room presets — the predefined "library" the user picks from in
@@ -1826,6 +1827,91 @@ function _generateDungeonOnce(opts) {
     }
   });
 
+  // -------- 7b. Fuse touching / partially-overlapping room walls --------
+  // When two rooms are placed so their outer walls share a line segment
+  // (touching exactly OR partially overlapping), split each wall at the
+  // other's endpoints so the shared portion becomes a single line, then
+  // merge identical one-sided wall pairs into a two-sided passable line.
+  // This is the "drag rooms together to build larger shapes" mechanic —
+  // the engine sees the user's intent and dissolves the inner walls.
+  {
+    function cloneSidedef(sdId) {
+      if (sdId === -1) return -1;
+      const src = sidedefs.find(s => s.id === sdId);
+      if (!src) return -1;
+      const nid = 'sd' + sidedefs.length;
+      sidedefs.push({ ...src, id: nid });
+      return nid;
+    }
+    function trySplitAt(line, atV) {
+      if (line.v1 === atV || line.v2 === atV) return null;
+      const v = verts.find(x => x.id === atV);
+      const a = verts.find(x => x.id === line.v1);
+      const b = verts.find(x => x.id === line.v2);
+      if (!v || !a || !b) return null;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1) return null;
+      const t = ((v.x - a.x) * dx + (v.y - a.y) * dy) / lenSq;
+      if (t <= 0.001 || t >= 0.999) return null;
+      const projX = a.x + t * dx, projY = a.y + t * dy;
+      if ((v.x - projX) ** 2 + (v.y - projY) ** 2 > 1) return null;
+      const half2 = {
+        ...line, id: 'l' + linedefs.length, v1: atV,
+        front: cloneSidedef(line.front), back: cloneSidedef(line.back),
+      };
+      line.v2 = atV;
+      return half2;
+    }
+    // Iterate: collect endpoints of all one-sided walls, split any line
+    // passing through one of them. Repeat until stable.
+    let safety = 200;
+    let changed = true;
+    while (changed && safety-- > 0) {
+      changed = false;
+      const endpoints = new Set();
+      for (const l of linedefs) {
+        if (l.back === -1) { endpoints.add(l.v1); endpoints.add(l.v2); }
+      }
+      for (const vid of endpoints) {
+        for (let i = 0; i < linedefs.length; i++) {
+          const half2 = trySplitAt(linedefs[i], vid);
+          if (half2) { linedefs.push(half2); changed = true; }
+        }
+      }
+    }
+    // Merge identical one-sided wall pairs (between DIFFERENT sectors) into
+    // a single two-sided passable line. Clears the front wall texture.
+    const removed = new Set();
+    for (let i = 0; i < linedefs.length; i++) {
+      if (removed.has(i)) continue;
+      const l1 = linedefs[i];
+      if (l1.back !== -1) continue;
+      for (let j = i + 1; j < linedefs.length; j++) {
+        if (removed.has(j)) continue;
+        const l2 = linedefs[j];
+        if (l2.back !== -1) continue;
+        const sameVerts = (l1.v1 === l2.v1 && l1.v2 === l2.v2) ||
+                          (l1.v1 === l2.v2 && l1.v2 === l2.v1);
+        if (!sameVerts) continue;
+        const fs1 = sidedefs.find(s => s.id === l1.front);
+        const fs2 = sidedefs.find(s => s.id === l2.front);
+        if (!fs1 || !fs2 || fs1.sector === fs2.sector) continue;
+        l1.back = l2.front;
+        l1.flags = (l1.flags | 4) & ~1;
+        if (fs1.middle && fs1.middle !== '-' &&
+            fs1.middle !== 'DOORTRAK' && fs1.middle !== 'SW1EXIT') {
+          fs1.middle = '-';
+        }
+        removed.add(j);
+        break;
+      }
+    }
+    for (let i = linedefs.length - 1; i >= 0; i--) {
+      if (removed.has(i)) linedefs.splice(i, 1);
+    }
+  }
+
   // -------- 8. Apply door specials --------
   // Each line touching a doorBody becomes a DR-1 door so USE opens it from
   // EITHER side (corridor or room). The line's back must be the door body
@@ -1926,7 +2012,22 @@ function _generateDungeonOnce(opts) {
   }
 
   // -------- 9. Place things --------
-  const things = [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
+  // ShapeShifter override: when the caller supplies userThings (placed by
+  // the user before BUILD), use those verbatim instead of auto-generating
+  // monsters, items, and decorations. The exit-post block below still runs
+  // so the user always gets a working exit, even if they didn't place a
+  // P1 start manually we'll insert one at the first room.
+  const userThings = opts && opts.userThings;
+  const things = userThings
+    ? userThings.map((t, i) => ({
+        id: 't' + i, x: t.x | 0, y: t.y | 0,
+        angle: t.angle | 0, type: t.type, flags: t.flags == null ? 7 : t.flags,
+      }))
+    : [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
+  if (userThings && !things.some(t => t.type === 1)) {
+    things.unshift({ id: 'tps', x: rooms[0].cx | 0, y: rooms[0].cy | 0,
+      angle: 90, type: 1, flags: 7 });
+  }
   // Per-zone monster archetypes — combat theme matches palette. Techbase
   // walls draw human grunts; hellish stone draws demons and cacos. Doom
   // type IDs: 3001 imp, 3002 pinky, 3003 baron, 3004 zombie, 9 sergeant,
@@ -1963,8 +2064,9 @@ function _generateDungeonOnce(opts) {
     reactor:     { types: [85, 2035, 70],       count: [3, 5] },
     gallery:     { types: [34, 35, 31],         count: [3, 5] },
   };
-  // Vary monster count by room size — bigger rooms host more.
-  rooms.forEach((r, i) => {
+  // Vary monster count by room size — bigger rooms host more. Skip
+  // entirely when the user supplied an explicit thing list.
+  if (!userThings) rooms.forEach((r, i) => {
     if (i === 0) return; // start room empty
     const bb = roomBBox(r);
     const area = (bb.maxX - bb.minX) * (bb.maxY - bb.minY);
@@ -3459,6 +3561,109 @@ function shapeShifterRoomPolygon(r) {
   return pts;
 }
 
+// Touch-friendly thing palette for ShapeShifter's THINGS stage. Each
+// entry: type (Doom thing ID), label, and a marker colour. Categories are
+// the top-level tabs.
+const SHAPESHIFTER_THINGS = {
+  PLAYER: [
+    { type: 1,  label: 'P1 Start',  color: '#7fffd4' },
+    { type: 11, label: 'DM Start',  color: '#7fff7f' },
+    { type: 14, label: 'Teleport',  color: '#9966ff' },
+  ],
+  MONSTER: [
+    { type: 3004, label: 'Zombie',     color: '#a08070' },
+    { type: 9,    label: 'Sergeant',   color: '#5a4030' },
+    { type: 3001, label: 'Imp',        color: '#aa3030' },
+    { type: 3002, label: 'Pinky',      color: '#cc4444' },
+    { type: 3005, label: 'Cacodemon',  color: '#cc2222' },
+    { type: 3006, label: 'Lost Soul',  color: '#ffaa00' },
+    { type: 65,   label: 'Chaingunner',color: '#704020' },
+    { type: 69,   label: 'Hell Knight',color: '#ff8855' },
+    { type: 3003, label: 'Baron',      color: '#cc6644' },
+    { type: 68,   label: 'Arachnotron',color: '#aa66ff' },
+    { type: 71,   label: 'Pain Elem.', color: '#ff88ff' },
+    { type: 64,   label: 'Archvile',   color: '#ff0044' },
+    { type: 67,   label: 'Mancubus',   color: '#ddaa44' },
+    { type: 16,   label: 'Cyberdemon', color: '#ff00ff' },
+    { type: 7,    label: 'Spider',     color: '#dd2222' },
+    { type: 84,   label: 'Wolf SS',    color: '#666666' },
+  ],
+  WEAPON: [
+    { type: 2001, label: 'Shotgun',    color: '#cc8844' },
+    { type: 82,   label: 'Super SG',   color: '#ff8800' },
+    { type: 2002, label: 'Chaingun',   color: '#aaaaaa' },
+    { type: 2003, label: 'Rocket',     color: '#666666' },
+    { type: 2004, label: 'Plasma',     color: '#5577ff' },
+    { type: 2005, label: 'Chainsaw',   color: '#888800' },
+    { type: 2006, label: 'BFG9000',    color: '#00ff00' },
+  ],
+  AMMO: [
+    { type: 2007, label: 'Clip',         color: '#ffff00' },
+    { type: 2048, label: 'Bullet Box',   color: '#ffaa00' },
+    { type: 2008, label: 'Shells',       color: '#ff8800' },
+    { type: 2049, label: 'Shell Box',    color: '#ff6600' },
+    { type: 2010, label: 'Rocket',       color: '#666666' },
+    { type: 2046, label: 'Rocket Box',   color: '#444444' },
+    { type: 2047, label: 'Cell',         color: '#0088ff' },
+    { type: 17,   label: 'Cell Pack',    color: '#0066ff' },
+    { type: 8,    label: 'Backpack',     color: '#996644' },
+  ],
+  HEALTH: [
+    { type: 2011, label: 'Stimpak',     color: '#ff6666' },
+    { type: 2012, label: 'Medikit',     color: '#ff2222' },
+    { type: 2013, label: 'Soulsphere',  color: '#0066ff' },
+    { type: 2014, label: 'Health+',     color: '#ff8888' },
+    { type: 2015, label: 'Armor+',      color: '#88ff88' },
+    { type: 2018, label: 'Armor',       color: '#00aa00' },
+    { type: 2019, label: 'Mega Armor',  color: '#0044ff' },
+    { type: 83,   label: 'Megasphere',  color: '#ffaa00' },
+    { type: 2022, label: 'Invuln',      color: '#aa00ff' },
+    { type: 2023, label: 'Berserk',     color: '#aa0000' },
+    { type: 2024, label: 'Invis',       color: '#aaaaaa' },
+    { type: 2025, label: 'Rad Suit',    color: '#00aa44' },
+    { type: 2026, label: 'Comp Map',    color: '#ffaa44' },
+    { type: 2045, label: 'Light Amp',   color: '#00ff00' },
+  ],
+  KEY: [
+    { type: 5,  label: 'Blue Key',     color: '#0044ff' },
+    { type: 13, label: 'Red Key',      color: '#ff0000' },
+    { type: 6,  label: 'Yellow Key',   color: '#ffaa00' },
+    { type: 38, label: 'Blue Skull',   color: '#0044ff' },
+    { type: 39, label: 'Red Skull',    color: '#ff0000' },
+    { type: 40, label: 'Yellow Skull', color: '#ffaa00' },
+  ],
+  DECOR: [
+    { type: 2035, label: 'Barrel',         color: '#cc6644' },
+    { type: 70,   label: 'Burning Barrel', color: '#ff8800' },
+    { type: 30,   label: 'Tall Green Col', color: '#88dd88' },
+    { type: 31,   label: 'Short Green Col',color: '#44aa44' },
+    { type: 32,   label: 'Tall Red Col',   color: '#aa2222' },
+    { type: 33,   label: 'Short Red Col',  color: '#882222' },
+    { type: 34,   label: 'Candelabra',     color: '#aa8866' },
+    { type: 35,   label: 'Candle',         color: '#ffff88' },
+    { type: 44,   label: 'Blue Torch',     color: '#4488ff' },
+    { type: 45,   label: 'Green Torch',    color: '#44ff44' },
+    { type: 46,   label: 'Red Torch',      color: '#ff4444' },
+    { type: 55,   label: 'Short Red Tch',  color: '#ff8866' },
+    { type: 56,   label: 'Short Grn Tch',  color: '#88ff66' },
+    { type: 57,   label: 'Short Blu Tch',  color: '#6688ff' },
+    { type: 47,   label: 'Stalagmite',     color: '#888844' },
+    { type: 54,   label: 'Tree',           color: '#226622' },
+    { type: 41,   label: 'Evil Eye',       color: '#ff00ff' },
+    { type: 42,   label: 'Floating Skull', color: '#eeeeff' },
+    { type: 73,   label: 'Hanged Victim',  color: '#660000' },
+    { type: 85,   label: 'Tall Tech Lamp', color: '#ffffff' },
+    { type: 86,   label: 'Short Tech Lamp',color: '#ddddff' },
+  ],
+};
+const SHAPESHIFTER_THING_LOOKUP = (() => {
+  const m = new Map();
+  for (const cat of Object.keys(SHAPESHIFTER_THINGS)) {
+    for (const t of SHAPESHIFTER_THINGS[cat]) m.set(t.type, { ...t, cat });
+  }
+  return m;
+})();
+
 function shapeShifterRoomBBox(r) {
   const pts = shapeShifterRoomPolygon(r);
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -3500,11 +3705,15 @@ function findShapeShifterSeams(rooms) {
 function ShapeShifter() {
   const [rooms, setRooms] = useState([]);
   const [connections, setConnections] = useState([]); // [{ id, fromId, toId, valid }]
-  const [tool, setTool] = useState('place'); // 'place' | 'connect'
-  const [selectedId, setSelectedId] = useState(null);
-  const [pendingConnect, setPendingConnect] = useState(null); // roomId waiting for second tap
+  const [thingsList, setThingsList] = useState([]);   // user-placed things (pre-build)
+  const [mode, setMode] = useState('place'); // 'place' | 'connect' | 'things'
+  const [selectedId, setSelectedId] = useState(null);          // selected ROOM
+  const [selectedThingId, setSelectedThingId] = useState(null); // selected THING
+  const [pendingConnect, setPendingConnect] = useState(null);
+  const [thingCat, setThingCat] = useState('PLAYER');
+  const [pickedThingType, setPickedThingType] = useState(1);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
-  const [hint, setHint] = useState('Pick a room style to add it to the canvas.');
+  const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
   const canvasRef = useRef(null);
   const pointersRef = useRef(new Map());
@@ -3527,8 +3736,6 @@ function ShapeShifter() {
   const roomById = useCallback((id) => rooms.find(r => r.id === id), [rooms]);
 
   function bboxesOverlap(a, b) {
-    // Rooms must NOT overlap, but they may touch (shared edge is fine —
-    // that becomes a seam in the build pass).
     return !(a.maxX <= b.minX || b.maxX <= a.minX ||
              a.maxY <= b.minY || b.maxY <= a.minY);
   }
@@ -3536,7 +3743,9 @@ function ShapeShifter() {
   const addPreset = (preset) => {
     const target = { type: preset.type, cx: view.x, cy: view.y,
       w: preset.w, h: preset.h, r: preset.r };
-    for (let attempt = 0; attempt < 60; attempt++) {
+    // Initial placement: nudge to a free spot but allow the user to drag
+    // it INTO another room — overlap is how rooms fuse.
+    for (let attempt = 0; attempt < 30; attempt++) {
       const bb = shapeShifterRoomBBox(target);
       const overlap = rooms.some((o) => bboxesOverlap(bb, shapeShifterRoomBBox(o)));
       if (!overlap) break;
@@ -3548,7 +3757,7 @@ function ShapeShifter() {
     const r = { ...target, id: nextId('ssr'), label: preset.label, feature: preset.feature };
     setRooms(rs => [...rs, r]);
     setSelectedId(r.id);
-    setHint(preset.label + ' placed — drag to move (touch walls form seams).');
+    setHint(preset.label + ' placed — drag rooms over each other to fuse them.');
   };
 
   const deleteSelected = () => {
@@ -3595,18 +3804,44 @@ function ShapeShifter() {
       const specs = rooms.map(r => ({
         type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
       }));
-      const map = generateShapeShifterMap(specs, connections);
+      const thingSpecs = thingsList.map(t => ({
+        type: t.type, x: t.x, y: t.y, angle: t.angle | 0, flags: t.flags | 7,
+      }));
+      const map = generateShapeShifterMap(specs, connections, thingSpecs);
       setPreviewMap(map);
-      setHint('Built. Press PLAY to download the WAD, or BACK to keep editing.');
+      setSelectedThingId(null);
+      setHint('Built. PLAY / SAVE to export, BACK to keep editing.');
     } catch (e) {
       setHint('Build failed: ' + e.message);
     }
   };
 
+  const placeThing = (wx, wy) => {
+    const nx = Math.round(wx), ny = Math.round(wy);
+    const t = { id: nextId('th'), x: nx, y: ny, angle: 0, type: pickedThingType, flags: 7 };
+    setThingsList(ts => [...ts, t]);
+    setSelectedThingId(t.id);
+  };
+  const deleteSelectedThing = () => {
+    if (!selectedThingId) return;
+    setThingsList(ts => ts.filter(t => t.id !== selectedThingId));
+    setSelectedThingId(null);
+  };
+  const rotateSelectedThing = () => {
+    if (!selectedThingId) return;
+    setThingsList(ts => ts.map(t => t.id === selectedThingId ? { ...t, angle: ((t.angle | 0) + 45) % 360 } : t));
+  };
+
   const playWad = async () => {
     if (!previewMap) return;
     try {
-      const buf = buildWad({ MAP01: previewMap });
+      // Substitute the edited thing list (with stable IDs) into the map.
+      const finalThings = thingsList.map((t, i) => ({
+        id: 't' + i, x: t.x | 0, y: t.y | 0,
+        angle: t.angle | 0, type: t.type, flags: t.flags | 7,
+      }));
+      const finalMap = { ...previewMap, things: finalThings };
+      const buf = buildWad({ MAP01: finalMap });
       const file = new File([buf], 'shapeshifter.wad', { type: 'application/octet-stream' });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         try { await navigator.share({ files: [file], title: 'shapeshifter.wad' }); return; }
@@ -3645,20 +3880,22 @@ function ShapeShifter() {
     return null;
   }
 
+  function hitThing(sx, sy) {
+    const w = screenToWorld(sx, sy);
+    const TOL = 18 / view.zoom;
+    for (let i = thingsList.length - 1; i >= 0; i--) {
+      const t = thingsList[i];
+      const dx = w.x - t.x, dy = w.y - t.y;
+      if (dx * dx + dy * dy < TOL * TOL) return t;
+    }
+    return null;
+  }
+
   const onPointerDown = (e) => {
     canvasRef.current?.setPointerCapture(e.pointerId);
     const rect = canvasRef.current.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     pointersRef.current.set(e.pointerId, { sx, sy, startX: sx, startY: sy, t: Date.now() });
-    if (previewMap) {
-      gestureRef.current = { kind: pointersRef.current.size === 2 ? 'pinch' : 'pan',
-        startView: { x: view.x, y: view.y }, startZoom: view.zoom,
-        startDist: pointersRef.current.size === 2
-          ? Math.hypot([...pointersRef.current.values()][0].sx - [...pointersRef.current.values()][1].sx,
-                       [...pointersRef.current.values()][0].sy - [...pointersRef.current.values()][1].sy)
-          : 0 };
-      return;
-    }
     if (pointersRef.current.size === 2) {
       const [a, b] = [...pointersRef.current.values()];
       gestureRef.current = { kind: 'pinch',
@@ -3666,8 +3903,12 @@ function ShapeShifter() {
         startZoom: view.zoom, startView: { x: view.x, y: view.y } };
       return;
     }
-    const hit = hitRoom(sx, sy);
-    if (tool === 'connect') {
+    if (previewMap) {
+      gestureRef.current = { kind: 'pan', startView: { x: view.x, y: view.y } };
+      return;
+    }
+    if (mode === 'connect') {
+      const hit = hitRoom(sx, sy);
       if (hit) {
         if (pendingConnect && pendingConnect !== hit.id) {
           tryConnectRooms(pendingConnect, hit.id);
@@ -3684,7 +3925,21 @@ function ShapeShifter() {
       }
       return;
     }
-    // place mode
+    if (mode === 'things') {
+      const ht = hitThing(sx, sy);
+      if (ht) {
+        setSelectedThingId(ht.id);
+        const w = screenToWorld(sx, sy);
+        gestureRef.current = { kind: 'thingDrag', id: ht.id, offsetX: ht.x - w.x, offsetY: ht.y - w.y };
+      } else {
+        const w = screenToWorld(sx, sy);
+        placeThing(w.x, w.y);
+        gestureRef.current = { kind: 'tap' };
+      }
+      return;
+    }
+    // PLACE mode
+    const hit = hitRoom(sx, sy);
     if (hit) {
       setSelectedId(hit.id);
       const w = screenToWorld(sx, sy);
@@ -3722,15 +3977,14 @@ function ShapeShifter() {
       const w = screenToWorld(rec.sx, rec.sy);
       const nx = Math.round((w.x + g.offsetX) / 32) * 32;
       const ny = Math.round((w.y + g.offsetY) / 32) * 32;
-      setRooms(rs => {
-        const dragging = rs.find(r => r.id === g.id);
-        if (!dragging) return rs;
-        const moved = { ...dragging, cx: nx, cy: ny };
-        const movedBB = shapeShifterRoomBBox(moved);
-        const wouldOverlap = rs.some(o => o.id !== g.id && bboxesOverlap(movedBB, shapeShifterRoomBBox(o)));
-        if (wouldOverlap) return rs; // clamp — refuse the move
-        return rs.map(r => r.id === g.id ? moved : r);
-      });
+      // Overlap is the fusion mechanic — let it happen freely. The build
+      // pass merges coincident walls into open passages.
+      setRooms(rs => rs.map(r => r.id === g.id ? { ...r, cx: nx, cy: ny } : r));
+    } else if (g.kind === 'thingDrag' && pointersRef.current.size === 1) {
+      const w = screenToWorld(rec.sx, rec.sy);
+      const nx = Math.round(w.x);
+      const ny = Math.round(w.y);
+      setThingsList(ts => ts.map(t => t.id === g.id ? { ...t, x: nx, y: ny } : t));
     }
   };
   const onPointerUp = (e) => {
@@ -3798,14 +4052,39 @@ function ShapeShifter() {
         ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
       }
       ctx.stroke();
-      // Player start
-      const ps = previewMap.things.find(t => t.type === 1);
-      if (ps) {
-        const p = worldToScreen(ps.x, ps.y);
-        ctx.fillStyle = COLORS.accent; ctx.beginPath();
-        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill();
+      // Things from the built map (includes any auto-inserted P1 start)
+      for (const t of previewMap.things) {
+        const info = SHAPESHIFTER_THING_LOOKUP.get(t.type);
+        const color = info?.color || COLORS.thing;
+        const p = worldToScreen(t.x, t.y);
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill();
+        ctx.lineWidth = 1; ctx.strokeStyle = '#000'; ctx.stroke();
+        const a = (t.angle || 0) * Math.PI / 180;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x + Math.cos(a) * 12, p.y - Math.sin(a) * 12);
+        ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
       }
       return;
+    }
+    // Overlap fusion — when room bboxes intersect, paint the intersection
+    // rectangle in accent so users can see where rooms are fusing.
+    for (let i = 0; i < rooms.length; i++) {
+      for (let j = i + 1; j < rooms.length; j++) {
+        const a = shapeShifterRoomBBox(rooms[i]), b = shapeShifterRoomBBox(rooms[j]);
+        const ix1 = Math.max(a.minX, b.minX), ix2 = Math.min(a.maxX, b.maxX);
+        const iy1 = Math.max(a.minY, b.minY), iy2 = Math.min(a.maxY, b.maxY);
+        if (ix2 > ix1 && iy2 > iy1) {
+          const tl = worldToScreen(ix1, iy2), br = worldToScreen(ix2, iy1);
+          ctx.fillStyle = COLORS.accent + '33';
+          ctx.fillRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+          ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+          ctx.setLineDash([]);
+        }
+      }
     }
     // Seams — green highlight where two rooms touch along an axis-aligned
     // wall. The build pass merges these into open passages between rooms.
@@ -3850,7 +4129,26 @@ function ShapeShifter() {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(r.label, c2.x, c2.y);
     }
-  }, [rooms, connections, selectedId, pendingConnect, view, previewMap, screenToWorld, worldToScreen, roomById]);
+    // User-placed things (visible in all edit modes, interactive only in
+    // THINGS mode).
+    for (const t of thingsList) {
+      const info = SHAPESHIFTER_THING_LOOKUP.get(t.type);
+      const color = info?.color || COLORS.thing;
+      const p = worldToScreen(t.x, t.y);
+      const selected = t.id === selectedThingId;
+      const radius = selected ? 9 : 6;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = selected ? 2 : 1;
+      ctx.strokeStyle = selected ? COLORS.amber : '#000';
+      ctx.stroke();
+      const a = (t.angle || 0) * Math.PI / 180;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x + Math.cos(a) * (radius + 6), p.y - Math.sin(a) * (radius + 6));
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
+    }
+  }, [rooms, connections, selectedId, pendingConnect, view, previewMap, thingsList, selectedThingId, mode, screenToWorld, worldToScreen, roomById]);
 
   return (
     <div className="w-full h-screen flex flex-col overflow-hidden select-none"
@@ -3859,7 +4157,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.2</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.5</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (
@@ -3872,7 +4170,10 @@ function ShapeShifter() {
             </button>
           )}
           {previewMap && (<>
-            <button onClick={() => { setPreviewMap(null); setHint('Back to editing — drag rooms or draw more connections.'); }}
+            <button onClick={() => {
+                setPreviewMap(null); setSelectedThingId(null);
+                setHint('Back to editing — adjust rooms, connections, or things, then BUILD again.');
+              }}
               style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
                        background: COLORS.bgPanel, color: COLORS.cyan,
                        border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>BACK</button>
@@ -3886,23 +4187,30 @@ function ShapeShifter() {
       {!previewMap && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       display: 'flex', gap: 6, padding: '6px 8px' }}>
-          <button onClick={() => { setTool('place'); setPendingConnect(null); }}
-            style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
-                     color: tool === 'place' ? COLORS.bg : COLORS.cyan,
-                     background: tool === 'place' ? COLORS.cyan : COLORS.bg,
-                     border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>PLACE</button>
-          <button onClick={() => { setTool('connect'); setSelectedId(null); }}
-            style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
-                     color: tool === 'connect' ? COLORS.bg : COLORS.amber,
-                     background: tool === 'connect' ? COLORS.amber : COLORS.bg,
-                     border: '1px solid ' + COLORS.amber, borderRadius: 4 }}>CONNECT</button>
+          {['place','connect','things'].map(m => (
+            <button key={m} onClick={() => {
+                setMode(m); setSelectedId(null); setSelectedThingId(null); setPendingConnect(null);
+                if (m === 'place')   setHint('PLACE: tap a chip, drag rooms to fuse.');
+                if (m === 'connect') setHint('CONNECT: tap two rooms to draw a corridor.');
+                if (m === 'things')  setHint('THINGS: pick a thing, tap the canvas to drop it.');
+              }}
+              style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
+                       color: mode === m ? COLORS.bg :
+                              m === 'connect' ? COLORS.amber : m === 'things' ? '#ff8866' : COLORS.cyan,
+                       background: mode === m
+                         ? (m === 'connect' ? COLORS.amber : m === 'things' ? '#ff8866' : COLORS.cyan)
+                         : COLORS.bg,
+                       border: '1px solid ' +
+                         (m === 'connect' ? COLORS.amber : m === 'things' ? '#ff8866' : COLORS.cyan),
+                       borderRadius: 4 }}>{m.toUpperCase()}</button>
+          ))}
           <span style={{ flex: 1 }}/>
           <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim, alignSelf: 'center' }}>
-            {rooms.length}r / {connections.length}c
+            {rooms.length}r / {connections.length}c / {thingsList.length}t
           </span>
         </div>
       )}
-      {!previewMap && tool === 'place' && (
+      {!previewMap && mode === 'place' && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
           {SHAPESHIFTER_PRESETS.map(p => (
@@ -3916,6 +4224,40 @@ function ShapeShifter() {
           ))}
         </div>
       )}
+      {!previewMap && mode === 'things' && (
+        <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                      display: 'flex', gap: 4, padding: '6px 8px', overflowX: 'auto' }}>
+          {Object.keys(SHAPESHIFTER_THINGS).map(cat => (
+            <button key={cat} onClick={() => {
+                setThingCat(cat);
+                const first = SHAPESHIFTER_THINGS[cat][0];
+                if (first) setPickedThingType(first.type);
+              }}
+              style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
+                       color: thingCat === cat ? COLORS.bg : COLORS.cyan,
+                       background: thingCat === cat ? COLORS.cyan : COLORS.bg,
+                       border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>{cat}</button>
+          ))}
+        </div>
+      )}
+      {!previewMap && mode === 'things' && (
+        <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                      overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
+          {(SHAPESHIFTER_THINGS[thingCat] || []).map(t => {
+            const isPicked = pickedThingType === t.type;
+            return (
+              <button key={t.type} onClick={() => setPickedThingType(t.type)}
+                style={{ display: 'inline-block', padding: '6px 10px', marginRight: 6,
+                         fontSize: 11, fontFamily: monoStack,
+                         color: isPicked ? COLORS.bg : t.color,
+                         background: isPicked ? t.color : COLORS.bg,
+                         border: '1px solid ' + t.color, borderRadius: 4 }}>
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <div className="flex-1 relative" style={{ minHeight: 0 }}>
         <canvas ref={canvasRef} className="w-full h-full"
           onPointerDown={onPointerDown} onPointerMove={onPointerMove}
@@ -3927,7 +4269,7 @@ function ShapeShifter() {
                       borderRadius: 4, maxWidth: '70%' }}>
           {hint}
         </div>
-        {!previewMap && selectedId && tool === 'place' && (
+        {!previewMap && selectedId && mode === 'place' && (
           <button onClick={deleteSelected}
             style={{ position: 'absolute', top: 8, right: 8, padding: '6px 10px',
                      background: COLORS.bgPanel, color: '#ff7676',
@@ -3935,6 +4277,18 @@ function ShapeShifter() {
                      fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>
             DELETE
           </button>
+        )}
+        {!previewMap && selectedThingId && mode === 'things' && (
+          <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 6 }}>
+            <button onClick={rotateSelectedThing}
+              style={{ padding: '6px 10px', background: COLORS.bgPanel, color: COLORS.cyan,
+                       border: '1px solid ' + COLORS.cyan, borderRadius: 4,
+                       fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>↻ 45°</button>
+            <button onClick={deleteSelectedThing}
+              style={{ padding: '6px 10px', background: COLORS.bgPanel, color: '#ff7676',
+                       border: '1px solid #ff7676', borderRadius: 4,
+                       fontFamily: monoStack, fontSize: 11, fontWeight: 700 }}>DELETE</button>
+          </div>
         )}
       </div>
     </div>

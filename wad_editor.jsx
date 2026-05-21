@@ -690,9 +690,9 @@ function generateDungeon() {
 }
 
 // ShapeShifter: drive the dungeon generator from user-placed rooms +
-// user-drawn corridor pairs. Returns a full map in the same shape as
-// generateDungeon().
-function generateShapeShifterMap(roomSpecs, connectionSpecs) {
+// user-drawn corridor pairs + (optional) user-placed things. Returns a
+// full map in the same shape as generateDungeon().
+function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
   const rooms = roomSpecs.map((s) => ({
     type: s.type,
     cx: s.cx | 0, cy: s.cy | 0,
@@ -708,7 +708,8 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs) {
       corridors.push({ a, b });
     }
   }
-  return _generateDungeonOnce({ rooms, corridors });
+  const userThings = thingSpecs && thingSpecs.length ? thingSpecs : null;
+  return _generateDungeonOnce({ rooms, corridors, userThings });
 }
 
 // Room presets — the predefined "library" the user picks from in
@@ -1826,6 +1827,91 @@ function _generateDungeonOnce(opts) {
     }
   });
 
+  // -------- 7b. Fuse touching / partially-overlapping room walls --------
+  // When two rooms are placed so their outer walls share a line segment
+  // (touching exactly OR partially overlapping), split each wall at the
+  // other's endpoints so the shared portion becomes a single line, then
+  // merge identical one-sided wall pairs into a two-sided passable line.
+  // This is the "drag rooms together to build larger shapes" mechanic —
+  // the engine sees the user's intent and dissolves the inner walls.
+  {
+    function cloneSidedef(sdId) {
+      if (sdId === -1) return -1;
+      const src = sidedefs.find(s => s.id === sdId);
+      if (!src) return -1;
+      const nid = 'sd' + sidedefs.length;
+      sidedefs.push({ ...src, id: nid });
+      return nid;
+    }
+    function trySplitAt(line, atV) {
+      if (line.v1 === atV || line.v2 === atV) return null;
+      const v = verts.find(x => x.id === atV);
+      const a = verts.find(x => x.id === line.v1);
+      const b = verts.find(x => x.id === line.v2);
+      if (!v || !a || !b) return null;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1) return null;
+      const t = ((v.x - a.x) * dx + (v.y - a.y) * dy) / lenSq;
+      if (t <= 0.001 || t >= 0.999) return null;
+      const projX = a.x + t * dx, projY = a.y + t * dy;
+      if ((v.x - projX) ** 2 + (v.y - projY) ** 2 > 1) return null;
+      const half2 = {
+        ...line, id: 'l' + linedefs.length, v1: atV,
+        front: cloneSidedef(line.front), back: cloneSidedef(line.back),
+      };
+      line.v2 = atV;
+      return half2;
+    }
+    // Iterate: collect endpoints of all one-sided walls, split any line
+    // passing through one of them. Repeat until stable.
+    let safety = 200;
+    let changed = true;
+    while (changed && safety-- > 0) {
+      changed = false;
+      const endpoints = new Set();
+      for (const l of linedefs) {
+        if (l.back === -1) { endpoints.add(l.v1); endpoints.add(l.v2); }
+      }
+      for (const vid of endpoints) {
+        for (let i = 0; i < linedefs.length; i++) {
+          const half2 = trySplitAt(linedefs[i], vid);
+          if (half2) { linedefs.push(half2); changed = true; }
+        }
+      }
+    }
+    // Merge identical one-sided wall pairs (between DIFFERENT sectors) into
+    // a single two-sided passable line. Clears the front wall texture.
+    const removed = new Set();
+    for (let i = 0; i < linedefs.length; i++) {
+      if (removed.has(i)) continue;
+      const l1 = linedefs[i];
+      if (l1.back !== -1) continue;
+      for (let j = i + 1; j < linedefs.length; j++) {
+        if (removed.has(j)) continue;
+        const l2 = linedefs[j];
+        if (l2.back !== -1) continue;
+        const sameVerts = (l1.v1 === l2.v1 && l1.v2 === l2.v2) ||
+                          (l1.v1 === l2.v2 && l1.v2 === l2.v1);
+        if (!sameVerts) continue;
+        const fs1 = sidedefs.find(s => s.id === l1.front);
+        const fs2 = sidedefs.find(s => s.id === l2.front);
+        if (!fs1 || !fs2 || fs1.sector === fs2.sector) continue;
+        l1.back = l2.front;
+        l1.flags = (l1.flags | 4) & ~1;
+        if (fs1.middle && fs1.middle !== '-' &&
+            fs1.middle !== 'DOORTRAK' && fs1.middle !== 'SW1EXIT') {
+          fs1.middle = '-';
+        }
+        removed.add(j);
+        break;
+      }
+    }
+    for (let i = linedefs.length - 1; i >= 0; i--) {
+      if (removed.has(i)) linedefs.splice(i, 1);
+    }
+  }
+
   // -------- 8. Apply door specials --------
   // Each line touching a doorBody becomes a DR-1 door so USE opens it from
   // EITHER side (corridor or room). The line's back must be the door body
@@ -1926,7 +2012,22 @@ function _generateDungeonOnce(opts) {
   }
 
   // -------- 9. Place things --------
-  const things = [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
+  // ShapeShifter override: when the caller supplies userThings (placed by
+  // the user before BUILD), use those verbatim instead of auto-generating
+  // monsters, items, and decorations. The exit-post block below still runs
+  // so the user always gets a working exit, even if they didn't place a
+  // P1 start manually we'll insert one at the first room.
+  const userThings = opts && opts.userThings;
+  const things = userThings
+    ? userThings.map((t, i) => ({
+        id: 't' + i, x: t.x | 0, y: t.y | 0,
+        angle: t.angle | 0, type: t.type, flags: t.flags == null ? 7 : t.flags,
+      }))
+    : [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
+  if (userThings && !things.some(t => t.type === 1)) {
+    things.unshift({ id: 'tps', x: rooms[0].cx | 0, y: rooms[0].cy | 0,
+      angle: 90, type: 1, flags: 7 });
+  }
   // Per-zone monster archetypes — combat theme matches palette. Techbase
   // walls draw human grunts; hellish stone draws demons and cacos. Doom
   // type IDs: 3001 imp, 3002 pinky, 3003 baron, 3004 zombie, 9 sergeant,
@@ -1963,8 +2064,9 @@ function _generateDungeonOnce(opts) {
     reactor:     { types: [85, 2035, 70],       count: [3, 5] },
     gallery:     { types: [34, 35, 31],         count: [3, 5] },
   };
-  // Vary monster count by room size — bigger rooms host more.
-  rooms.forEach((r, i) => {
+  // Vary monster count by room size — bigger rooms host more. Skip
+  // entirely when the user supplied an explicit thing list.
+  if (!userThings) rooms.forEach((r, i) => {
     if (i === 0) return; // start room empty
     const bb = roomBBox(r);
     const area = (bb.maxX - bb.minX) * (bb.maxY - bb.minY);
@@ -3603,16 +3705,16 @@ function findShapeShifterSeams(rooms) {
 function ShapeShifter() {
   const [rooms, setRooms] = useState([]);
   const [connections, setConnections] = useState([]); // [{ id, fromId, toId, valid }]
-  const [tool, setTool] = useState('place'); // 'place' | 'connect'
-  const [selectedId, setSelectedId] = useState(null);
-  const [pendingConnect, setPendingConnect] = useState(null); // roomId waiting for second tap
+  const [thingsList, setThingsList] = useState([]);   // user-placed things (pre-build)
+  const [mode, setMode] = useState('place'); // 'place' | 'connect' | 'things'
+  const [selectedId, setSelectedId] = useState(null);          // selected ROOM
+  const [selectedThingId, setSelectedThingId] = useState(null); // selected THING
+  const [pendingConnect, setPendingConnect] = useState(null);
+  const [thingCat, setThingCat] = useState('PLAYER');
+  const [pickedThingType, setPickedThingType] = useState(1);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
-  const [hint, setHint] = useState('Pick a room style to add it to the canvas.');
+  const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
-  const [thingsList, setThingsList] = useState([]); // editable things list in THINGS stage
-  const [thingCat, setThingCat] = useState('MONSTER'); // category in THINGS stage
-  const [pickedThingType, setPickedThingType] = useState(3001); // imp by default
-  const [selectedThingId, setSelectedThingId] = useState(null);
   const canvasRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef(null);
@@ -3702,11 +3804,13 @@ function ShapeShifter() {
       const specs = rooms.map(r => ({
         type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
       }));
-      const map = generateShapeShifterMap(specs, connections);
+      const thingSpecs = thingsList.map(t => ({
+        type: t.type, x: t.x, y: t.y, angle: t.angle | 0, flags: t.flags | 7,
+      }));
+      const map = generateShapeShifterMap(specs, connections, thingSpecs);
       setPreviewMap(map);
-      setThingsList(map.things.map(t => ({ ...t })));
       setSelectedThingId(null);
-      setHint('Built. Tap a thing chip then tap the canvas to place it.');
+      setHint('Built. PLAY / SAVE to export, BACK to keep editing.');
     } catch (e) {
       setHint('Build failed: ' + e.message);
     }
@@ -3792,28 +3896,6 @@ function ShapeShifter() {
     const rect = canvasRef.current.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     pointersRef.current.set(e.pointerId, { sx, sy, startX: sx, startY: sy, t: Date.now() });
-    if (previewMap) {
-      // THINGS stage
-      if (pointersRef.current.size === 2) {
-        const [a, b] = [...pointersRef.current.values()];
-        gestureRef.current = { kind: 'pinch',
-          startDist: Math.hypot(a.sx - b.sx, a.sy - b.sy),
-          startZoom: view.zoom, startView: { x: view.x, y: view.y } };
-        return;
-      }
-      const ht = hitThing(sx, sy);
-      if (ht) {
-        setSelectedThingId(ht.id);
-        const w = screenToWorld(sx, sy);
-        gestureRef.current = { kind: 'thingDrag', id: ht.id, offsetX: ht.x - w.x, offsetY: ht.y - w.y };
-      } else {
-        const w = screenToWorld(sx, sy);
-        // Tap empty canvas → drop the selected thing type here.
-        placeThing(w.x, w.y);
-        gestureRef.current = { kind: 'tap' };
-      }
-      return;
-    }
     if (pointersRef.current.size === 2) {
       const [a, b] = [...pointersRef.current.values()];
       gestureRef.current = { kind: 'pinch',
@@ -3821,8 +3903,12 @@ function ShapeShifter() {
         startZoom: view.zoom, startView: { x: view.x, y: view.y } };
       return;
     }
-    const hit = hitRoom(sx, sy);
-    if (tool === 'connect') {
+    if (previewMap) {
+      gestureRef.current = { kind: 'pan', startView: { x: view.x, y: view.y } };
+      return;
+    }
+    if (mode === 'connect') {
+      const hit = hitRoom(sx, sy);
       if (hit) {
         if (pendingConnect && pendingConnect !== hit.id) {
           tryConnectRooms(pendingConnect, hit.id);
@@ -3839,7 +3925,21 @@ function ShapeShifter() {
       }
       return;
     }
-    // place mode
+    if (mode === 'things') {
+      const ht = hitThing(sx, sy);
+      if (ht) {
+        setSelectedThingId(ht.id);
+        const w = screenToWorld(sx, sy);
+        gestureRef.current = { kind: 'thingDrag', id: ht.id, offsetX: ht.x - w.x, offsetY: ht.y - w.y };
+      } else {
+        const w = screenToWorld(sx, sy);
+        placeThing(w.x, w.y);
+        gestureRef.current = { kind: 'tap' };
+      }
+      return;
+    }
+    // PLACE mode
+    const hit = hitRoom(sx, sy);
     if (hit) {
       setSelectedId(hit.id);
       const w = screenToWorld(sx, sy);
@@ -3952,23 +4052,18 @@ function ShapeShifter() {
         ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
       }
       ctx.stroke();
-      // Things (user-editable)
-      for (const t of thingsList) {
+      // Things from the built map (includes any auto-inserted P1 start)
+      for (const t of previewMap.things) {
         const info = SHAPESHIFTER_THING_LOOKUP.get(t.type);
         const color = info?.color || COLORS.thing;
         const p = worldToScreen(t.x, t.y);
-        const selected = t.id === selectedThingId;
-        const radius = selected ? 9 : 6;
         ctx.fillStyle = color;
-        ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
-        ctx.lineWidth = selected ? 2 : 1;
-        ctx.strokeStyle = selected ? COLORS.amber : '#000';
-        ctx.stroke();
-        // facing-angle tick
+        ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill();
+        ctx.lineWidth = 1; ctx.strokeStyle = '#000'; ctx.stroke();
         const a = (t.angle || 0) * Math.PI / 180;
         ctx.beginPath();
         ctx.moveTo(p.x, p.y);
-        ctx.lineTo(p.x + Math.cos(a) * (radius + 6), p.y - Math.sin(a) * (radius + 6));
+        ctx.lineTo(p.x + Math.cos(a) * 12, p.y - Math.sin(a) * 12);
         ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
       }
       return;
@@ -4034,7 +4129,26 @@ function ShapeShifter() {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(r.label, c2.x, c2.y);
     }
-  }, [rooms, connections, selectedId, pendingConnect, view, previewMap, thingsList, selectedThingId, screenToWorld, worldToScreen, roomById]);
+    // User-placed things (visible in all edit modes, interactive only in
+    // THINGS mode).
+    for (const t of thingsList) {
+      const info = SHAPESHIFTER_THING_LOOKUP.get(t.type);
+      const color = info?.color || COLORS.thing;
+      const p = worldToScreen(t.x, t.y);
+      const selected = t.id === selectedThingId;
+      const radius = selected ? 9 : 6;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = selected ? 2 : 1;
+      ctx.strokeStyle = selected ? COLORS.amber : '#000';
+      ctx.stroke();
+      const a = (t.angle || 0) * Math.PI / 180;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x + Math.cos(a) * (radius + 6), p.y - Math.sin(a) * (radius + 6));
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
+    }
+  }, [rooms, connections, selectedId, pendingConnect, view, previewMap, thingsList, selectedThingId, mode, screenToWorld, worldToScreen, roomById]);
 
   return (
     <div className="w-full h-screen flex flex-col overflow-hidden select-none"
@@ -4043,7 +4157,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.4</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.5</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (
@@ -4057,8 +4171,8 @@ function ShapeShifter() {
           )}
           {previewMap && (<>
             <button onClick={() => {
-                setPreviewMap(null); setThingsList([]); setSelectedThingId(null);
-                setHint('Back to editing — drag rooms to fuse, draw connections, then BUILD.');
+                setPreviewMap(null); setSelectedThingId(null);
+                setHint('Back to editing — adjust rooms, connections, or things, then BUILD again.');
               }}
               style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
                        background: COLORS.bgPanel, color: COLORS.cyan,
@@ -4073,23 +4187,30 @@ function ShapeShifter() {
       {!previewMap && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       display: 'flex', gap: 6, padding: '6px 8px' }}>
-          <button onClick={() => { setTool('place'); setPendingConnect(null); }}
-            style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
-                     color: tool === 'place' ? COLORS.bg : COLORS.cyan,
-                     background: tool === 'place' ? COLORS.cyan : COLORS.bg,
-                     border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>PLACE</button>
-          <button onClick={() => { setTool('connect'); setSelectedId(null); }}
-            style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
-                     color: tool === 'connect' ? COLORS.bg : COLORS.amber,
-                     background: tool === 'connect' ? COLORS.amber : COLORS.bg,
-                     border: '1px solid ' + COLORS.amber, borderRadius: 4 }}>CONNECT</button>
+          {['place','connect','things'].map(m => (
+            <button key={m} onClick={() => {
+                setMode(m); setSelectedId(null); setSelectedThingId(null); setPendingConnect(null);
+                if (m === 'place')   setHint('PLACE: tap a chip, drag rooms to fuse.');
+                if (m === 'connect') setHint('CONNECT: tap two rooms to draw a corridor.');
+                if (m === 'things')  setHint('THINGS: pick a thing, tap the canvas to drop it.');
+              }}
+              style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
+                       color: mode === m ? COLORS.bg :
+                              m === 'connect' ? COLORS.amber : m === 'things' ? '#ff8866' : COLORS.cyan,
+                       background: mode === m
+                         ? (m === 'connect' ? COLORS.amber : m === 'things' ? '#ff8866' : COLORS.cyan)
+                         : COLORS.bg,
+                       border: '1px solid ' +
+                         (m === 'connect' ? COLORS.amber : m === 'things' ? '#ff8866' : COLORS.cyan),
+                       borderRadius: 4 }}>{m.toUpperCase()}</button>
+          ))}
           <span style={{ flex: 1 }}/>
           <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim, alignSelf: 'center' }}>
-            {rooms.length}r / {connections.length}c
+            {rooms.length}r / {connections.length}c / {thingsList.length}t
           </span>
         </div>
       )}
-      {!previewMap && tool === 'place' && (
+      {!previewMap && mode === 'place' && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
           {SHAPESHIFTER_PRESETS.map(p => (
@@ -4103,7 +4224,7 @@ function ShapeShifter() {
           ))}
         </div>
       )}
-      {previewMap && (
+      {!previewMap && mode === 'things' && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       display: 'flex', gap: 4, padding: '6px 8px', overflowX: 'auto' }}>
           {Object.keys(SHAPESHIFTER_THINGS).map(cat => (
@@ -4119,7 +4240,7 @@ function ShapeShifter() {
           ))}
         </div>
       )}
-      {previewMap && (
+      {!previewMap && mode === 'things' && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
           {(SHAPESHIFTER_THINGS[thingCat] || []).map(t => {
@@ -4148,7 +4269,7 @@ function ShapeShifter() {
                       borderRadius: 4, maxWidth: '70%' }}>
           {hint}
         </div>
-        {!previewMap && selectedId && tool === 'place' && (
+        {!previewMap && selectedId && mode === 'place' && (
           <button onClick={deleteSelected}
             style={{ position: 'absolute', top: 8, right: 8, padding: '6px 10px',
                      background: COLORS.bgPanel, color: '#ff7676',
@@ -4157,7 +4278,7 @@ function ShapeShifter() {
             DELETE
           </button>
         )}
-        {previewMap && selectedThingId && (
+        {!previewMap && selectedThingId && mode === 'things' && (
           <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', gap: 6 }}>
             <button onClick={rotateSelectedThing}
               style={{ padding: '6px 10px', background: COLORS.bgPanel, color: COLORS.cyan,

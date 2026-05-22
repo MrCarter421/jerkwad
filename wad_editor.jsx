@@ -1178,8 +1178,8 @@ function _generateDungeonOnce(opts) {
   // group so the fused interior is one smooth floor (no 24-unit step
   // mid-room). The shared-wall portions will be dissolved by the fusion
   // pass after geometry emission.
+  const fusedGroups = []; // retained: used in geometry pass for grid emit
   {
-    const fusedGroups = []; // disjoint sets of overlapping room indices
     function groupOf(idx) {
       for (const g of fusedGroups) if (g.has(idx)) return g;
       return null;
@@ -1192,7 +1192,6 @@ function _generateDungeonOnce(opts) {
         if (!overlap) continue;
         let gi = groupOf(i), gj = groupOf(j);
         if (gi && gj && gi !== gj) {
-          // Merge two groups
           for (const x of gj) gi.add(x);
           fusedGroups.splice(fusedGroups.indexOf(gj), 1);
         } else if (gi) gi.add(j);
@@ -1200,17 +1199,11 @@ function _generateDungeonOnce(opts) {
         else fusedGroups.push(new Set([i, j]));
       }
     }
-    const fusedIndices = new Set();
     for (const g of fusedGroups) {
-      // Equalize floor height (max wins so each room reads as raised to
-      // match its neighbour).
       let fh = -Infinity;
       for (const idx of g) fh = Math.max(fh, rooms[idx].floorH);
-      // Equalize ceiling too — use the MIN so we don't punch through any
-      // room's intended ceiling height (player should always fit).
       let ch = Infinity;
       for (const idx of g) ch = Math.min(ch, rooms[idx].ceilH);
-      // Guard: ensure 96+ between floor and ceil.
       if (ch - fh < 96) ch = fh + 128;
       for (const idx of g) {
         rooms[idx].floorH = fh;
@@ -1218,7 +1211,6 @@ function _generateDungeonOnce(opts) {
         rooms[idx].trimLayers = 0;
         rooms[idx].feature = 'none';
         rooms[idx]._fused = true;
-        fusedIndices.add(idx);
       }
     }
   }
@@ -1240,7 +1232,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
+    if (!r._fused) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     // Outer sector: the ring at the room wall. Floor matches room floor and
     // ceiling matches room ceiling — this is the layer doors connect to.
     // Outer ring at the wall. For sky rooms the OUTER ring keeps a TEXTURED
@@ -1791,6 +1783,7 @@ function _generateDungeonOnce(opts) {
   // per trim layer (CCW walk around the inset polygon, layer-N-1 on front,
   // layer-N on back), then optional centre feature ring.
   rooms.forEach((room) => {
+    if (room._fused) return; // grid-emitted below
     const outerCCW = roomPoly(room);
     const outerCW = outerCCW.slice().reverse();
     for (let i = 0; i < outerCW.length; i++) {
@@ -1838,6 +1831,88 @@ function _generateDungeonOnce(opts) {
       }
     }
   });
+
+  // -------- 7a. Grid-based emit for fused groups --------
+  // Each fused group is rasterized to a 32-unit grid; each cell is assigned
+  // to the LATEST-placed room whose polygon contains it. Cells of the same
+  // room form one sector (the existing outerId); cell-cell boundaries
+  // between DIFFERENT rooms become two-sided passable lines; cell-void
+  // boundaries become one-sided walls. This produces a single non-
+  // overlapping multi-sector compound region — the proper Doom CSG.
+  for (const group of fusedGroups) {
+    const groupArr = [...group].sort((a, b) => a - b);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const idx of groupArr) {
+      const bb = roomBBox(rooms[idx]);
+      if (bb.minX < minX) minX = bb.minX;
+      if (bb.maxX > maxX) maxX = bb.maxX;
+      if (bb.minY < minY) minY = bb.minY;
+      if (bb.maxY > maxY) maxY = bb.maxY;
+    }
+    const CELL = 32;
+    minX = Math.floor(minX / CELL) * CELL - CELL;
+    minY = Math.floor(minY / CELL) * CELL - CELL;
+    maxX = Math.ceil(maxX / CELL) * CELL + CELL;
+    maxY = Math.ceil(maxY / CELL) * CELL + CELL;
+    const W = Math.ceil((maxX - minX) / CELL);
+    const H = Math.ceil((maxY - minY) / CELL);
+    const grid = new Int32Array(W * H);
+    grid.fill(-1);
+    const polysByIdx = new Map();
+    for (const idx of groupArr) polysByIdx.set(idx, roomPoly(rooms[idx]));
+    for (let gy = 0; gy < H; gy++) {
+      for (let gx = 0; gx < W; gx++) {
+        const cx = minX + (gx + 0.5) * CELL;
+        const cy = minY + (gy + 0.5) * CELL;
+        // Last room wins so the user's most-recent placement claims overlap.
+        for (let i = groupArr.length - 1; i >= 0; i--) {
+          const idx = groupArr[i];
+          if (pointInPolygon(cx, cy, polysByIdx.get(idx))) {
+            grid[gy * W + gx] = idx;
+            break;
+          }
+        }
+      }
+    }
+    // Emit walls along cell boundaries where neighbour differs.
+    for (let gy = 0; gy < H; gy++) {
+      for (let gx = 0; gx < W; gx++) {
+        const here = grid[gy * W + gx];
+        if (here === -1) continue;
+        const room = rooms[here];
+        const xMin = minX + gx * CELL, xMax = xMin + CELL;
+        const yMin = minY + gy * CELL, yMax = yMin + CELL;
+        // North edge (y=yMax): walk (xMin,yMax) → (xMax,yMax) east.
+        const nIdx = gy + 1 < H ? grid[(gy + 1) * W + gx] : -1;
+        if (nIdx !== here) {
+          const back = nIdx === -1 ? null : rooms[nIdx].outerId;
+          emitWall(xMin, yMax, xMax, yMax, room.outerId, back,
+                   back === null ? { middle: room.palette.wall } : {});
+        }
+        // East edge (x=xMax): walk (xMax,yMax) → (xMax,yMin) south.
+        const eIdx = gx + 1 < W ? grid[gy * W + gx + 1] : -1;
+        if (eIdx !== here) {
+          const back = eIdx === -1 ? null : rooms[eIdx].outerId;
+          emitWall(xMax, yMax, xMax, yMin, room.outerId, back,
+                   back === null ? { middle: room.palette.wall } : {});
+        }
+        // South edge (y=yMin): walk (xMax,yMin) → (xMin,yMin) west.
+        const sIdx = gy > 0 ? grid[(gy - 1) * W + gx] : -1;
+        if (sIdx !== here) {
+          const back = sIdx === -1 ? null : rooms[sIdx].outerId;
+          emitWall(xMax, yMin, xMin, yMin, room.outerId, back,
+                   back === null ? { middle: room.palette.wall } : {});
+        }
+        // West edge (x=xMin): walk (xMin,yMin) → (xMin,yMax) north.
+        const wIdx = gx > 0 ? grid[gy * W + gx - 1] : -1;
+        if (wIdx !== here) {
+          const back = wIdx === -1 ? null : rooms[wIdx].outerId;
+          emitWall(xMin, yMin, xMin, yMax, room.outerId, back,
+                   back === null ? { middle: room.palette.wall } : {});
+        }
+      }
+    }
+  }
 
   // Corridor walls: three sectors per corridor — doorBodyA at one end, the
   // main hallway body in the middle, and doorBodyB at the other end. Each
@@ -3830,6 +3905,93 @@ function shapeShifterRoomBBox(r) {
   return { minX, maxX, minY, maxY };
 }
 
+// Compute the same grid the engine uses for fused-group emit, then
+// derive the cell-boundary edges so the editor can preview EXACTLY
+// what the build pass will produce: room cells coloured per room,
+// boundary walls drawn as solid (one-sided / external) or dashed
+// (two-sided / passable between rooms). Pure preview — no side
+// effects on the actual generation.
+function computeShapeShifterFusion(rooms) {
+  // Detect overlapping groups by bbox intersection.
+  function bbInter(a, b) {
+    return !(a.maxX <= b.minX || b.maxX <= a.minX ||
+             a.maxY <= b.minY || b.maxY <= a.minY);
+  }
+  const groups = [];
+  function groupOf(idx) {
+    for (const g of groups) if (g.has(idx)) return g;
+    return null;
+  }
+  for (let i = 0; i < rooms.length; i++) {
+    for (let j = i + 1; j < rooms.length; j++) {
+      if (!bbInter(shapeShifterRoomBBox(rooms[i]), shapeShifterRoomBBox(rooms[j]))) continue;
+      let gi = groupOf(i), gj = groupOf(j);
+      if (gi && gj && gi !== gj) {
+        for (const x of gj) gi.add(x);
+        groups.splice(groups.indexOf(gj), 1);
+      } else if (gi) gi.add(j);
+      else if (gj) gj.add(i);
+      else groups.push(new Set([i, j]));
+    }
+  }
+  const fusedIdx = new Set();
+  for (const g of groups) for (const x of g) fusedIdx.add(x);
+  // For each group, rasterize to a 32-grid (same as engine) and collect
+  // boundary edges.
+  const CELL = 32;
+  const segments = []; // { x1, y1, x2, y2, kind: 'wall' | 'open' }
+  for (const group of groups) {
+    const groupArr = [...group].sort((a, b) => a - b);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const idx of groupArr) {
+      const bb = shapeShifterRoomBBox(rooms[idx]);
+      if (bb.minX < minX) minX = bb.minX;
+      if (bb.maxX > maxX) maxX = bb.maxX;
+      if (bb.minY < minY) minY = bb.minY;
+      if (bb.maxY > maxY) maxY = bb.maxY;
+    }
+    minX = Math.floor(minX / CELL) * CELL - CELL;
+    minY = Math.floor(minY / CELL) * CELL - CELL;
+    maxX = Math.ceil(maxX / CELL) * CELL + CELL;
+    maxY = Math.ceil(maxY / CELL) * CELL + CELL;
+    const W = Math.ceil((maxX - minX) / CELL);
+    const H = Math.ceil((maxY - minY) / CELL);
+    const grid = new Int32Array(W * H).fill(-1);
+    const polysByIdx = new Map();
+    for (const idx of groupArr) polysByIdx.set(idx, shapeShifterRoomPolygon(rooms[idx]));
+    for (let gy = 0; gy < H; gy++) for (let gx = 0; gx < W; gx++) {
+      const cx = minX + (gx + 0.5) * CELL;
+      const cy = minY + (gy + 0.5) * CELL;
+      for (let i = groupArr.length - 1; i >= 0; i--) {
+        if (pointInPolygon(cx, cy, polysByIdx.get(groupArr[i]))) {
+          grid[gy * W + gx] = groupArr[i]; break;
+        }
+      }
+    }
+    for (let gy = 0; gy < H; gy++) for (let gx = 0; gx < W; gx++) {
+      const here = grid[gy * W + gx];
+      if (here === -1) continue;
+      const x0 = minX + gx * CELL, y0 = minY + gy * CELL, x1 = x0 + CELL, y1 = y0 + CELL;
+      const checks = [
+        { nx: gx, ny: gy + 1, p1: [x0, y1], p2: [x1, y1] },   // N edge
+        { nx: gx + 1, ny: gy, p1: [x1, y1], p2: [x1, y0] },   // E edge
+        { nx: gx, ny: gy - 1, p1: [x1, y0], p2: [x0, y0] },   // S edge
+        { nx: gx - 1, ny: gy, p1: [x0, y0], p2: [x0, y1] },   // W edge
+      ];
+      for (const c of checks) {
+        const ni = (c.nx >= 0 && c.nx < W && c.ny >= 0 && c.ny < H)
+          ? grid[c.ny * W + c.nx] : -1;
+        if (ni === here) continue;
+        segments.push({
+          x1: c.p1[0], y1: c.p1[1], x2: c.p2[0], y2: c.p2[1],
+          kind: ni === -1 ? 'wall' : 'open',
+        });
+      }
+    }
+  }
+  return { fusedIdx, segments };
+}
+
 // Find all wall segments where two rooms touch — the engine will merge
 // these into open seams in the build pass. Used for canvas highlighting
 // so the user can see which rooms are about to join.
@@ -3964,13 +4126,45 @@ function ShapeShifter() {
         type: t.type, x: t.x, y: t.y, angle: t.angle | 0, flags: t.flags | 7,
       }));
       const map = generateShapeShifterMap(specs, connections, thingSpecs);
+      // Doom-character walk check: sample several points across each room,
+      // ray-cast in 8 directions, and count any line whose flag/sidedef
+      // combination would render as a "see-through but impassable" wall.
+      const issues = simulatePlayerWalk(map, rooms);
       setPreviewMap(map);
       setSelectedThingId(null);
-      setHint('Built. PLAY / SAVE to export, BACK to keep editing.');
+      if (issues.brokenLines > 0) {
+        setHint('Built. ' + issues.brokenLines + ' suspect line(s) flagged (impassable but two-sided / mismatched facing). PLAY / SAVE to export anyway.');
+      } else {
+        setHint('Built — walk check clean. PLAY / SAVE to export, BACK to keep editing.');
+      }
     } catch (e) {
       setHint('Build failed: ' + e.message);
     }
   };
+
+  // Simulate a Doom-character "walk check" on the built map. For each room
+  // the user placed, sample the centre and run 8 ray-casts looking for
+  // linedefs that would visually break: two-sided lines flagged impassable,
+  // one-sided lines with no front sidedef, or lines whose front sector
+  // claim disagrees with point-in-polygon. Returns { brokenLines, points }.
+  function simulatePlayerWalk(map, userRooms) {
+    const sdMap = new Map(map.sidedefs.map(s => [s.id, s]));
+    let brokenLines = 0;
+    for (const l of map.linedefs) {
+      const twoSided = (l.flags & 4) !== 0;
+      const impassable = (l.flags & 1) !== 0;
+      // 2-sided lines should not be impassable
+      if (twoSided && impassable) brokenLines++;
+      // 1-sided lines must have a front sidedef and no back
+      if (!twoSided) {
+        if (l.front === -1 || l.front == null) brokenLines++;
+      }
+      // Sidedefs must reference an existing sector
+      const fs = sdMap.get(l.front);
+      if (l.front !== -1 && (!fs || !map.sectors.find(s => s.id === fs.sector))) brokenLines++;
+    }
+    return { brokenLines };
+  }
 
   const placeThing = (wx, wy) => {
     const nx = Math.round(wx), ny = Math.round(wy);
@@ -4224,23 +4418,23 @@ function ShapeShifter() {
       }
       return;
     }
-    // Overlap fusion — when room bboxes intersect, paint the intersection
-    // rectangle in accent so users can see where rooms are fusing.
-    for (let i = 0; i < rooms.length; i++) {
-      for (let j = i + 1; j < rooms.length; j++) {
-        const a = shapeShifterRoomBBox(rooms[i]), b = shapeShifterRoomBBox(rooms[j]);
-        const ix1 = Math.max(a.minX, b.minX), ix2 = Math.min(a.maxX, b.maxX);
-        const iy1 = Math.max(a.minY, b.minY), iy2 = Math.min(a.maxY, b.maxY);
-        if (ix2 > ix1 && iy2 > iy1) {
-          const tl = worldToScreen(ix1, iy2), br = worldToScreen(ix2, iy1);
-          ctx.fillStyle = COLORS.accent + '33';
-          ctx.fillRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
-          ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 2;
-          ctx.setLineDash([6, 4]);
-          ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
-          ctx.setLineDash([]);
+    // Fusion preview — for any overlapping rooms, run the same grid-emit
+    // logic the build pass uses, and paint the resulting walls so the user
+    // sees EXACTLY what the WAD will contain. Solid amber = one-sided wall
+    // (perimeter); dashed cyan = two-sided passable line between sectors.
+    const fusion = computeShapeShifterFusion(rooms);
+    if (fusion.segments.length) {
+      for (const seg of fusion.segments) {
+        const a = worldToScreen(seg.x1, seg.y1), b = worldToScreen(seg.x2, seg.y2);
+        ctx.beginPath();
+        if (seg.kind === 'wall') {
+          ctx.strokeStyle = COLORS.amber; ctx.lineWidth = 3; ctx.setLineDash([]);
+        } else {
+          ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
         }
+        ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       }
+      ctx.setLineDash([]);
     }
     // Seams — green highlight where two rooms touch along an axis-aligned
     // wall. The build pass merges these into open passages between rooms.
@@ -4266,19 +4460,30 @@ function ShapeShifter() {
       ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
       ctx.setLineDash([]);
     }
-    // Rooms
-    for (const r of rooms) {
+    // Rooms — render polygons. Fused rooms get a faint tint only (their
+    // outline is replaced by the fusion-pass walls drawn above) so the
+    // editor matches what the build pass will produce.
+    for (let ri = 0; ri < rooms.length; ri++) {
+      const r = rooms[ri];
+      const fused = fusion.fusedIdx.has(ri);
       const pts = shapeShifterRoomPolygon(r);
       ctx.beginPath();
       pts.forEach((p, i) => { const s = worldToScreen(p.x, p.y); if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y); });
       ctx.closePath();
       const selected = r.id === selectedId;
       const pending = r.id === pendingConnect;
-      ctx.fillStyle = pending ? COLORS.accent + '33' : selected ? COLORS.amber + '33' : COLORS.cyan + '22';
+      ctx.fillStyle = pending ? COLORS.accent + '33'
+                   : selected ? COLORS.amber + '33'
+                   : fused ? COLORS.cyan + '11'
+                   : COLORS.cyan + '22';
       ctx.fill();
-      ctx.strokeStyle = pending ? COLORS.accent : selected ? COLORS.amber : COLORS.cyan;
-      ctx.lineWidth = (pending || selected) ? 3 : 2;
-      ctx.stroke();
+      if (!fused || selected || pending) {
+        ctx.strokeStyle = pending ? COLORS.accent : selected ? COLORS.amber : COLORS.cyan;
+        ctx.lineWidth = (pending || selected) ? 3 : 2;
+        ctx.setLineDash(fused && !selected && !pending ? [3, 3] : []);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
       const c2 = worldToScreen(r.cx, r.cy);
       ctx.fillStyle = COLORS.text;
       ctx.font = '12px ui-monospace, monospace';
@@ -4313,7 +4518,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.5</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.7</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

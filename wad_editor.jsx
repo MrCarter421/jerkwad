@@ -1912,6 +1912,106 @@ function _generateDungeonOnce(opts) {
     }
   }
 
+  // -------- 7c. Phantom wall conversion (overlap fusion cleanup) --------
+  // After fusion merges identical-vertex walls, some one-sided walls may
+  // still be left STUCK INSIDE another room's polygon (when one room is
+  // placed overlapping another, the smaller's perimeter ends up inside
+  // the larger's interior). Doom renders these as phantom walls blocking
+  // movement in the fused interior. Convert any such wall to a two-sided
+  // passable line whose back is the enclosing room's outer sector.
+  {
+    // Pre-compute room outer polygons (cached) for the point-in-polygon test.
+    const roomPolys = rooms.map(r => ({ outerId: r.outerId, poly: roomPoly(r) }));
+    // Set of all sub-sector IDs that belong to a room (so we only flip walls
+    // whose own sector is a room sub-sector, not corridors / door bodies).
+    const roomSecs = new Set();
+    for (const r of rooms) {
+      roomSecs.add(r.outerId);
+      for (const id of r.trimIds || []) roomSecs.add(id);
+      if (r.featureId) roomSecs.add(r.featureId);
+      for (const id of r.pillarSecIds || []) roomSecs.add(id);
+      for (const a of r.alcoves || []) roomSecs.add(a.sectorId);
+    }
+    for (let i = 0; i < linedefs.length; i++) {
+      const l = linedefs[i];
+      if (l.back !== -1) continue;
+      const fs = sidedefs.find(s => s.id === l.front);
+      if (!fs || !roomSecs.has(fs.sector)) continue;
+      const v1 = verts.find(v => v.id === l.v1);
+      const v2 = verts.find(v => v.id === l.v2);
+      if (!v1 || !v2) continue;
+      const mx = (v1.x + v2.x) / 2, my = (v1.y + v2.y) / 2;
+      // Find an enclosing OTHER room (not this wall's own room).
+      let enclosing = null;
+      for (const rp of roomPolys) {
+        if (rp.outerId === fs.sector) continue;
+        // Skip if the wall's own room is a sub-sector of this room.
+        const ownRoom = rooms.find(r =>
+          r.outerId === fs.sector ||
+          (r.trimIds || []).includes(fs.sector) ||
+          r.featureId === fs.sector ||
+          (r.pillarSecIds || []).includes(fs.sector));
+        if (ownRoom && ownRoom.outerId === rp.outerId) continue;
+        if (pointInPolygon(mx, my, rp.poly)) { enclosing = rp; break; }
+      }
+      if (!enclosing) continue;
+      const backSdId = 'sd' + sidedefs.length;
+      sidedefs.push({
+        id: backSdId, xOff: 0, yOff: 0, upper: '-', lower: '-',
+        middle: '-', sector: enclosing.outerId,
+      });
+      l.back = backSdId;
+      l.flags = (l.flags | 4) & ~1;
+      if (fs.middle && fs.middle !== '-' &&
+          fs.middle !== 'DOORTRAK' && fs.middle !== 'SW1EXIT') {
+        fs.middle = '-';
+      }
+    }
+  }
+
+  // -------- 7d. Linedef facing cleanup --------
+  // For each line, verify the front sidedef's sector contains the point
+  // just to the RIGHT of v1→v2 (CW convention). If not, swap front/back
+  // and v1/v2 so the orientation is correct. Skip lines where the front
+  // sector ID isn't found.
+  {
+    const secLookup = new Map(sectors.map(s => [s.id, s]));
+    function pointInSector(px, py, secId) {
+      // Quick check: any room sub-sector with its polygon containing (px, py)
+      for (const r of rooms) {
+        const poly = roomPoly(r);
+        if (!pointInPolygon(px, py, poly)) continue;
+        if (r.outerId === secId) return true;
+        // trim / feature / pillar would be more nuanced but for cleanup
+        // we accept a coarse match
+      }
+      return false;
+    }
+    for (const l of linedefs) {
+      if (l.back === -1) continue; // one-sided: trust the original emit
+      const fs = sidedefs.find(s => s.id === l.front);
+      const bs = sidedefs.find(s => s.id === l.back);
+      if (!fs || !bs) continue;
+      if (fs.sector === bs.sector) continue; // degenerate, skip
+      const v1 = verts.find(v => v.id === l.v1);
+      const v2 = verts.find(v => v.id === l.v2);
+      if (!v1 || !v2) continue;
+      const mx = (v1.x + v2.x) / 2, my = (v1.y + v2.y) / 2;
+      const dx = v2.x - v1.x, dy = v2.y - v1.y;
+      const len = Math.hypot(dx, dy); if (len < 0.001) continue;
+      // Right perpendicular from midpoint, 1 unit
+      const rx = mx + dy / len, ry = my - dx / len;
+      const lx = mx - dy / len, ly = my + dx / len;
+      const frontOnRight = pointInSector(rx, ry, fs.sector);
+      const backOnRight = pointInSector(rx, ry, bs.sector);
+      if (!frontOnRight && backOnRight) {
+        // Flip: front is on the LEFT, back is on the RIGHT. Swap.
+        const tmpSd = l.front; l.front = l.back; l.back = tmpSd;
+        const tmpV = l.v1; l.v1 = l.v2; l.v2 = tmpV;
+      }
+    }
+  }
+
   // -------- 8. Apply door specials --------
   // Each line touching a doorBody becomes a DR-1 door so USE opens it from
   // EITHER side (corridor or room). The line's back must be the door body

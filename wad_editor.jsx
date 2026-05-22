@@ -1170,6 +1170,59 @@ function _generateDungeonOnce(opts) {
     if (!changed) break;
   }
 
+  // -------- 5b. detect overlapping (fused) rooms --------
+  // Rooms whose bounding boxes intersect are being deliberately fused by
+  // the user. Strip their internal detail (trim layers, centre features,
+  // pillars, alcoves) — those things only make sense inside a clean
+  // convex room. Equalize floor heights across each overlap-connected
+  // group so the fused interior is one smooth floor (no 24-unit step
+  // mid-room). The shared-wall portions will be dissolved by the fusion
+  // pass after geometry emission.
+  {
+    const fusedGroups = []; // disjoint sets of overlapping room indices
+    function groupOf(idx) {
+      for (const g of fusedGroups) if (g.has(idx)) return g;
+      return null;
+    }
+    for (let i = 0; i < rooms.length; i++) {
+      for (let j = i + 1; j < rooms.length; j++) {
+        const a = roomBBox(rooms[i]), b = roomBBox(rooms[j]);
+        const overlap = !(a.maxX <= b.minX || b.maxX <= a.minX ||
+                          a.maxY <= b.minY || b.maxY <= a.minY);
+        if (!overlap) continue;
+        let gi = groupOf(i), gj = groupOf(j);
+        if (gi && gj && gi !== gj) {
+          // Merge two groups
+          for (const x of gj) gi.add(x);
+          fusedGroups.splice(fusedGroups.indexOf(gj), 1);
+        } else if (gi) gi.add(j);
+        else if (gj) gj.add(i);
+        else fusedGroups.push(new Set([i, j]));
+      }
+    }
+    const fusedIndices = new Set();
+    for (const g of fusedGroups) {
+      // Equalize floor height (max wins so each room reads as raised to
+      // match its neighbour).
+      let fh = -Infinity;
+      for (const idx of g) fh = Math.max(fh, rooms[idx].floorH);
+      // Equalize ceiling too — use the MIN so we don't punch through any
+      // room's intended ceiling height (player should always fit).
+      let ch = Infinity;
+      for (const idx of g) ch = Math.min(ch, rooms[idx].ceilH);
+      // Guard: ensure 96+ between floor and ceil.
+      if (ch - fh < 96) ch = fh + 128;
+      for (const idx of g) {
+        rooms[idx].floorH = fh;
+        rooms[idx].ceilH = ch;
+        rooms[idx].trimLayers = 0;
+        rooms[idx].feature = 'none';
+        rooms[idx]._fused = true;
+        fusedIndices.add(idx);
+      }
+    }
+  }
+
   // -------- 6. allocate sectors --------
   const sectors = [];
   const allocSec = (props) => {
@@ -1352,7 +1405,10 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r.feature === 'altar') {
+    if (r._fused) {
+      // Fused rooms skip ALL interior detail — pillars, alcoves and centre
+      // features only render correctly inside a clean convex room.
+    } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
     } else if (r.feature === 'observatory' && minDim >= 384) {
@@ -1421,7 +1477,7 @@ function _generateDungeonOnce(opts) {
     // only (octagon/hexagon flat-side spans are tight). Skip sides that
     // already host corridor attachments. Cap at 2 per room.
     r.alcoves = [];
-    if (r.type === 'square' && r.w >= 384 && r.h >= 384) {
+    if (!r._fused && r.type === 'square' && r.w >= 384 && r.h >= 384) {
       const roomIdx = rooms.indexOf(r);
       const ALCOVE_W = 96, ALCOVE_D = 56, ALCOVE_MARGIN = 96;
       const sideHasCorridor = (side) => {

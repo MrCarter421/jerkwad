@@ -2268,14 +2268,16 @@ function _generateDungeonOnce(opts) {
     for (const a of r.alcoves || []) wallTexBySector.set(a.sectorId, a.wallTex);
   });
   const secMap = new Map(sectors.map(s => [s.id, s]));
-  // Sky-border trim pre-pass: a non-sky ceiling sector abutting a SKY
-  // ceiling sector at the SAME height renders as an abrupt flat-to-flat
-  // seam. Recess each such sky sector 16 units below its non-sky neighbour
-  // (once) so the build's resolve loop frames the sky opening with a real
-  // textured upper lip on the higher (ground) side. Sky sectors already
-  // taller than their neighbour (open-dome oculus) are left alone.
+  // Sky-border rooftop trim pre-pass. Wherever a SKY-ceiling sector abuts
+  // a non-sky sector we want a "rooftop" read: the roofed (non-sky) side
+  // keeps its height, and the sky drops a notch below it so the higher
+  // roof edge frames the opening with a real textured upper lip instead of
+  // an abrupt flat-to-flat seam or sky bleeding down a wall. We compute the
+  // LOWEST bordering non-sky ceiling per sky sector, then recess the sky to
+  // (that − 16) once, as long as ≥ 96 headroom remains. Sky sectors with no
+  // non-sky neighbour (fully open-air rooms like the Garden) are untouched.
   {
-    const adjusted = new Set();
+    const minGround = new Map(); // sky sector id -> lowest bordering non-sky ceil
     for (const l of linedefs) {
       if (l.front === -1 || l.back === -1) continue;
       const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
@@ -2283,15 +2285,19 @@ function _generateDungeonOnce(opts) {
       const fsec = secMap.get(fs.sector), bsec = secMap.get(bs.sector);
       if (!fsec || !bsec) continue;
       const fSky = fsec.ceilTex === 'F_SKY1', bSky = bsec.ceilTex === 'F_SKY1';
-      if (fSky === bSky) continue;            // both sky or both non-sky → skip
+      if (fSky === bSky) continue;
       const skySec = fSky ? fsec : bsec;
       const groundSec = fSky ? bsec : fsec;
-      if (skySec.ceilH < groundSec.ceilH) continue; // already a lip
-      if (adjusted.has(skySec.id)) continue;
-      const target = groundSec.ceilH - 16;
-      if (target - skySec.floorH < 96) continue;     // keep headroom
-      skySec.ceilH = target;
-      adjusted.add(skySec.id);
+      const cur = minGround.get(skySec.id);
+      if (cur == null || groundSec.ceilH < cur) minGround.set(skySec.id, groundSec.ceilH);
+    }
+    for (const [skyId, gc] of minGround) {
+      const sky = secMap.get(skyId);
+      if (!sky) continue;
+      const target = gc - 16;
+      if (target >= sky.ceilH) continue;           // already recessed enough
+      if (target - sky.floorH < 96) continue;       // keep headroom
+      sky.ceilH = target;
     }
   }
   for (const l of linedefs) {
@@ -4668,7 +4674,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.9</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.10</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

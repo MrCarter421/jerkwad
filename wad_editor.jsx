@@ -2328,6 +2328,22 @@ function _generateDungeonOnce(opts) {
     }
   }
 
+  // -------- 8c. Clear stray middle textures on two-sided lines --------
+  // A fused/merged boundary must be a clean see-through opening. Any
+  // middle texture left on a two-sided line renders as a glass-pane /
+  // fence that blocks the view (and sometimes the player). Clear them on
+  // both sidedefs. DOORTRAK is preserved (door tracks are intentional);
+  // grates (MIDGRATE/MIDBARS) aren't used by the generator.
+  for (const l of linedefs) {
+    if (l.back === -1) continue;
+    const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
+    for (const sd of [fs, bs]) {
+      if (sd && sd.middle && sd.middle !== '-' && sd.middle !== 'DOORTRAK') {
+        sd.middle = '-';
+      }
+    }
+  }
+
   // -------- 9. Place things --------
   // ShapeShifter override: when the caller supplies userThings (placed by
   // the user before BUILD), use those verbatim instead of auto-generating
@@ -4119,6 +4135,7 @@ function ShapeShifter() {
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
   const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
+  const [needP1Confirm, setNeedP1Confirm] = useState(false);
   const canvasRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef(null);
@@ -4204,6 +4221,15 @@ function ShapeShifter() {
 
   const build = () => {
     if (rooms.length < 1) { setHint('Place at least one room first.'); return; }
+    // Warn (once) if no Player 1 start was placed. Tap BUILD again to
+    // auto-place one at the first room.
+    const hasP1 = thingsList.some(t => t.type === 1);
+    if (!hasP1 && !needP1Confirm) {
+      setNeedP1Confirm(true);
+      setHint('⚠ No Player 1 start placed. Add one in THINGS, or tap BUILD again to auto-place it at the first room.');
+      return;
+    }
+    setNeedP1Confirm(false);
     try {
       const specs = rooms.map(r => ({
         type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
@@ -4299,6 +4325,18 @@ function ShapeShifter() {
     }
     return null;
   }
+  // Resize handle sits at the room's far corner: top-right for squares,
+  // the east point for octagons/hexagons.
+  function roomResizeHandle(r) {
+    if (r.type === 'square') return { x: r.cx + r.w / 2, y: r.cy + r.h / 2 };
+    return { x: r.cx + (r.r || 256), y: r.cy };
+  }
+  function hitResizeHandle(sx, sy, room) {
+    if (!room) return false;
+    const h = roomResizeHandle(room);
+    const hs = worldToScreen(h.x, h.y);
+    return dist2(sx, sy, hs.x, hs.y) < 26 * 26;
+  }
   function hitConnection(sx, sy) {
     const w = screenToWorld(sx, sy);
     const TOL = 16 / view.zoom;
@@ -4374,7 +4412,12 @@ function ShapeShifter() {
       }
       return;
     }
-    // PLACE mode
+    // PLACE mode — check the selected room's resize handle first.
+    const selRoom = rooms.find(r => r.id === selectedId);
+    if (selRoom && hitResizeHandle(sx, sy, selRoom)) {
+      gestureRef.current = { kind: 'resize', id: selRoom.id };
+      return;
+    }
     const hit = hitRoom(sx, sy);
     if (hit) {
       setSelectedId(hit.id);
@@ -4416,6 +4459,18 @@ function ShapeShifter() {
       // Overlap is the fusion mechanic — let it happen freely. The build
       // pass merges coincident walls into open passages.
       setRooms(rs => rs.map(r => r.id === g.id ? { ...r, cx: nx, cy: ny } : r));
+    } else if (g.kind === 'resize' && pointersRef.current.size === 1) {
+      const w = screenToWorld(rec.sx, rec.sy);
+      setRooms(rs => rs.map(r => {
+        if (r.id !== g.id) return r;
+        if (r.type === 'square') {
+          const halfW = Math.max(64, Math.round(Math.abs(w.x - r.cx) / 32) * 32);
+          const halfH = Math.max(64, Math.round(Math.abs(w.y - r.cy) / 32) * 32);
+          return { ...r, w: halfW * 2, h: halfH * 2 };
+        }
+        const rad = Math.max(96, Math.round(Math.hypot(w.x - r.cx, w.y - r.cy) / 32) * 32);
+        return { ...r, r: rad };
+      }));
     } else if (g.kind === 'thingDrag' && pointersRef.current.size === 1) {
       const w = screenToWorld(rec.sx, rec.sy);
       const nx = Math.round(w.x);
@@ -4575,6 +4630,15 @@ function ShapeShifter() {
       ctx.font = '12px ui-monospace, monospace';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(r.label, c2.x, c2.y);
+      // Resize handle for the selected room (PLACE mode only).
+      if (selected && mode === 'place' && !previewMap) {
+        const h = roomResizeHandle(r);
+        const hs = worldToScreen(h.x, h.y);
+        ctx.fillStyle = COLORS.amber;
+        ctx.fillRect(hs.x - 7, hs.y - 7, 14, 14);
+        ctx.strokeStyle = COLORS.bg; ctx.lineWidth = 2;
+        ctx.strokeRect(hs.x - 7, hs.y - 7, 14, 14);
+      }
     }
     // User-placed things (visible in all edit modes, interactive only in
     // THINGS mode).
@@ -4604,7 +4668,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.8</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.9</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

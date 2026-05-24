@@ -1200,17 +1200,20 @@ function _generateDungeonOnce(opts) {
       }
     }
     for (const g of fusedGroups) {
+      // Equalize FLOOR only — so the player walks between fused rooms with
+      // no step. Keep each room's own CEILING so height variety and sky
+      // openings survive (that variety + the kept pillars/features make
+      // the fused interior interesting rather than a flat box).
       let fh = -Infinity;
       for (const idx of g) fh = Math.max(fh, rooms[idx].floorH);
-      let ch = Infinity;
-      for (const idx of g) ch = Math.min(ch, rooms[idx].ceilH);
-      if (ch - fh < 96) ch = fh + 128;
       for (const idx of g) {
         rooms[idx].floorH = fh;
-        rooms[idx].ceilH = ch;
-        rooms[idx].trimLayers = 0;
-        rooms[idx].feature = 'none';
+        if (rooms[idx].ceilH - fh < 96) rooms[idx].ceilH = fh + 128;
+        rooms[idx].trimLayers = 0;  // concentric rings don't fit a fused shape
+        rooms[idx].feature = 'none'; // centre features need a clean convex room
         rooms[idx]._fused = true;
+        // Pillars ARE kept — they get rasterized into the fusion grid below
+        // as solid columns, so fused rooms still have combat cover / detail.
       }
     }
   }
@@ -1397,10 +1400,7 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r._fused) {
-      // Fused rooms skip ALL interior detail — pillars, alcoves and centre
-      // features only render correctly inside a clean convex room.
-    } else if (r.feature === 'altar') {
+    if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
     } else if (r.feature === 'observatory' && minDim >= 384) {
@@ -1782,28 +1782,27 @@ function _generateDungeonOnce(opts) {
   // For each room: outer polygon CW walk (with corridor cuts), then one ring
   // per trim layer (CCW walk around the inset polygon, layer-N-1 on front,
   // layer-N on back), then optional centre feature ring.
-  rooms.forEach((room) => {
-    if (room._fused) return; // grid-emitted below
-    const outerCCW = roomPoly(room);
-    const outerCW = outerCCW.slice().reverse();
-    for (let i = 0; i < outerCW.length; i++) {
-      emitOuterEdge(room, outerCW[i], outerCW[(i + 1) % outerCW.length]);
-    }
+  rooms.forEach((room, roomIdx) => {
     const layerIds = [room.outerId, ...room.trimIds];
-    // Ring i (1..trimLayers): between layer i-1 (outer-side) and layer i (inner-side).
-    for (let layer = 1; layer <= room.trimLayers; layer++) {
-      const ringPoly = roomPoly(room, TRIM_W * layer);
-      if (ringPoly.length < 3) break;
-      for (let j = 0; j < ringPoly.length; j++) {
-        const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
-        // Walking CCW around the inset polygon: right of v1->v2 = outside
-        // inset = inside outer layer. emitWall(p1, p2, outerLayer, innerLayer)
-        // gives front=outerLayer, back=innerLayer.
-        emitWall(p1.x, p1.y, p2.x, p2.y, layerIds[layer - 1], layerIds[layer]);
+    if (!room._fused) {
+      // Non-fused: emit the smooth polygon perimeter + concentric trim.
+      const outerCCW = roomPoly(room);
+      const outerCW = outerCCW.slice().reverse();
+      for (let i = 0; i < outerCW.length; i++) {
+        emitOuterEdge(room, outerCW[i], outerCW[(i + 1) % outerCW.length]);
+      }
+      for (let layer = 1; layer <= room.trimLayers; layer++) {
+        const ringPoly = roomPoly(room, TRIM_W * layer);
+        if (ringPoly.length < 3) break;
+        for (let j = 0; j < ringPoly.length; j++) {
+          const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+          emitWall(p1.x, p1.y, p2.x, p2.y, layerIds[layer - 1], layerIds[layer]);
+        }
       }
     }
-    // Centre feature
-    if (room.feature !== 'none' && room.featureId) {
+    // Non-fused rooms emit their centre feature + smooth octagon pillars.
+    // Fused rooms get their pillars rasterized into the grid pass instead.
+    if (!room._fused && room.feature !== 'none' && room.featureId) {
       const ringPoly = roomPoly(room, TRIM_W * room.trimLayers + INNER_INSET);
       if (ringPoly.length >= 3) {
         const innerMost = layerIds[layerIds.length - 1];
@@ -1813,12 +1812,7 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
-    // Pillars — small closed sub-sectors inside the innermost interior.
-    // Each pillar is a CCW octagon walked with the enclosing sector on the
-    // outside and the pillar (closed) sector on the inside. The
-    // resolveTwoSidedTextures pass below will set a SUPPORT2 column texture
-    // on the room's side because of the big floor-to-ceiling delta.
-    if (room.pillars && room.pillars.length) {
+    if (!room._fused && room.pillars && room.pillars.length) {
       const enclosing = layerIds[layerIds.length - 1];
       for (let k = 0; k < room.pillars.length; k++) {
         const p = room.pillars[k];
@@ -1856,59 +1850,69 @@ function _generateDungeonOnce(opts) {
     maxY = Math.ceil(maxY / CELL) * CELL + CELL;
     const W = Math.ceil((maxX - minX) / CELL);
     const H = Math.ceil((maxY - minY) / CELL);
-    const grid = new Int32Array(W * H);
-    grid.fill(-1);
+    // Cells store the SECTOR id (room outer, pillar, or null=void) plus the
+    // wall texture for one-sided emit.
+    const cellSec = new Array(W * H).fill(null);
+    const cellTex = new Array(W * H).fill('STARTAN2');
     const polysByIdx = new Map();
     for (const idx of groupArr) polysByIdx.set(idx, roomPoly(rooms[idx]));
     for (let gy = 0; gy < H; gy++) {
       for (let gx = 0; gx < W; gx++) {
         const cx = minX + (gx + 0.5) * CELL;
         const cy = minY + (gy + 0.5) * CELL;
-        // Last room wins so the user's most-recent placement claims overlap.
         for (let i = groupArr.length - 1; i >= 0; i--) {
           const idx = groupArr[i];
           if (pointInPolygon(cx, cy, polysByIdx.get(idx))) {
-            grid[gy * W + gx] = idx;
+            cellSec[gy * W + gx] = rooms[idx].outerId;
+            cellTex[gy * W + gx] = rooms[idx].palette.wall;
             break;
           }
         }
       }
     }
-    // Emit walls along cell boundaries where neighbour differs.
+    // Overlay pillars as solid columns — cells inside a pillar's radius
+    // (and currently belonging to that pillar's room) become the pillar's
+    // closed sector. They read as floor-to-ceiling columns.
+    for (const idx of groupArr) {
+      const room = rooms[idx];
+      if (!room.pillars || !room.pillars.length) continue;
+      for (let k = 0; k < room.pillars.length; k++) {
+        const p = room.pillars[k];
+        const psec = room.pillarSecIds[k];
+        const r2 = (p.radius + 4) * (p.radius + 4);
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== room.outerId) continue;
+            const cx = minX + (gx + 0.5) * CELL;
+            const cy = minY + (gy + 0.5) * CELL;
+            if ((cx - p.cx) ** 2 + (cy - p.cy) ** 2 <= r2) {
+              cellSec[gy * W + gx] = psec;
+              cellTex[gy * W + gx] = room.palette.wall;
+            }
+          }
+        }
+      }
+    }
+    // Emit walls along cell boundaries where the neighbour's sector differs.
     for (let gy = 0; gy < H; gy++) {
       for (let gx = 0; gx < W; gx++) {
-        const here = grid[gy * W + gx];
-        if (here === -1) continue;
-        const room = rooms[here];
+        const here = cellSec[gy * W + gx];
+        if (here === null) continue;
+        const tex = cellTex[gy * W + gx];
         const xMin = minX + gx * CELL, xMax = xMin + CELL;
         const yMin = minY + gy * CELL, yMax = yMin + CELL;
-        // North edge (y=yMax): walk (xMin,yMax) → (xMax,yMax) east.
-        const nIdx = gy + 1 < H ? grid[(gy + 1) * W + gx] : -1;
-        if (nIdx !== here) {
-          const back = nIdx === -1 ? null : rooms[nIdx].outerId;
-          emitWall(xMin, yMax, xMax, yMax, room.outerId, back,
-                   back === null ? { middle: room.palette.wall } : {});
-        }
-        // East edge (x=xMax): walk (xMax,yMax) → (xMax,yMin) south.
-        const eIdx = gx + 1 < W ? grid[gy * W + gx + 1] : -1;
-        if (eIdx !== here) {
-          const back = eIdx === -1 ? null : rooms[eIdx].outerId;
-          emitWall(xMax, yMax, xMax, yMin, room.outerId, back,
-                   back === null ? { middle: room.palette.wall } : {});
-        }
-        // South edge (y=yMin): walk (xMax,yMin) → (xMin,yMin) west.
-        const sIdx = gy > 0 ? grid[(gy - 1) * W + gx] : -1;
-        if (sIdx !== here) {
-          const back = sIdx === -1 ? null : rooms[sIdx].outerId;
-          emitWall(xMax, yMin, xMin, yMin, room.outerId, back,
-                   back === null ? { middle: room.palette.wall } : {});
-        }
-        // West edge (x=xMin): walk (xMin,yMin) → (xMin,yMax) north.
-        const wIdx = gx > 0 ? grid[gy * W + gx - 1] : -1;
-        if (wIdx !== here) {
-          const back = wIdx === -1 ? null : rooms[wIdx].outerId;
-          emitWall(xMin, yMin, xMin, yMax, room.outerId, back,
-                   back === null ? { middle: room.palette.wall } : {});
+        const nb = (ggx, ggy) => (ggx >= 0 && ggx < W && ggy >= 0 && ggy < H)
+          ? cellSec[ggy * W + ggx] : null;
+        const edges = [
+          { s: nb(gx, gy + 1), x1: xMin, y1: yMax, x2: xMax, y2: yMax }, // N
+          { s: nb(gx + 1, gy), x1: xMax, y1: yMax, x2: xMax, y2: yMin }, // E
+          { s: nb(gx, gy - 1), x1: xMax, y1: yMin, x2: xMin, y2: yMin }, // S
+          { s: nb(gx - 1, gy), x1: xMin, y1: yMin, x2: xMin, y2: yMax }, // W
+        ];
+        for (const e of edges) {
+          if (e.s === here) continue;
+          emitWall(e.x1, e.y1, e.x2, e.y2, here, e.s,
+                   e.s === null ? { middle: tex } : {});
         }
       }
     }
@@ -2143,6 +2147,62 @@ function _generateDungeonOnce(opts) {
     }
   }
 
+  // -------- 7e. Merge collinear linedefs --------
+  // The grid emit produces long runs of 32-unit segments. Merge any
+  // consecutive collinear segments (l1.v2 == l2.v1) that share identical
+  // front/back sectors, textures, flags, and special into a single longer
+  // linedef. This cleans up the wall count and removes the "stepped"
+  // micro-segment look on fused boundaries. Only normal (special 0) walls
+  // are merged so doors / switches are never coalesced.
+  {
+    const vById = new Map(verts.map(v => [v.id, v]));
+    const sameTex = (a, b) => a.upper === b.upper && a.lower === b.lower && a.middle === b.middle;
+    function mergeable(l1, l2) {
+      if (l1.special !== 0 || l2.special !== 0) return false;
+      if (l1.flags !== l2.flags) return false;
+      // front sectors equal, back sectors equal (both -1 or same)
+      const f1 = sidedefs.find(s => s.id === l1.front);
+      const f2 = sidedefs.find(s => s.id === l2.front);
+      if (!f1 || !f2 || f1.sector !== f2.sector || !sameTex(f1, f2)) return false;
+      const b1 = l1.back === -1 ? null : sidedefs.find(s => s.id === l1.back);
+      const b2 = l2.back === -1 ? null : sidedefs.find(s => s.id === l2.back);
+      if ((b1 == null) !== (b2 == null)) return false;
+      if (b1 && b2 && (b1.sector !== b2.sector || !sameTex(b1, b2))) return false;
+      // collinear and same direction
+      const a = vById.get(l1.v1), m = vById.get(l1.v2), c = vById.get(l2.v2);
+      if (!a || !m || !c) return false;
+      const cross = (m.x - a.x) * (c.y - a.y) - (m.y - a.y) * (c.x - a.x);
+      if (Math.abs(cross) > 0.5) return false;
+      const dot = (m.x - a.x) * (c.x - m.x) + (m.y - a.y) * (c.y - m.y);
+      return dot > 0;
+    }
+    let changed = true, safety = 4000;
+    while (changed && safety-- > 0) {
+      changed = false;
+      const byV1 = new Map();
+      for (let i = 0; i < linedefs.length; i++) {
+        const k = linedefs[i].v1;
+        if (!byV1.has(k)) byV1.set(k, []);
+        byV1.get(k).push(i);
+      }
+      for (let i = 0; i < linedefs.length; i++) {
+        const l1 = linedefs[i];
+        const conts = byV1.get(l1.v2);
+        if (!conts) continue;
+        let did = false;
+        for (const j of conts) {
+          if (j === i) continue;
+          const l2 = linedefs[j];
+          if (!mergeable(l1, l2)) continue;
+          l1.v2 = l2.v2;          // extend l1 to l2's end
+          linedefs.splice(j, 1);  // drop l2
+          changed = true; did = true; break;
+        }
+        if (did) break;
+      }
+    }
+  }
+
   // -------- 8. Apply door specials --------
   // Each line touching a doorBody becomes a DR-1 door so USE opens it from
   // EITHER side (corridor or room). The line's back must be the door body
@@ -2208,6 +2268,32 @@ function _generateDungeonOnce(opts) {
     for (const a of r.alcoves || []) wallTexBySector.set(a.sectorId, a.wallTex);
   });
   const secMap = new Map(sectors.map(s => [s.id, s]));
+  // Sky-border trim pre-pass: a non-sky ceiling sector abutting a SKY
+  // ceiling sector at the SAME height renders as an abrupt flat-to-flat
+  // seam. Recess each such sky sector 16 units below its non-sky neighbour
+  // (once) so the build's resolve loop frames the sky opening with a real
+  // textured upper lip on the higher (ground) side. Sky sectors already
+  // taller than their neighbour (open-dome oculus) are left alone.
+  {
+    const adjusted = new Set();
+    for (const l of linedefs) {
+      if (l.front === -1 || l.back === -1) continue;
+      const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
+      if (!fs || !bs) continue;
+      const fsec = secMap.get(fs.sector), bsec = secMap.get(bs.sector);
+      if (!fsec || !bsec) continue;
+      const fSky = fsec.ceilTex === 'F_SKY1', bSky = bsec.ceilTex === 'F_SKY1';
+      if (fSky === bSky) continue;            // both sky or both non-sky → skip
+      const skySec = fSky ? fsec : bsec;
+      const groundSec = fSky ? bsec : fsec;
+      if (skySec.ceilH < groundSec.ceilH) continue; // already a lip
+      if (adjusted.has(skySec.id)) continue;
+      const target = groundSec.ceilH - 16;
+      if (target - skySec.floorH < 96) continue;     // keep headroom
+      skySec.ceilH = target;
+      adjusted.add(skySec.id);
+    }
+  }
   for (const l of linedefs) {
     if (l.front === -1 || l.back === -1) continue;
     const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
@@ -4518,7 +4604,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.7</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.8</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

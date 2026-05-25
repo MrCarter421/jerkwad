@@ -739,6 +739,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'courtyard',   label: 'Courtyard',    type: 'square',  w: 1024, h: 1024, feature: 'courtyard' },
   { id: 'plaza',       label: 'Plaza',        type: 'octagon', r: 640,          feature: 'plaza' },
   { id: 'ziggurat',    label: 'Ziggurat',     type: 'square',  w: 768, h: 768,   feature: 'ziggurat' },
+  { id: 'lift',        label: 'Lift Vault',   type: 'square',  w: 640, h: 640,   feature: 'lift' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1123,8 +1124,9 @@ function _generateDungeonOnce(opts) {
     else if (roll < 0.87 && isMidRoom)       r.feature = 'observatory';
     else if (roll < 0.90)                    r.feature = 'sewer';
     else if (isLargeRoom && roll < 0.94)     r.feature = 'courtyard';
-    else if (isMidRoom && roll < 0.96)       r.feature = 'plaza';
-    else if (isMidRoom && roll < 0.99)       r.feature = 'ziggurat';
+    else if (isMidRoom && roll < 0.955)      r.feature = 'plaza';
+    else if (isMidRoom && roll < 0.975)      r.feature = 'ziggurat';
+    else if (isMidRoom && roll < 0.99)       r.feature = 'lift';
     else                                     r.feature = 'none';
     // Per-feature room-level overrides — ceiling height, palette swaps and
     // ambient lighting set the mood before sector allocation.
@@ -1166,6 +1168,10 @@ function _generateDungeonOnce(opts) {
       r.ceilH = r.floorH + 128;
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
+    }
+    // Lift — a raised vantage platform reachable only by a working lift.
+    if (r.feature === 'lift') {
+      r.ceilH = Math.max(r.ceilH, r.floorH + 192);
     }
     // Courtyard — an open-sky paved yard with a central enterable BUILDING
     // (a house/tower silhouette with solid walls, a flat roof and one door).
@@ -1260,6 +1266,7 @@ function _generateDungeonOnce(opts) {
 
   // -------- 6. allocate sectors --------
   const sectors = [];
+  let tagCounter = 1; // unique sector tags for lifts etc.
   const allocSec = (props) => {
     const id = 's' + sectors.length;
     sectors.push({ id, floorH: 0, ceilH: 128, floorTex: 'FLOOR0_1', ceilTex: 'CEIL3_5',
@@ -1275,7 +1282,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
@@ -1483,6 +1490,29 @@ function _generateDungeonOnce(opts) {
           light: Math.min(255, r.light + i * 4), special: 0,
         }));
       }
+    }
+    // Lift — a central raised vantage platform plus a working lift strip on
+    // its south edge. The platform sits +96 above the floor (too high to
+    // step); the lift starts level with it and lowers on use (SR special
+    // 62), so the player rides up. Adds verticality + a real linedef trigger.
+    if (r.feature === 'lift' && minDim >= 384) {
+      const ph = Math.floor(minDim * 0.26 / 32) * 32; // platform half-size
+      const lift = 64;                                  // lift strip size
+      r.lift = {
+        cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32,
+        ph, lift, top: r.floorH + 96,
+      };
+      r.liftPlatformId = allocSec({
+        floorH: r.floorH + 96, ceilH: r.ceilH,
+        floorTex: r.palette.accent, ceilTex: r.palette.ceil,
+        light: Math.min(255, r.light + 16), special: 0,
+      });
+      r.liftTag = tagCounter++;
+      r.liftSectorId = allocSec({
+        floorH: r.floorH + 96, ceilH: r.ceilH,
+        floorTex: r.palette.trim, ceilTex: r.palette.ceil,
+        light: r.light, special: 0, tag: r.liftTag,
+      });
     }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
@@ -1740,7 +1770,7 @@ function _generateDungeonOnce(opts) {
       id: 'l' + linedefs.length,
       v1, v2,
       flags: (sharedSector ? 4 : 1) | (props.flags || 0),
-      special: 0, tag: 0, front, back,
+      special: props.special || 0, tag: props.tag || 0, front, back,
     };
     linedefs.push(ld);
     return ld;
@@ -1986,6 +2016,28 @@ function _generateDungeonOnce(opts) {
           emitWall(p1.x, p1.y, p2.x, p2.y, layers[i - 1], layers[i]);
         }
       }
+    }
+    // Lift — a +96 vantage platform with a working SR lift on its south
+    // edge. Platform walls are 2-sided steps (too tall to climb); the lift
+    // strip rides the player up when its south face (special 62) is used.
+    if (!room._fused && room.lift) {
+      const L = room.lift, lx = L.cx, ly = L.cy, P = L.ph, hl = L.lift / 2;
+      const out = room.outerId, plat = room.liftPlatformId, lif = room.liftSectorId;
+      const pS = ly - P, pN = ly + P, pW = lx - P, pE = lx + P;
+      const lS = pS - L.lift; // lift strip south edge
+      // Platform ring (front = main floor, 2-sided steps), south split for lift.
+      emitWall(pE, pN, pW, pN, out, plat); // N
+      emitWall(pW, pN, pW, pS, out, plat); // W
+      emitWall(pE, pS, pE, pN, out, plat); // E
+      emitWall(pW, pS, lx - hl, pS, out, plat); // S left of lift
+      emitWall(lx + hl, pS, pE, pS, out, plat); // S right of lift
+      // Lift strip — north edge opens onto the platform (same height).
+      emitWall(lx + hl, pS, lx - hl, pS, plat, lif);
+      // Side walls (2-sided steps to main floor).
+      emitWall(lx + hl, lS, lx + hl, pS, out, lif); // east
+      emitWall(lx - hl, pS, lx - hl, lS, out, lif); // west
+      // South face — the activator: SR Lift (62) on this room's lift tag.
+      emitWall(lx - hl, lS, lx + hl, lS, out, lif, { special: 62, tag: room.liftTag });
     }
   });
 
@@ -4837,7 +4889,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.13</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.14</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

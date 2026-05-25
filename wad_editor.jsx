@@ -1328,10 +1328,13 @@ function _generateDungeonOnce(opts) {
         light: Math.min(255, r.light + 16), special: 0,
       });
     } else if (r.feature === 'sky') {
+      // Open oculus shaft with a raised, brighter dais directly beneath it —
+      // a shaft-of-light altar the player steps up onto. The 16-unit step is
+      // textured by the resolve pass against the innermost trim.
       r.featureId = allocSec({
-        floorH: deepestFloor, ceilH: r.floorH + 384,
-        floorTex: r.palette.floor, ceilTex: 'F_SKY1',
-        light: Math.min(255, r.light + 48), special: 0,
+        floorH: deepestFloor + 16, ceilH: r.floorH + 384,
+        floorTex: r.palette.accent, ceilTex: 'F_SKY1',
+        light: Math.min(255, r.light + 64), special: 0,
       });
     } else if (r.feature === 'pit') {
       r.featureId = allocSec({
@@ -1465,22 +1468,31 @@ function _generateDungeonOnce(opts) {
       r.buildings = [];
       for (const pos of layout) {
         if (pos.half < 96) continue;
+        // Solid roofed structure: walls rise to a flat roof with OPEN SKY
+        // above it (the roof sector's ceiling is sky too), so the building
+        // reads consistently from every angle — wall face up to the roofline,
+        // then the flat roof, then sky. (Vanilla Doom can't both enter a
+        // building AND show its roof from outside in an open-sky yard, so we
+        // make these solid skyline structures with a textured facade.) Houses
+        // are 96–128 tall, towers 160–208, for a varied skyline.
         const bRoof = pick(BUILDING_ROOFS);
         const isTower = rand() < 0.4;
-        const roofTop = r.floorH + (isTower ? 184 : 112);
+        const roofTop = r.floorH + (isTower ? 160 + Math.floor(rand() * 4) * 16
+                                            : 96 + Math.floor(rand() * 3) * 16);
         r.buildings.push({
-          cx: pos.cx, cy: pos.cy, half: pos.half, thick: 32, door: 64, win: 96,
-          wall: pick(BUILDING_WALLS), roofTop,
-          interiorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
-            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 48), special: 0 }),
-          doorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
-            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 32), special: 0 }),
-          windowIds: [
-            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
-              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
-            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
-              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
-          ],
+          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80, porchDepth: 48,
+          wall: pick(BUILDING_WALLS), roofTop, isTower,
+          doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
+          winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
+          roofSec: allocSec({ floorH: roofTop, ceilH: r.ceilH,
+            floorTex: bRoof, ceilTex: 'F_SKY1',
+            light: Math.min(255, r.light + 8), special: 0 }),
+          // Recessed covered entrance — a shadowed porch carved into the south
+          // wall (floor at grade, low roofed ceiling), giving the thick wall a
+          // layered doorway with depth instead of a flat painted panel.
+          porchSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 80,
+            floorTex: r.palette.floor, ceilTex: bRoof,
+            light: Math.max(96, r.light - 24), special: 0 }),
         });
       }
     }
@@ -1552,6 +1564,42 @@ function _generateDungeonOnce(opts) {
             light: Math.min(255, r.light + 16), special: 0 }) });
       }
     }
+    // Courtyard terrain — the open compound floor gets a sunken service
+    // basin near its centre plus a couple of raised platforms (loading
+    // docks / equipment pads) out toward the edges, the multi-level
+    // industrial-base look. Clear floor is grid-scanned so the patches
+    // adapt to any 1/2/4-building layout and never touch a building (which
+    // would block its doors). Sky ceiling carries over above each patch.
+    if (r.feature === 'courtyard' && !r._fused && r.buildings && r.buildings.length) {
+      const sn = v => Math.round(v / 32) * 32;
+      const inset = minDim / 2 - 80, hp = 80, m = 48;
+      const clearCell = (cx, cy) =>
+        Math.abs(cx - r.cx) + hp <= inset && Math.abs(cy - r.cy) + hp <= inset &&
+        r.buildings.every(b => Math.abs(cx - b.cx) >= b.half + hp + m ||
+                               Math.abs(cy - b.cy) >= b.half + hp + m);
+      const cells = [];
+      for (let cy = sn(r.cy - inset); cy <= r.cy + inset; cy += 64)
+        for (let cx = sn(r.cx - inset); cx <= r.cx + inset; cx += 64)
+          if (clearCell(cx, cy)) cells.push({ cx, cy, d: Math.hypot(cx - r.cx, cy - r.cy) });
+      if (cells.length) {
+        cells.sort((a, b) => a.d - b.d);
+        const basin = cells[0];
+        r.terrains.push({ cx: basin.cx, cy: basin.cy, hw: hp, hh: hp, kind: 'basin',
+          secId: allocSec({ floorH: r.floorH - 24, ceilH: r.ceilH,
+            floorTex: pick(['FWATER1', 'NUKAGE1', 'FLOOR0_2']), ceilTex: r.palette.ceil,
+            light: Math.max(96, r.light - 24), special: 0 }) });
+        let placed = 0;
+        for (let i = cells.length - 1; i >= 0 && placed < 2; i--) {
+          const c = cells[i];
+          if (!r.terrains.every(t => Math.hypot(c.cx - t.cx, c.cy - t.cy) >= 2 * hp + 96)) continue;
+          r.terrains.push({ cx: c.cx, cy: c.cy, hw: hp, hh: hp, kind: 'terrace',
+            secId: allocSec({ floorH: r.floorH + 16, ceilH: r.ceilH,
+              floorTex: r.palette.accent, ceilTex: r.palette.ceil,
+              light: Math.min(255, r.light + 16), special: 0 }) });
+          placed++;
+        }
+      }
+    }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
     // Pillars in larger rooms — small closed sub-sectors that act as
@@ -1578,7 +1626,9 @@ function _generateDungeonOnce(opts) {
         const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
         const radius = 40 + Math.floor(rand() * 3) * 16;
         if (!clearOfTerrain(cx, cy, radius)) continue;
-        r.pillars.push({ cx, cy, radius });
+        // Short kiosks/planters (48–80 tall) with open sky above — NOT
+        // floor-to-sky monoliths, so they read as low obstacles in the square.
+        r.pillars.push({ cx, cy, radius, top: r.floorH + 48 + Math.floor(rand() * 3) * 16 });
       }
     } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
@@ -1626,10 +1676,12 @@ function _generateDungeonOnce(opts) {
       } else if (minDim >= 640) {
         r.pillars.push({ cx: r.cx, cy: r.cy, radius: 40 });
       }
-    } else if (minDim >= 1024 && r.type === 'square') {
+    } else if (minDim >= 1024 && r.type === 'square' &&
+               r.feature !== 'courtyard' && r.feature !== 'lift' && r.feature !== 'ziggurat') {
       // Big square room with a central feature: two side pillars on the
       // room's longer axis, far enough out that they don't crowd the
-      // feature ring.
+      // feature ring. Skipped for self-managing yards (courtyard buildings,
+      // lift platform, ziggurat stairs) whose own structures fill the floor.
       const longAxisX = r.w >= r.h;
       const off = Math.floor((longAxisX ? r.w : r.h) * 0.32 / 32) * 32;
       const innerRadius = TRIM_W * r.trimLayers + INNER_INSET;
@@ -1640,8 +1692,11 @@ function _generateDungeonOnce(opts) {
         r.pillars.push({ cx: r.cx + dx, cy: r.cy + dy, radius: 40 });
       }
     }
-    r.pillarSecIds = r.pillars.map(() => allocSec({
-      floorH: r.ceilH, ceilH: r.ceilH,
+    // A pillar with floor == ceil == room ceiling reads as a solid
+    // floor-to-ceiling column. A pillar with an explicit `top` (< ceil)
+    // is a short raised block (open above) — e.g. plaza kiosks/planters.
+    r.pillarSecIds = r.pillars.map((p) => allocSec({
+      floorH: p.top != null ? p.top : r.ceilH, ceilH: r.ceilH,
       floorTex: r.palette.floor, ceilTex: r.palette.ceil,
       light: r.light, special: 0,
     }));
@@ -2107,47 +2162,40 @@ function _generateDungeonOnce(opts) {
         emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, t.secId);
       }
     }
-    // Courtyard compound — each building is a thick-walled square shell with
-    // a roofed interior, a south door, and a window on the east + west walls.
+    // Courtyard compound — each building is a SOLID roofed structure. The
+    // four outer walls are two-sided against the building's roof sector
+    // (floor = roof height, ceiling = sky), so from the yard you see the wall
+    // face rise to the roofline and then the flat roof + open sky above it —
+    // a consistent skyline read. The wall faces carry a facade: a tall door
+    // panel centred on the south wall and lit window strips on the E/W walls.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
-      const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2, hw = b.win / 2;
-      const court = room.outerId, inner = b.interiorId, door = b.doorId;
-      const wE = b.windowIds[0], wW = b.windowIds[1];
-      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh; // outer ring
-      const iS = by - Bh + T, iN = by + Bh - T, iW = bx - Bh + T, iE = bx + Bh - T; // inner
+      const bx = b.cx, by = b.cy, Bh = b.half, hd = b.door / 2, hw = b.win / 2;
+      const court = room.outerId, roof = b.roofSec, porch = b.porchSec;
+      const PD = b.porchDepth;
+      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh;
+      const pN = oS + PD; // porch back (north) edge
       const wallTex = b.wall;
-      // OUTER ring (one-sided, courtyard on the right / CCW walk). The south
-      // wall is split around the door gap; E/W walls split around windows.
-      emitWall(oW, oS, bx - hd, oS, court, null, { middle: wallTex });   // S left of door
-      emitWall(bx + hd, oS, oE, oS, court, null, { middle: wallTex });   // S right of door
-      emitWall(oE, oS, oE, by - hw, court, null, { middle: wallTex });   // E below window
-      emitWall(oE, by + hw, oE, oN, court, null, { middle: wallTex });   // E above window
-      emitWall(oE, oN, oW, oN, court, null, { middle: wallTex });        // N
-      emitWall(oW, oN, oW, by + hw, court, null, { middle: wallTex });   // W above window
-      emitWall(oW, by - hw, oW, oS, court, null, { middle: wallTex });   // W below window
-      // INNER ring (one-sided, interior on the right / CW walk).
-      emitWall(bx - hd, iS, iW, iS, inner, null, { middle: wallTex });   // S left
-      emitWall(iE, iS, bx + hd, iS, inner, null, { middle: wallTex });   // S right
-      emitWall(iW, iS, iW, by - hw, inner, null, { middle: wallTex });   // W below window
-      emitWall(iW, by + hw, iW, iN, inner, null, { middle: wallTex });   // W above window
-      emitWall(iW, iN, iE, iN, inner, null, { middle: wallTex });        // N
-      emitWall(iE, iN, iE, by + hw, inner, null, { middle: wallTex });   // E above window
-      emitWall(iE, by - hw, iE, iS, inner, null, { middle: wallTex });   // E below window
-      // DOOR — short passage through the wall thickness (open both faces).
-      emitWall(bx - hd, oS, bx + hd, oS, court, door, { upper: wallTex, backUpper: wallTex });
-      emitWall(bx + hd, iS, bx - hd, iS, inner, door);
-      emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex });
-      emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex });
-      // EAST WINDOW — raised-sill opening; see/shoot through, can't enter.
-      emitWall(oE, by - hw, oE, by + hw, court, wE, { upper: wallTex, backUpper: wallTex }); // courtyard face
-      emitWall(iE, by + hw, iE, by - hw, inner, wE);                                          // interior face
-      emitWall(oE, by - hw, iE, by - hw, wE, null, { middle: wallTex });                      // south jamb
-      emitWall(iE, by + hw, oE, by + hw, wE, null, { middle: wallTex });                      // north jamb
-      // WEST WINDOW
-      emitWall(oW, by + hw, oW, by - hw, court, wW, { upper: wallTex, backUpper: wallTex });   // courtyard face
-      emitWall(iW, by - hw, iW, by + hw, inner, wW);                                           // interior face
-      emitWall(iW, by - hw, oW, by - hw, wW, null, { middle: wallTex });                       // south jamb
-      emitWall(oW, by + hw, iW, by + hw, wW, null, { middle: wallTex });                       // north jamb
+      const face = tex => ({ frontSide: { lower: tex } });
+      // SOUTH wall — solid segments flank a recessed covered porch. The porch
+      // opening shows the building wall as a lintel above (upper texture); the
+      // porch interior is a shadowed bay with the door panel at its back.
+      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));     // S left of porch
+      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));     // S right of porch
+      emitWall(bx - hd, oS, bx + hd, oS, court, porch,
+        { frontSide: { upper: wallTex }, backSide: { upper: wallTex } }); // porch opening + lintel
+      emitWall(bx - hd, oS, bx - hd, pN, porch, roof, face(wallTex)); // porch W jamb
+      emitWall(bx - hd, pN, bx + hd, pN, porch, roof, face(b.doorTex)); // porch back (door panel)
+      emitWall(bx + hd, pN, bx + hd, oS, porch, roof, face(wallTex)); // porch E jamb
+      // EAST wall — split around a window strip.
+      emitWall(oE, oS, oE, by - hw, court, roof, face(wallTex));     // E below window
+      emitWall(oE, by - hw, oE, by + hw, court, roof, face(b.winTex)); // window strip
+      emitWall(oE, by + hw, oE, oN, court, roof, face(wallTex));     // E above window
+      // NORTH wall.
+      emitWall(oE, oN, oW, oN, court, roof, face(wallTex));
+      // WEST wall — split around a window strip.
+      emitWall(oW, oN, oW, by + hw, court, roof, face(wallTex));     // W above window
+      emitWall(oW, by + hw, oW, by - hw, court, roof, face(b.winTex)); // window strip
+      emitWall(oW, by - hw, oW, oS, court, roof, face(wallTex));     // W below window
     }
     // Ziggurat — concentric rising stair rings. Same CCW-inset walk as the
     // trim rings; front = outer (lower) ring, back = inner (higher) ring,
@@ -5062,7 +5110,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.17</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.21</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -1487,14 +1487,28 @@ function _generateDungeonOnce(opts) {
         const isTower = rand() < 0.4;
         const roofTop = r.floorH + (isTower ? 160 + Math.floor(rand() * 4) * 16
                                             : 96 + Math.floor(rand() * 3) * 16);
+        const plinthH = r.floorH + 12;     // base podium height
+        const capH = roofTop + 16;         // parapet cap (lip) height
         r.buildings.push({
-          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80, porchDepth: 48,
-          wall: pick(BUILDING_WALLS), roofTop, isTower,
+          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80,
+          porchDepth: 48, plinthW: 24, parapetW: 56,
+          wall: pick(BUILDING_WALLS), roofTop, isTower, plinthH, capH,
           doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
           winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
+          capTex: pick(['STONE', 'STONE2', 'METAL', 'BROWN1', 'STARTAN3']),
+          // Recessed roof centre (the part inside the parapet lip).
           roofSec: allocSec({ floorH: roofTop, ceilH: r.ceilH,
             floorTex: bRoof, ceilTex: 'F_SKY1',
             light: Math.min(255, r.light + 8), special: 0 }),
+          // Parapet cap — a raised lip ring around the roof edge.
+          capSec: allocSec({ floorH: capH, ceilH: r.ceilH,
+            floorTex: pick(BUILDING_ROOFS), ceilTex: 'F_SKY1',
+            light: Math.min(255, r.light + 8), special: 0 }),
+          // Plinth — a raised base podium the building stands on; doubles as
+          // the floor of the recessed entrance.
+          plinthSec: allocSec({ floorH: plinthH, ceilH: r.ceilH,
+            floorTex: r.palette.floor, ceilTex: 'F_SKY1',
+            light: r.light, special: 0 }),
         });
       }
     }
@@ -1799,9 +1813,10 @@ function _generateDungeonOnce(opts) {
     for (const p of (r.pillars || [])) {
       if (Math.hypot(px - p.cx, py - p.cy) < p.radius + half + m) return false;
     }
-    // clear of compound buildings
+    // clear of compound buildings (including their plinth base ring)
     for (const b of (r.buildings || [])) {
-      if (Math.abs(px - b.cx) < b.half + half + m && Math.abs(py - b.cy) < b.half + half + m) return false;
+      const bh = b.half + (b.plinthW || 0);
+      if (Math.abs(px - b.cx) < bh + half + m && Math.abs(py - b.cy) < bh + half + m) return false;
     }
     // clear of terrain (sunken basins / raised terraces)
     for (const t of (r.terrains || [])) {
@@ -2164,39 +2179,51 @@ function _generateDungeonOnce(opts) {
         emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, t.secId);
       }
     }
-    // Courtyard compound — each building is a SOLID roofed structure. The
-    // four outer walls are two-sided against the building's roof sector
-    // (floor = roof height, ceiling = sky), so from the yard you see the wall
-    // face rise to the roofline and then the flat roof + open sky above it —
-    // a consistent skyline read. The wall faces carry a facade: a tall door
-    // panel centred on the south wall and lit window strips on the E/W walls.
+    // Courtyard compound — each building is a SOLID skyline structure built
+    // from three concentric height bands, all open to sky above:
+    //   • a raised PLINTH base ring the building stands on (also the floor of
+    //     the recessed entrance),
+    //   • the WALL ring rising to the roofline (facade: a recessed door bay on
+    //     the south, lit window strips on E/W),
+    //   • a PARAPET cap lip around a slightly recessed flat ROOF centre.
+    // Every band's ceiling is sky, so there are no sky/non-sky upper seams.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
       const bx = b.cx, by = b.cy, Bh = b.half, hd = b.door / 2, hw = b.win / 2;
-      const court = room.outerId, roof = b.roofSec;
-      const PD = b.porchDepth;
+      const court = room.outerId, plinth = b.plinthSec, cap = b.capSec, roof = b.roofSec;
+      const PD = b.porchDepth, PBh = Bh + b.plinthW, IBh = Bh - b.parapetW;
       const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh;
-      const pN = oS + PD; // recessed entrance back (north) edge
+      const pS = by - PBh, pN = by + PBh, pW = bx - PBh, pE = bx + PBh;
+      const rN = oS + PD; // recessed-entrance back edge
       const wallTex = b.wall;
-      const face = tex => ({ frontSide: { lower: tex } });
-      // SOUTH wall — the centre jogs inward to form a recessed entrance bay.
-      // The bay floor/ceiling are the open yard (sky), so the recess walls are
-      // ordinary yard↔roof faces (both sky above → no upper-texture seams):
-      // you walk into a shadowed nook with the door panel set at its back.
-      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));      // S left of bay
-      emitWall(bx - hd, oS, bx - hd, pN, court, roof, face(wallTex)); // bay W jamb (recess in)
-      emitWall(bx - hd, pN, bx + hd, pN, court, roof, face(b.doorTex)); // bay back (door panel)
-      emitWall(bx + hd, pN, bx + hd, oS, court, roof, face(wallTex)); // bay E jamb (recess out)
-      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));      // S right of bay
-      // EAST wall — split around a window strip.
-      emitWall(oE, oS, oE, by - hw, court, roof, face(wallTex));     // E below window
-      emitWall(oE, by - hw, oE, by + hw, court, roof, face(b.winTex)); // window strip
-      emitWall(oE, by + hw, oE, oN, court, roof, face(wallTex));     // E above window
-      // NORTH wall.
-      emitWall(oE, oN, oW, oN, court, roof, face(wallTex));
-      // WEST wall — split around a window strip.
-      emitWall(oW, oN, oW, by + hw, court, roof, face(wallTex));     // W above window
-      emitWall(oW, by + hw, oW, by - hw, court, roof, face(b.winTex)); // window strip
-      emitWall(oW, by - hw, oW, oS, court, roof, face(wallTex));     // W below window
+      const lo = tex => ({ frontSide: { lower: tex } });
+      // PLINTH base ring (court → plinth), a 12-unit step up onto the podium.
+      emitWall(pW, pS, pE, pS, court, plinth, lo(wallTex)); // S
+      emitWall(pE, pS, pE, pN, court, plinth, lo(wallTex)); // E
+      emitWall(pE, pN, pW, pN, court, plinth, lo(wallTex)); // N
+      emitWall(pW, pN, pW, pS, court, plinth, lo(wallTex)); // W
+      // WALL ring (plinth → cap). South face leaves an entrance gap that the
+      // plinth flows through into the recessed bay; the bay's door panel sits
+      // at its back. E/W walls split around window strips.
+      emitWall(oW, oS, bx - hd, oS, plinth, cap, lo(wallTex));   // S left of entrance
+      emitWall(bx + hd, oS, oE, oS, plinth, cap, lo(wallTex));   // S right of entrance
+      emitWall(bx - hd, oS, bx - hd, rN, plinth, cap, lo(wallTex)); // bay W jamb
+      emitWall(bx - hd, rN, bx + hd, rN, plinth, cap, lo(b.doorTex)); // bay back (door)
+      emitWall(bx + hd, rN, bx + hd, oS, plinth, cap, lo(wallTex)); // bay E jamb
+      emitWall(oE, oS, oE, by - hw, plinth, cap, lo(wallTex));   // E below window
+      emitWall(oE, by - hw, oE, by + hw, plinth, cap, lo(b.winTex)); // E window
+      emitWall(oE, by + hw, oE, oN, plinth, cap, lo(wallTex));   // E above window
+      emitWall(oE, oN, oW, oN, plinth, cap, lo(wallTex));        // N
+      emitWall(oW, oN, oW, by + hw, plinth, cap, lo(wallTex));   // W above window
+      emitWall(oW, by + hw, oW, by - hw, plinth, cap, lo(b.winTex)); // W window
+      emitWall(oW, by - hw, oW, oS, plinth, cap, lo(wallTex));   // W below window
+      // PARAPET cap → recessed ROOF centre: a raised lip ring around the roof.
+      if (IBh >= 32) {
+        const rp = squarePoly(bx, by, IBh * 2, IBh * 2);
+        for (let j = 0; j < rp.length; j++) {
+          const q1 = rp[j], q2 = rp[(j + 1) % rp.length];
+          emitWall(q1.x, q1.y, q2.x, q2.y, cap, roof, { backSide: { lower: b.capTex } });
+        }
+      }
     }
     // Ziggurat — concentric rising stair rings. Same CCW-inset walk as the
     // trim rings; front = outer (lower) ring, back = inner (higher) ring,
@@ -5086,7 +5113,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.22</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.23</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

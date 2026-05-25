@@ -701,15 +701,17 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
   }));
   const idIndex = new Map(roomSpecs.map((s, i) => [s.id, i]));
   const corridors = [];
+  const teleporters = [];
   if (connectionSpecs) {
     for (const c of connectionSpecs) {
       const a = idIndex.get(c.fromId), b = idIndex.get(c.toId);
       if (a == null || b == null || a === b) continue;
-      corridors.push({ a, b });
+      if (c.kind === 'teleporter') teleporters.push({ a, b });
+      else corridors.push({ a, b });
     }
   }
   const userThings = thingSpecs && thingSpecs.length ? thingSpecs : null;
-  return _generateDungeonOnce({ rooms, corridors, userThings });
+  return _generateDungeonOnce({ rooms, corridors, teleporters, userThings });
 }
 
 // Room presets — the predefined "library" the user picks from in
@@ -736,6 +738,10 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'crusher',     label: 'Crusher',      type: 'square',  w: 448, h: 448, feature: 'crusher' },
   { id: 'platform',    label: 'Platform',     type: 'square',  w: 512, h: 512, feature: 'platform' },
   { id: 'sky',         label: 'Sky Room',     type: 'octagon', r: 448,         feature: 'sky' },
+  { id: 'courtyard',   label: 'Courtyard',    type: 'square',  w: 1024, h: 1024, feature: 'courtyard' },
+  { id: 'plaza',       label: 'Plaza',        type: 'octagon', r: 640,          feature: 'plaza' },
+  { id: 'ziggurat',    label: 'Ziggurat',     type: 'square',  w: 768, h: 768,   feature: 'ziggurat' },
+  { id: 'lift',        label: 'Lift Vault',   type: 'square',  w: 640, h: 640,   feature: 'lift' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -935,6 +941,8 @@ function _generateDungeonOnce(opts) {
 
   // -------- 3. user-specified corridors OR auto spanning tree --------
   const corridors = [];
+  const teleportPads = []; // {roomIdx, cx, cy, half, padSecId, ownTag, destTag}
+  const userTeleporters = (opts && opts.teleporters) || [];
   const userCorridors = opts && opts.corridors;
   if (userCorridors) {
     // ShapeShifter explicit connections — try each pair the user drew. If
@@ -1032,7 +1040,16 @@ function _generateDungeonOnce(opts) {
     { wall: 'STONE2',   floor: 'RROCK11',  ceil: 'CEIL3_3', trim: 'STEP2',    accent: 'FLAT5'    },
     { wall: 'WOOD1',    floor: 'FLOOR5_2', ceil: 'CEIL5_1', trim: 'FLOOR5_4', accent: 'TLITE6_4' },
     { wall: 'GRAY5',    floor: 'FLAT5_4',  ceil: 'CEIL3_1', trim: 'STEP1',    accent: 'TLITE6_6' },
+    // Urban / industrial sets — for city blocks, tech bays and brick yards
+    { wall: 'STARTAN3', floor: 'FLOOR0_2', ceil: 'CEIL3_4', trim: 'FLAT1',    accent: 'COMPSPAN' },
+    { wall: 'BROWN144', floor: 'FLAT5_4',  ceil: 'CEIL5_2', trim: 'FLAT5',    accent: 'COMPBLUE' },
+    { wall: 'GRAY7',    floor: 'FLAT1',    ceil: 'CEIL3_4', trim: 'FLAT5_4',  accent: 'LITE5'    },
+    { wall: 'STONE3',   floor: 'RROCK16',  ceil: 'CEIL3_3', trim: 'STEP2',    accent: 'FLAT5_5'  },
   ];
+  // City-block building wall textures — used by the courtyard feature so
+  // central structures read as houses / towers, not generic dungeon walls.
+  const BUILDING_WALLS = ['BROWN1', 'STONE2', 'STARTAN3', 'GRAY7', 'METAL2', 'BROWN144'];
+  const BUILDING_ROOFS = ['FLAT1', 'CEIL5_2', 'FLAT5_4', 'CRATOP1', 'FLAT5_5'];
   // Themed zones: cluster rooms by proximity into 2–3 zones, each zone gets a
   // shared palette. Adjacent rooms in the same zone read as one "area" — a
   // techbase wing, a hellish wing, a wood-floored armory — which is the
@@ -1107,9 +1124,13 @@ function _generateDungeonOnce(opts) {
     else if (roll < 0.71)                    r.feature = 'gallery';
     else if (roll < 0.76 && isMidRoom)       r.feature = 'throne';
     else if (roll < 0.81)                    r.feature = 'mausoleum';
-    else if (roll < 0.85)                    r.feature = 'foundry';
-    else if (roll < 0.89 && isMidRoom)       r.feature = 'observatory';
-    else if (roll < 0.93)                    r.feature = 'sewer';
+    else if (roll < 0.83)                    r.feature = 'foundry';
+    else if (roll < 0.87 && isMidRoom)       r.feature = 'observatory';
+    else if (roll < 0.90)                    r.feature = 'sewer';
+    else if (isLargeRoom && roll < 0.94)     r.feature = 'courtyard';
+    else if (isMidRoom && roll < 0.955)      r.feature = 'plaza';
+    else if (isMidRoom && roll < 0.975)      r.feature = 'ziggurat';
+    else if (isMidRoom && roll < 0.99)       r.feature = 'lift';
     else                                     r.feature = 'none';
     // Per-feature room-level overrides — ceiling height, palette swaps and
     // ambient lighting set the mood before sector allocation.
@@ -1151,6 +1172,35 @@ function _generateDungeonOnce(opts) {
       r.ceilH = r.floorH + 128;
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
+    }
+    // Lift — a raised vantage platform reachable only by a working lift.
+    if (r.feature === 'lift') {
+      r.ceilH = Math.max(r.ceilH, r.floorH + 192);
+    }
+    // Courtyard — an open-sky paved yard with a central enterable BUILDING
+    // (a house/tower silhouette with solid walls, a flat roof and one door).
+    // This is the headline "structures in an open area" feature.
+    if (r.feature === 'courtyard') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 256;
+      r.light = 208;
+      r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT5_4', 'FLOOR0_1', 'RROCK16']) };
+    }
+    // Plaza — open-sky yard dotted with several small solid blocks
+    // (planters / kiosks) that the player weaves between.
+    if (r.feature === 'plaza') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 224;
+      r.light = 200;
+      r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT1', 'FLAT5_4', 'FLOOR0_2']) };
+    }
+    // Ziggurat — a stepped pyramid the player climbs to a central peak.
+    // Concentric rings rise 16 units each, adding lots of distinct floor
+    // heights (the verticality the pro maps lean on). Tall ceiling so the
+    // monument has headroom.
+    if (r.feature === 'ziggurat') {
+      r.ceilH = r.floorH + 256;
+      r.light = pick([160, 176, 192]);
     }
     r.special = rand() < 0.15 ? 8 : (rand() < 0.06 ? 17 : 0);
   });
@@ -1220,6 +1270,7 @@ function _generateDungeonOnce(opts) {
 
   // -------- 6. allocate sectors --------
   const sectors = [];
+  let tagCounter = 1; // unique sector tags for lifts etc.
   const allocSec = (props) => {
     const id = 's' + sectors.length;
     sectors.push({ id, floorH: 0, ceilH: 128, floorTex: 'FLOOR0_1', ceilTex: 'CEIL3_5',
@@ -1235,7 +1286,9 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    if (!r._fused) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift';
+    if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
+    else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
     // ceiling matches room ceiling — this is the layer doors connect to.
     // Outer ring at the wall. For sky rooms the OUTER ring keeps a TEXTURED
@@ -1392,6 +1445,113 @@ function _generateDungeonOnce(opts) {
         light: Math.max(80, r.light - 32), special: 7,
       });
     }
+    // Courtyard — a compound of 1–4 enterable buildings (houses / towers)
+    // standing in the open-sky yard. Bigger yards hold more buildings laid
+    // out on a grid with "streets" between, like a city block. Each
+    // building gets its own interior, door and two windows.
+    if (r.feature === 'courtyard') {
+      const sn32 = v => Math.round(v / 32) * 32;
+      let layout;
+      if (minDim >= 1280) {
+        const o = sn32(minDim * 0.24), h = sn32(minDim * 0.13);
+        layout = [[-o,-o],[o,-o],[-o,o],[o,o]].map(([dx,dy]) => ({ cx: sn32(r.cx)+dx, cy: sn32(r.cy)+dy, half: h }));
+      } else if (minDim >= 1024) {
+        const o = sn32(minDim * 0.22), h = sn32(minDim * 0.16);
+        const axis = rand() < 0.5;
+        layout = [[-o,0],[o,0]].map(([dx,dy]) => ({ cx: sn32(r.cx)+(axis?dx:dy), cy: sn32(r.cy)+(axis?dy:dx), half: h }));
+      } else {
+        layout = [{ cx: sn32(r.cx), cy: sn32(r.cy), half: sn32(minDim * 0.22) }];
+      }
+      r.buildings = [];
+      for (const pos of layout) {
+        if (pos.half < 96) continue;
+        const bRoof = pick(BUILDING_ROOFS);
+        const isTower = rand() < 0.4;
+        const roofTop = r.floorH + (isTower ? 184 : 112);
+        r.buildings.push({
+          cx: pos.cx, cy: pos.cy, half: pos.half, thick: 32, door: 64, win: 96,
+          wall: pick(BUILDING_WALLS), roofTop,
+          interiorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
+            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 48), special: 0 }),
+          doorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
+            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 32), special: 0 }),
+          windowIds: [
+            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
+              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
+            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
+              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
+          ],
+        });
+      }
+    }
+    // Ziggurat — allocate the concentric rising stair rings. Each ring is
+    // STAIR_W wide and 16 units higher than the one outside it, so the
+    // player climbs a stepped pyramid to a central peak platform.
+    if (r.feature === 'ziggurat') {
+      const STAIR_W = 48;
+      const maxSteps = Math.floor((minDim / 2 - 80) / STAIR_W);
+      const numSteps = Math.min(7, Math.max(2, maxSteps));
+      r.stairW = STAIR_W;
+      r.stairCount = numSteps;
+      r.stairIds = [];
+      for (let i = 1; i <= numSteps; i++) {
+        r.stairIds.push(allocSec({
+          floorH: r.floorH + i * 16, ceilH: r.ceilH,
+          floorTex: i === numSteps ? r.palette.accent : r.palette.trim,
+          ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+          light: Math.min(255, r.light + i * 4), special: 0,
+        }));
+      }
+    }
+    // Lift — a central raised vantage platform plus a working lift strip on
+    // its south edge. The platform sits +96 above the floor (too high to
+    // step); the lift starts level with it and lowers on use (SR special
+    // 62), so the player rides up. Adds verticality + a real linedef trigger.
+    if (r.feature === 'lift' && minDim >= 384) {
+      const ph = Math.floor(minDim * 0.26 / 32) * 32; // platform half-size
+      const lift = 64;                                  // lift strip size
+      r.lift = {
+        cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32,
+        ph, lift, top: r.floorH + 96,
+      };
+      r.liftPlatformId = allocSec({
+        floorH: r.floorH + 96, ceilH: r.ceilH,
+        floorTex: r.palette.accent, ceilTex: r.palette.ceil,
+        light: Math.min(255, r.light + 16), special: 0,
+      });
+      r.liftTag = tagCounter++;
+      r.liftSectorId = allocSec({
+        floorH: r.floorH + 96, ceilH: r.ceilH,
+        floorTex: r.palette.trim, ceilTex: r.palette.ceil,
+        light: r.light, special: 0, tag: r.liftTag,
+      });
+    }
+    // Plaza terrain — break the flat civic square into real height variation
+    // (the industrial/open-area look). A sunken central basin sits 24 below
+    // grade with a pair of raised vantage terraces on one axis 24 above it,
+    // giving three distinct floor levels. Stamped as flush-bordered
+    // sub-sectors; the resolve pass textures the risers, and the sky ceiling
+    // continues unbroken above them. Stored for the emit pass + clearance.
+    r.terrains = [];
+    if (r.feature === 'plaza' && minDim >= 640) {
+      const sn = v => Math.round(v / 32) * 32;
+      const bHalf = sn(minDim * 0.15);
+      r.terrains.push({ cx: sn(r.cx), cy: sn(r.cy), hw: bHalf, hh: bHalf, kind: 'basin',
+        secId: allocSec({ floorH: r.floorH - 24, ceilH: r.ceilH,
+          floorTex: pick(['FWATER1', 'FLOOR0_2', 'FLAT5_4']), ceilTex: r.palette.ceil,
+          light: Math.max(96, r.light - 24), special: 0 }) });
+      const off = sn(minDim * 0.30), tHalf = sn(minDim * 0.12);
+      const axis = rand() < 0.5;
+      for (const s of [-1, 1]) {
+        if (tHalf < 64) break;
+        r.terrains.push({
+          cx: sn(r.cx) + (axis ? s * off : 0), cy: sn(r.cy) + (axis ? 0 : s * off),
+          hw: tHalf, hh: tHalf, kind: 'terrace',
+          secId: allocSec({ floorH: r.floorH + 24, ceilH: r.ceilH,
+            floorTex: r.palette.accent, ceilTex: r.palette.ceil,
+            light: Math.min(255, r.light + 16), special: 0 }) });
+      }
+    }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
     // Pillars in larger rooms — small closed sub-sectors that act as
@@ -1400,7 +1560,27 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r.feature === 'altar') {
+    if (r.feature === 'plaza' && minDim >= 384) {
+      // Scatter a few solid blocks (planters / kiosks) the player weaves
+      // between in the open plaza, kept to the OUTER ring so they clear the
+      // sunken basin and raised terraces. Deterministic positions from RNG.
+      const span = minDim * 0.30;
+      const clearOfTerrain = (cx, cy, rad) => (r.terrains || []).every(t =>
+        Math.abs(cx - t.cx) >= t.hw + rad + 24 || Math.abs(cy - t.cy) >= t.hh + rad + 24);
+      const n = 3 + Math.floor(rand() * 3);
+      for (let i = 0; i < n; i++) {
+        const ang = rand() * Math.PI * 2;
+        // Push planters further out (0.7–1.05 of span) when terrain exists so
+        // they ring the terraces rather than collide with them.
+        const lo = (r.terrains && r.terrains.length) ? 0.7 : 0.4;
+        const dist = span * (lo + rand() * 0.35);
+        const cx = Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32;
+        const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
+        const radius = 40 + Math.floor(rand() * 3) * 16;
+        if (!clearOfTerrain(cx, cy, radius)) continue;
+        r.pillars.push({ cx, cy, radius });
+      }
+    } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
     } else if (r.feature === 'observatory' && minDim >= 384) {
@@ -1538,6 +1718,85 @@ function _generateDungeonOnce(opts) {
     }
   });
 
+  // -------- 6b. teleporter pads --------
+  // ShapeShifter teleporter connections: place a flush WR-97 pad in each
+  // endpoint room and a type-14 destination thing on it. A pad is a small
+  // flat sub-sector at the room floor (so it sits flush, no step) carved
+  // into the open floor. Restricted to flat-floored rooms (trimLayers===0,
+  // not fused, not ziggurat) so the pad's square loop never crosses a
+  // concentric trim ring (which would produce invalid topology). The pad is
+  // placed clear of the centre feature, pillars, buildings and lift.
+  const padClear = (r, px, py, half) => {
+    const m = 8;
+    // fully inside the room (corners within an inset polygon clear of walls)
+    const ip = roomPoly(r, 40);
+    if (ip.length < 3) return false;
+    for (const [dx, dy] of [[-half, -half], [half, -half], [half, half], [-half, half], [0, 0]]) {
+      if (!pointInPolygon(px + dx, py + dy, ip)) return false;
+    }
+    // clear of the centre feature ring (trimLayers===0 → ring radius = INNER_INSET)
+    if (r.feature !== 'none' && r.featureId) {
+      if (Math.hypot(px - r.cx, py - r.cy) < INNER_INSET + half + m) return false;
+    }
+    // clear of pillars / planters
+    for (const p of (r.pillars || [])) {
+      if (Math.hypot(px - p.cx, py - p.cy) < p.radius + half + m) return false;
+    }
+    // clear of compound buildings
+    for (const b of (r.buildings || [])) {
+      if (Math.abs(px - b.cx) < b.half + half + m && Math.abs(py - b.cy) < b.half + half + m) return false;
+    }
+    // clear of terrain (sunken basins / raised terraces)
+    for (const t of (r.terrains || [])) {
+      if (Math.abs(px - t.cx) < t.hw + half + m && Math.abs(py - t.cy) < t.hh + half + m) return false;
+    }
+    // clear of the lift platform
+    if (r.lift && Math.abs(px - r.lift.cx) < r.lift.ph + half + m &&
+        Math.abs(py - r.lift.cy) < r.lift.ph + half + m) return false;
+    // clear of pads already placed in this room
+    for (const q of teleportPads) {
+      if (q.roomIdx !== rooms.indexOf(r)) continue;
+      if (Math.abs(px - q.cx) < q.half + half + 32 && Math.abs(py - q.cy) < q.half + half + 32) return false;
+    }
+    return true;
+  };
+  // Grid-scan the open floor for a clear pad spot, preferring the cell
+  // nearest the partner room so the pad faces the connection.
+  const placePad = (r, towardX, towardY) => {
+    if (r._fused || r.trimLayers !== 0 || r.feature === 'ziggurat') return null;
+    const half = 40;
+    const bb = roomBBox(r, 48);
+    if (bb.maxX - bb.minX < 2 * half || bb.maxY - bb.minY < 2 * half) return null;
+    let best = null, bestD = Infinity;
+    for (let py = Math.ceil(bb.minY / 32) * 32; py <= bb.maxY; py += 32) {
+      for (let px = Math.ceil(bb.minX / 32) * 32; px <= bb.maxX; px += 32) {
+        if (!padClear(r, px, py, half)) continue;
+        const d = Math.hypot(px - towardX, py - towardY);
+        if (d < bestD) { bestD = d; best = { cx: px, cy: py, half }; }
+      }
+    }
+    return best;
+  };
+  for (const tp of userTeleporters) {
+    const ra = rooms[tp.a], rb = rooms[tp.b];
+    if (!ra || !rb) continue;
+    const padA = placePad(ra, rb.cx, rb.cy);
+    const padB = placePad(rb, ra.cx, ra.cy);
+    if (!padA || !padB) continue; // couldn't fit a pad in one of the rooms — skip
+    const tagA = tagCounter++, tagB = tagCounter++;
+    const padFloor = (r, pad, tag) => allocSec({
+      floorH: r.floorH, ceilH: r.ceilH,
+      floorTex: 'GATE1', ceilTex: r.palette.ceil,
+      light: 255, special: 0, tag,
+    });
+    padA.padSecId = padFloor(ra, padA, tagA);
+    padB.padSecId = padFloor(rb, padB, tagB);
+    teleportPads.push({ roomIdx: tp.a, cx: padA.cx, cy: padA.cy, half: padA.half,
+      padSecId: padA.padSecId, ownTag: tagA, destTag: tagB });
+    teleportPads.push({ roomIdx: tp.b, cx: padB.cx, cy: padB.cy, half: padB.half,
+      padSecId: padB.padSecId, ownTag: tagB, destTag: tagA });
+  }
+
   // Corridors: floor = max of two rooms' floors, ceiling = floor + 96 (canon).
   // Light 32 below the brighter neighbour for that "darker corridor → bright
   // room" contrast (Romero's doorway-light-delta rule).
@@ -1634,7 +1893,7 @@ function _generateDungeonOnce(opts) {
       id: 'l' + linedefs.length,
       v1, v2,
       flags: (sharedSector ? 4 : 1) | (props.flags || 0),
-      special: 0, tag: 0, front, back,
+      special: props.special || 0, tag: props.tag || 0, front, back,
     };
     linedefs.push(ld);
     return ld;
@@ -1823,6 +2082,108 @@ function _generateDungeonOnce(opts) {
           emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId);
         }
       }
+    }
+    // Teleporter pads — a flush GATE-floor square carved into the room. Its
+    // boundary lines are two-sided (passable) WR-97 teleport triggers whose
+    // front side faces the room: walking ONTO the pad fires the teleport to
+    // the partner pad's destination (destTag), while arriving from a teleport
+    // (landing on the back side) and walking off does not re-trigger.
+    for (const pad of teleportPads) {
+      if (pad.roomIdx !== roomIdx) continue;
+      const poly = squarePoly(pad.cx, pad.cy, pad.half * 2, pad.half * 2);
+      for (let j = 0; j < poly.length; j++) {
+        const q1 = poly[j], q2 = poly[(j + 1) % poly.length];
+        emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, pad.padSecId,
+          { special: 97, tag: pad.destTag });
+      }
+    }
+    // Terrain — sunken basins / raised terraces stamped into a flat yard.
+    // Two-sided flush borders; the resolve pass paints STEP risers on the
+    // lower side, and the (sky) ceiling carries over unchanged.
+    for (const t of (!room._fused && room.terrains ? room.terrains : [])) {
+      const poly = squarePoly(t.cx, t.cy, t.hw * 2, t.hh * 2);
+      for (let j = 0; j < poly.length; j++) {
+        const q1 = poly[j], q2 = poly[(j + 1) % poly.length];
+        emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, t.secId);
+      }
+    }
+    // Courtyard compound — each building is a thick-walled square shell with
+    // a roofed interior, a south door, and a window on the east + west walls.
+    for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
+      const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2, hw = b.win / 2;
+      const court = room.outerId, inner = b.interiorId, door = b.doorId;
+      const wE = b.windowIds[0], wW = b.windowIds[1];
+      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh; // outer ring
+      const iS = by - Bh + T, iN = by + Bh - T, iW = bx - Bh + T, iE = bx + Bh - T; // inner
+      const wallTex = b.wall;
+      // OUTER ring (one-sided, courtyard on the right / CCW walk). The south
+      // wall is split around the door gap; E/W walls split around windows.
+      emitWall(oW, oS, bx - hd, oS, court, null, { middle: wallTex });   // S left of door
+      emitWall(bx + hd, oS, oE, oS, court, null, { middle: wallTex });   // S right of door
+      emitWall(oE, oS, oE, by - hw, court, null, { middle: wallTex });   // E below window
+      emitWall(oE, by + hw, oE, oN, court, null, { middle: wallTex });   // E above window
+      emitWall(oE, oN, oW, oN, court, null, { middle: wallTex });        // N
+      emitWall(oW, oN, oW, by + hw, court, null, { middle: wallTex });   // W above window
+      emitWall(oW, by - hw, oW, oS, court, null, { middle: wallTex });   // W below window
+      // INNER ring (one-sided, interior on the right / CW walk).
+      emitWall(bx - hd, iS, iW, iS, inner, null, { middle: wallTex });   // S left
+      emitWall(iE, iS, bx + hd, iS, inner, null, { middle: wallTex });   // S right
+      emitWall(iW, iS, iW, by - hw, inner, null, { middle: wallTex });   // W below window
+      emitWall(iW, by + hw, iW, iN, inner, null, { middle: wallTex });   // W above window
+      emitWall(iW, iN, iE, iN, inner, null, { middle: wallTex });        // N
+      emitWall(iE, iN, iE, by + hw, inner, null, { middle: wallTex });   // E above window
+      emitWall(iE, by - hw, iE, iS, inner, null, { middle: wallTex });   // E below window
+      // DOOR — short passage through the wall thickness (open both faces).
+      emitWall(bx - hd, oS, bx + hd, oS, court, door, { upper: wallTex, backUpper: wallTex });
+      emitWall(bx + hd, iS, bx - hd, iS, inner, door);
+      emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex });
+      emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex });
+      // EAST WINDOW — raised-sill opening; see/shoot through, can't enter.
+      emitWall(oE, by - hw, oE, by + hw, court, wE, { upper: wallTex, backUpper: wallTex }); // courtyard face
+      emitWall(iE, by + hw, iE, by - hw, inner, wE);                                          // interior face
+      emitWall(oE, by - hw, iE, by - hw, wE, null, { middle: wallTex });                      // south jamb
+      emitWall(iE, by + hw, oE, by + hw, wE, null, { middle: wallTex });                      // north jamb
+      // WEST WINDOW
+      emitWall(oW, by + hw, oW, by - hw, court, wW, { upper: wallTex, backUpper: wallTex });   // courtyard face
+      emitWall(iW, by - hw, iW, by + hw, inner, wW);                                           // interior face
+      emitWall(iW, by - hw, oW, by - hw, wW, null, { middle: wallTex });                       // south jamb
+      emitWall(oW, by + hw, iW, by + hw, wW, null, { middle: wallTex });                       // north jamb
+    }
+    // Ziggurat — concentric rising stair rings. Same CCW-inset walk as the
+    // trim rings; front = outer (lower) ring, back = inner (higher) ring,
+    // so the resolve pass puts the step face on the lower side.
+    if (!room._fused && room.feature === 'ziggurat' && room.stairIds) {
+      const layers = [room.outerId, ...room.stairIds];
+      for (let i = 1; i <= room.stairCount; i++) {
+        const ringPoly = roomPoly(room, room.stairW * i);
+        if (ringPoly.length < 3) break;
+        for (let j = 0; j < ringPoly.length; j++) {
+          const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+          emitWall(p1.x, p1.y, p2.x, p2.y, layers[i - 1], layers[i]);
+        }
+      }
+    }
+    // Lift — a +96 vantage platform with a working SR lift on its south
+    // edge. Platform walls are 2-sided steps (too tall to climb); the lift
+    // strip rides the player up when its south face (special 62) is used.
+    if (!room._fused && room.lift) {
+      const L = room.lift, lx = L.cx, ly = L.cy, P = L.ph, hl = L.lift / 2;
+      const out = room.outerId, plat = room.liftPlatformId, lif = room.liftSectorId;
+      const pS = ly - P, pN = ly + P, pW = lx - P, pE = lx + P;
+      const lS = pS - L.lift; // lift strip south edge
+      // Platform ring (front = main floor, 2-sided steps), south split for lift.
+      emitWall(pE, pN, pW, pN, out, plat); // N
+      emitWall(pW, pN, pW, pS, out, plat); // W
+      emitWall(pE, pS, pE, pN, out, plat); // E
+      emitWall(pW, pS, lx - hl, pS, out, plat); // S left of lift
+      emitWall(lx + hl, pS, pE, pS, out, plat); // S right of lift
+      // Lift strip — north edge opens onto the platform (same height).
+      emitWall(lx + hl, pS, lx - hl, pS, plat, lif);
+      // Side walls (2-sided steps to main floor).
+      emitWall(lx + hl, lS, lx + hl, pS, out, lif); // east
+      emitWall(lx - hl, pS, lx - hl, lS, out, lif); // west
+      // South face — the activator: SR Lift (62) on this room's lift tag.
+      emitWall(lx - hl, lS, lx + hl, lS, out, lif, { special: 62, tag: room.liftTag });
     }
   });
 
@@ -2366,6 +2727,13 @@ function _generateDungeonOnce(opts) {
   if (userThings && !things.some(t => t.type === 1)) {
     things.unshift({ id: 'tps', x: rooms[0].cx | 0, y: rooms[0].cy | 0,
       angle: 90, type: 1, flags: 7 });
+  }
+  // Teleport destinations: a type-14 thing sits on each pad. The partner
+  // pad's WR-97 lines are tagged to this pad's sector, so arriving players
+  // land here. Flags 7 = present on all skill levels.
+  for (const pad of teleportPads) {
+    things.push({ id: 't' + things.length, x: pad.cx, y: pad.cy,
+      angle: 90, type: 14, flags: 7 });
   }
   // Per-zone monster archetypes — combat theme matches palette. Techbase
   // walls draw human grunts; hellish stone draws demons and cacos. Doom
@@ -4136,6 +4504,7 @@ function ShapeShifter() {
   const [selectedId, setSelectedId] = useState(null);          // selected ROOM
   const [selectedThingId, setSelectedThingId] = useState(null); // selected THING
   const [pendingConnect, setPendingConnect] = useState(null);
+  const [connKind, setConnKind] = useState('corridor'); // 'corridor' | 'teleporter'
   const [thingCat, setThingCat] = useState('PLAYER');
   const [pickedThingType, setPickedThingType] = useState(1);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
@@ -4203,15 +4572,24 @@ function ShapeShifter() {
       setHint('These rooms are already connected.');
       return;
     }
-    // Validate via tryCorridor against current placement.
+    // Validate against current placement by building a one-connection probe.
     const specs = rooms.map(r => ({
       type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
     }));
-    const fromIdx = rooms.findIndex(r => r.id === fromId);
-    const toIdx = rooms.findIndex(r => r.id === toId);
-    const test = generateShapeShifterMap(specs, [{ fromId, toId }]);
+    const test = generateShapeShifterMap(specs, [{ fromId, toId, kind: connKind }]);
+    if (connKind === 'teleporter') {
+      // Teleporter is valid when a pad was carved in BOTH rooms (8 WR-97
+      // lines + two type-14 destinations). Pads only fit flat-floored rooms.
+      const padPairOK = test.things.filter(t => t.type === 14).length === 2;
+      const conn = { id: nextId('ssc'), fromId, toId, kind: 'teleporter', valid: padPairOK };
+      setConnections(cs => [...cs, conn]);
+      setHint(padPairOK
+        ? 'Teleporter linked — instant travel between the pads. Keep linking or BUILD.'
+        : 'Teleport pad won’t fit — use open flat rooms (Plaza, Courtyard, Lift Vault).');
+      return;
+    }
     const hasNewDoor = test.linedefs.some(l => l.special === 1);
-    const conn = { id: nextId('ssc'), fromId, toId, valid: hasNewDoor };
+    const conn = { id: nextId('ssc'), fromId, toId, kind: 'corridor', valid: hasNewDoor };
     setConnections(cs => [...cs, conn]);
     if (hasNewDoor) {
       setHint('Corridor drawn — keep linking or hit BUILD.');
@@ -4222,7 +4600,7 @@ function ShapeShifter() {
 
   const deleteConnection = (id) => {
     setConnections(cs => cs.filter(c => c.id !== id));
-    setHint('Corridor removed.');
+    setHint('Connection removed.');
   };
 
   const build = () => {
@@ -4597,15 +4975,25 @@ function ShapeShifter() {
       }
       ctx.stroke();
     }
-    // Connections (drawn before rooms so room outlines sit on top of endpoints)
+    // Connections (drawn before rooms so room outlines sit on top of endpoints).
+    // Teleporters draw as a violet dotted link with ◉ endpoints; corridors as
+    // a solid amber line. Invalid links are red dashed.
     for (const c of connections) {
       const a = roomById(c.fromId), b = roomById(c.toId); if (!a || !b) continue;
       const pa = worldToScreen(a.cx, a.cy), pb = worldToScreen(b.cx, b.cy);
+      const isTele = c.kind === 'teleporter';
       ctx.lineWidth = 4;
-      ctx.strokeStyle = c.valid === false ? COLORS.danger : COLORS.amber;
-      ctx.setLineDash(c.valid === false ? [6, 6] : []);
+      ctx.strokeStyle = c.valid === false ? COLORS.danger : (isTele ? '#9966ff' : COLORS.amber);
+      ctx.setLineDash(c.valid === false ? [6, 6] : (isTele ? [3, 9] : []));
       ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
       ctx.setLineDash([]);
+      if (isTele && c.valid !== false) {
+        ctx.fillStyle = '#9966ff';
+        ctx.font = '16px ui-monospace, monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('◉', pa.x, pa.y);
+        ctx.fillText('◉', pb.x, pb.y);
+      }
     }
     // Rooms — render polygons. Fused rooms get a faint tint only (their
     // outline is replaced by the fusion-pass walls drawn above) so the
@@ -4674,7 +5062,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.10</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.17</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (
@@ -4708,7 +5096,7 @@ function ShapeShifter() {
             <button key={m} onClick={() => {
                 setMode(m); setSelectedId(null); setSelectedThingId(null); setPendingConnect(null);
                 if (m === 'place')   setHint('PLACE: tap a chip, drag rooms to fuse.');
-                if (m === 'connect') setHint('CONNECT: tap two rooms to draw a corridor.');
+                if (m === 'connect') setHint('CONNECT: pick CORRIDOR or TELEPORTER, then tap two rooms.');
                 if (m === 'things')  setHint('THINGS: pick a thing, tap the canvas to drop it.');
               }}
               style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
@@ -4724,6 +5112,28 @@ function ShapeShifter() {
           <span style={{ flex: 1 }}/>
           <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim, alignSelf: 'center' }}>
             {rooms.length}r / {connections.length}c / {thingsList.length}t
+          </span>
+        </div>
+      )}
+      {!previewMap && mode === 'connect' && (
+        <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                      display: 'flex', gap: 6, alignItems: 'center', padding: '6px 8px' }}>
+          <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim }}>LINK:</span>
+          {[['corridor', 'CORRIDOR', COLORS.amber], ['teleporter', 'TELEPORTER', '#9966ff']].map(([k, lbl, col]) => (
+            <button key={k} onClick={() => {
+                setConnKind(k); setPendingConnect(null);
+                setHint(k === 'teleporter'
+                  ? 'TELEPORTER: tap two flat rooms (Plaza/Courtyard/Lift) for instant travel.'
+                  : 'CORRIDOR: tap two rooms whose walls overlap to draw a door.');
+              }}
+              style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
+                       color: connKind === k ? COLORS.bg : col,
+                       background: connKind === k ? col : COLORS.bg,
+                       border: '1px solid ' + col, borderRadius: 4 }}>{lbl}</button>
+          ))}
+          <span style={{ flex: 1 }}/>
+          <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim }}>
+            {connKind === 'teleporter' ? '◉ violet = warp' : '— amber = walk'}
           </span>
         </div>
       )}

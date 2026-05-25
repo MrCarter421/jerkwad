@@ -1465,22 +1465,25 @@ function _generateDungeonOnce(opts) {
       r.buildings = [];
       for (const pos of layout) {
         if (pos.half < 96) continue;
+        // Solid roofed structure: walls rise to a flat roof with OPEN SKY
+        // above it (the roof sector's ceiling is sky too), so the building
+        // reads consistently from every angle — wall face up to the roofline,
+        // then the flat roof, then sky. (Vanilla Doom can't both enter a
+        // building AND show its roof from outside in an open-sky yard, so we
+        // make these solid skyline structures with a textured facade.) Houses
+        // are 96–128 tall, towers 160–208, for a varied skyline.
         const bRoof = pick(BUILDING_ROOFS);
         const isTower = rand() < 0.4;
-        const roofTop = r.floorH + (isTower ? 184 : 112);
+        const roofTop = r.floorH + (isTower ? 160 + Math.floor(rand() * 4) * 16
+                                            : 96 + Math.floor(rand() * 3) * 16);
         r.buildings.push({
-          cx: pos.cx, cy: pos.cy, half: pos.half, thick: 32, door: 64, win: 96,
-          wall: pick(BUILDING_WALLS), roofTop,
-          interiorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
-            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 48), special: 0 }),
-          doorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
-            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 32), special: 0 }),
-          windowIds: [
-            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
-              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
-            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
-              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
-          ],
+          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80,
+          wall: pick(BUILDING_WALLS), roofTop, isTower,
+          doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
+          winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
+          roofSec: allocSec({ floorH: roofTop, ceilH: r.ceilH,
+            floorTex: bRoof, ceilTex: 'F_SKY1',
+            light: Math.min(255, r.light + 8), special: 0 }),
         });
       }
     }
@@ -2145,47 +2148,32 @@ function _generateDungeonOnce(opts) {
         emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, t.secId);
       }
     }
-    // Courtyard compound — each building is a thick-walled square shell with
-    // a roofed interior, a south door, and a window on the east + west walls.
+    // Courtyard compound — each building is a SOLID roofed structure. The
+    // four outer walls are two-sided against the building's roof sector
+    // (floor = roof height, ceiling = sky), so from the yard you see the wall
+    // face rise to the roofline and then the flat roof + open sky above it —
+    // a consistent skyline read. The wall faces carry a facade: a tall door
+    // panel centred on the south wall and lit window strips on the E/W walls.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
-      const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2, hw = b.win / 2;
-      const court = room.outerId, inner = b.interiorId, door = b.doorId;
-      const wE = b.windowIds[0], wW = b.windowIds[1];
-      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh; // outer ring
-      const iS = by - Bh + T, iN = by + Bh - T, iW = bx - Bh + T, iE = bx + Bh - T; // inner
+      const bx = b.cx, by = b.cy, Bh = b.half, hd = b.door / 2, hw = b.win / 2;
+      const court = room.outerId, roof = b.roofSec;
+      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh;
       const wallTex = b.wall;
-      // OUTER ring (one-sided, courtyard on the right / CCW walk). The south
-      // wall is split around the door gap; E/W walls split around windows.
-      emitWall(oW, oS, bx - hd, oS, court, null, { middle: wallTex });   // S left of door
-      emitWall(bx + hd, oS, oE, oS, court, null, { middle: wallTex });   // S right of door
-      emitWall(oE, oS, oE, by - hw, court, null, { middle: wallTex });   // E below window
-      emitWall(oE, by + hw, oE, oN, court, null, { middle: wallTex });   // E above window
-      emitWall(oE, oN, oW, oN, court, null, { middle: wallTex });        // N
-      emitWall(oW, oN, oW, by + hw, court, null, { middle: wallTex });   // W above window
-      emitWall(oW, by - hw, oW, oS, court, null, { middle: wallTex });   // W below window
-      // INNER ring (one-sided, interior on the right / CW walk).
-      emitWall(bx - hd, iS, iW, iS, inner, null, { middle: wallTex });   // S left
-      emitWall(iE, iS, bx + hd, iS, inner, null, { middle: wallTex });   // S right
-      emitWall(iW, iS, iW, by - hw, inner, null, { middle: wallTex });   // W below window
-      emitWall(iW, by + hw, iW, iN, inner, null, { middle: wallTex });   // W above window
-      emitWall(iW, iN, iE, iN, inner, null, { middle: wallTex });        // N
-      emitWall(iE, iN, iE, by + hw, inner, null, { middle: wallTex });   // E above window
-      emitWall(iE, by - hw, iE, iS, inner, null, { middle: wallTex });   // E below window
-      // DOOR — short passage through the wall thickness (open both faces).
-      emitWall(bx - hd, oS, bx + hd, oS, court, door, { upper: wallTex, backUpper: wallTex });
-      emitWall(bx + hd, iS, bx - hd, iS, inner, door);
-      emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex });
-      emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex });
-      // EAST WINDOW — raised-sill opening; see/shoot through, can't enter.
-      emitWall(oE, by - hw, oE, by + hw, court, wE, { upper: wallTex, backUpper: wallTex }); // courtyard face
-      emitWall(iE, by + hw, iE, by - hw, inner, wE);                                          // interior face
-      emitWall(oE, by - hw, iE, by - hw, wE, null, { middle: wallTex });                      // south jamb
-      emitWall(iE, by + hw, oE, by + hw, wE, null, { middle: wallTex });                      // north jamb
-      // WEST WINDOW
-      emitWall(oW, by + hw, oW, by - hw, court, wW, { upper: wallTex, backUpper: wallTex });   // courtyard face
-      emitWall(iW, by - hw, iW, by + hw, inner, wW);                                           // interior face
-      emitWall(iW, by - hw, oW, by - hw, wW, null, { middle: wallTex });                       // south jamb
-      emitWall(oW, by + hw, iW, by + hw, wW, null, { middle: wallTex });                       // north jamb
+      const face = tex => ({ frontSide: { lower: tex } });
+      // SOUTH wall — split around a tall door panel.
+      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));     // S left of door
+      emitWall(bx - hd, oS, bx + hd, oS, court, roof, face(b.doorTex)); // door panel
+      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));     // S right of door
+      // EAST wall — split around a window strip.
+      emitWall(oE, oS, oE, by - hw, court, roof, face(wallTex));     // E below window
+      emitWall(oE, by - hw, oE, by + hw, court, roof, face(b.winTex)); // window strip
+      emitWall(oE, by + hw, oE, oN, court, roof, face(wallTex));     // E above window
+      // NORTH wall.
+      emitWall(oE, oN, oW, oN, court, roof, face(wallTex));
+      // WEST wall — split around a window strip.
+      emitWall(oW, oN, oW, by + hw, court, roof, face(wallTex));     // W above window
+      emitWall(oW, by + hw, oW, by - hw, court, roof, face(b.winTex)); // window strip
+      emitWall(oW, by - hw, oW, oS, court, roof, face(wallTex));     // W below window
     }
     // Ziggurat — concentric rising stair rings. Same CCW-inset walk as the
     // trim rings; front = outer (lower) ring, back = inner (higher) ring,
@@ -5100,7 +5088,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.18</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.19</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

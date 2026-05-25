@@ -1526,6 +1526,32 @@ function _generateDungeonOnce(opts) {
         light: r.light, special: 0, tag: r.liftTag,
       });
     }
+    // Plaza terrain — break the flat civic square into real height variation
+    // (the industrial/open-area look). A sunken central basin sits 24 below
+    // grade with a pair of raised vantage terraces on one axis 24 above it,
+    // giving three distinct floor levels. Stamped as flush-bordered
+    // sub-sectors; the resolve pass textures the risers, and the sky ceiling
+    // continues unbroken above them. Stored for the emit pass + clearance.
+    r.terrains = [];
+    if (r.feature === 'plaza' && minDim >= 640) {
+      const sn = v => Math.round(v / 32) * 32;
+      const bHalf = sn(minDim * 0.15);
+      r.terrains.push({ cx: sn(r.cx), cy: sn(r.cy), hw: bHalf, hh: bHalf, kind: 'basin',
+        secId: allocSec({ floorH: r.floorH - 24, ceilH: r.ceilH,
+          floorTex: pick(['FWATER1', 'FLOOR0_2', 'FLAT5_4']), ceilTex: r.palette.ceil,
+          light: Math.max(96, r.light - 24), special: 0 }) });
+      const off = sn(minDim * 0.30), tHalf = sn(minDim * 0.12);
+      const axis = rand() < 0.5;
+      for (const s of [-1, 1]) {
+        if (tHalf < 64) break;
+        r.terrains.push({
+          cx: sn(r.cx) + (axis ? s * off : 0), cy: sn(r.cy) + (axis ? 0 : s * off),
+          hw: tHalf, hh: tHalf, kind: 'terrace',
+          secId: allocSec({ floorH: r.floorH + 24, ceilH: r.ceilH,
+            floorTex: r.palette.accent, ceilTex: r.palette.ceil,
+            light: Math.min(255, r.light + 16), special: 0 }) });
+      }
+    }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
     // Pillars in larger rooms — small closed sub-sectors that act as
@@ -1536,17 +1562,23 @@ function _generateDungeonOnce(opts) {
     r.pillars = [];
     if (r.feature === 'plaza' && minDim >= 384) {
       // Scatter a few solid blocks (planters / kiosks) the player weaves
-      // between in the open plaza. Deterministic positions from the RNG.
+      // between in the open plaza, kept to the OUTER ring so they clear the
+      // sunken basin and raised terraces. Deterministic positions from RNG.
       const span = minDim * 0.30;
+      const clearOfTerrain = (cx, cy, rad) => (r.terrains || []).every(t =>
+        Math.abs(cx - t.cx) >= t.hw + rad + 24 || Math.abs(cy - t.cy) >= t.hh + rad + 24);
       const n = 3 + Math.floor(rand() * 3);
       for (let i = 0; i < n; i++) {
         const ang = rand() * Math.PI * 2;
-        const dist = span * (0.4 + rand() * 0.6);
-        r.pillars.push({
-          cx: Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32,
-          cy: Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32,
-          radius: 40 + Math.floor(rand() * 3) * 16,
-        });
+        // Push planters further out (0.7–1.05 of span) when terrain exists so
+        // they ring the terraces rather than collide with them.
+        const lo = (r.terrains && r.terrains.length) ? 0.7 : 0.4;
+        const dist = span * (lo + rand() * 0.35);
+        const cx = Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32;
+        const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
+        const radius = 40 + Math.floor(rand() * 3) * 16;
+        if (!clearOfTerrain(cx, cy, radius)) continue;
+        r.pillars.push({ cx, cy, radius });
       }
     } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
@@ -1713,6 +1745,10 @@ function _generateDungeonOnce(opts) {
     // clear of compound buildings
     for (const b of (r.buildings || [])) {
       if (Math.abs(px - b.cx) < b.half + half + m && Math.abs(py - b.cy) < b.half + half + m) return false;
+    }
+    // clear of terrain (sunken basins / raised terraces)
+    for (const t of (r.terrains || [])) {
+      if (Math.abs(px - t.cx) < t.hw + half + m && Math.abs(py - t.cy) < t.hh + half + m) return false;
     }
     // clear of the lift platform
     if (r.lift && Math.abs(px - r.lift.cx) < r.lift.ph + half + m &&
@@ -2059,6 +2095,16 @@ function _generateDungeonOnce(opts) {
         const q1 = poly[j], q2 = poly[(j + 1) % poly.length];
         emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, pad.padSecId,
           { special: 97, tag: pad.destTag });
+      }
+    }
+    // Terrain — sunken basins / raised terraces stamped into a flat yard.
+    // Two-sided flush borders; the resolve pass paints STEP risers on the
+    // lower side, and the (sky) ceiling carries over unchanged.
+    for (const t of (!room._fused && room.terrains ? room.terrains : [])) {
+      const poly = squarePoly(t.cx, t.cy, t.hw * 2, t.hh * 2);
+      for (let j = 0; j < poly.length; j++) {
+        const q1 = poly[j], q2 = poly[(j + 1) % poly.length];
+        emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, t.secId);
       }
     }
     // Courtyard compound — each building is a thick-walled square shell with
@@ -5016,7 +5062,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.16</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.17</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

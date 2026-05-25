@@ -1552,6 +1552,42 @@ function _generateDungeonOnce(opts) {
             light: Math.min(255, r.light + 16), special: 0 }) });
       }
     }
+    // Courtyard terrain — the open compound floor gets a sunken service
+    // basin near its centre plus a couple of raised platforms (loading
+    // docks / equipment pads) out toward the edges, the multi-level
+    // industrial-base look. Clear floor is grid-scanned so the patches
+    // adapt to any 1/2/4-building layout and never touch a building (which
+    // would block its doors). Sky ceiling carries over above each patch.
+    if (r.feature === 'courtyard' && !r._fused && r.buildings && r.buildings.length) {
+      const sn = v => Math.round(v / 32) * 32;
+      const inset = minDim / 2 - 80, hp = 80, m = 48;
+      const clearCell = (cx, cy) =>
+        Math.abs(cx - r.cx) + hp <= inset && Math.abs(cy - r.cy) + hp <= inset &&
+        r.buildings.every(b => Math.abs(cx - b.cx) >= b.half + hp + m ||
+                               Math.abs(cy - b.cy) >= b.half + hp + m);
+      const cells = [];
+      for (let cy = sn(r.cy - inset); cy <= r.cy + inset; cy += 64)
+        for (let cx = sn(r.cx - inset); cx <= r.cx + inset; cx += 64)
+          if (clearCell(cx, cy)) cells.push({ cx, cy, d: Math.hypot(cx - r.cx, cy - r.cy) });
+      if (cells.length) {
+        cells.sort((a, b) => a.d - b.d);
+        const basin = cells[0];
+        r.terrains.push({ cx: basin.cx, cy: basin.cy, hw: hp, hh: hp, kind: 'basin',
+          secId: allocSec({ floorH: r.floorH - 24, ceilH: r.ceilH,
+            floorTex: pick(['FWATER1', 'NUKAGE1', 'FLOOR0_2']), ceilTex: r.palette.ceil,
+            light: Math.max(96, r.light - 24), special: 0 }) });
+        let placed = 0;
+        for (let i = cells.length - 1; i >= 0 && placed < 2; i--) {
+          const c = cells[i];
+          if (!r.terrains.every(t => Math.hypot(c.cx - t.cx, c.cy - t.cy) >= 2 * hp + 96)) continue;
+          r.terrains.push({ cx: c.cx, cy: c.cy, hw: hp, hh: hp, kind: 'terrace',
+            secId: allocSec({ floorH: r.floorH + 16, ceilH: r.ceilH,
+              floorTex: r.palette.accent, ceilTex: r.palette.ceil,
+              light: Math.min(255, r.light + 16), special: 0 }) });
+          placed++;
+        }
+      }
+    }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
     // Pillars in larger rooms — small closed sub-sectors that act as
@@ -1626,10 +1662,12 @@ function _generateDungeonOnce(opts) {
       } else if (minDim >= 640) {
         r.pillars.push({ cx: r.cx, cy: r.cy, radius: 40 });
       }
-    } else if (minDim >= 1024 && r.type === 'square') {
+    } else if (minDim >= 1024 && r.type === 'square' &&
+               r.feature !== 'courtyard' && r.feature !== 'lift' && r.feature !== 'ziggurat') {
       // Big square room with a central feature: two side pillars on the
       // room's longer axis, far enough out that they don't crowd the
-      // feature ring.
+      // feature ring. Skipped for self-managing yards (courtyard buildings,
+      // lift platform, ziggurat stairs) whose own structures fill the floor.
       const longAxisX = r.w >= r.h;
       const off = Math.floor((longAxisX ? r.w : r.h) * 0.32 / 32) * 32;
       const innerRadius = TRIM_W * r.trimLayers + INNER_INSET;
@@ -5062,7 +5100,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.17</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.18</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

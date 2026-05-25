@@ -738,6 +738,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'sky',         label: 'Sky Room',     type: 'octagon', r: 448,         feature: 'sky' },
   { id: 'courtyard',   label: 'Courtyard',    type: 'square',  w: 1024, h: 1024, feature: 'courtyard' },
   { id: 'plaza',       label: 'Plaza',        type: 'octagon', r: 640,          feature: 'plaza' },
+  { id: 'ziggurat',    label: 'Ziggurat',     type: 'square',  w: 768, h: 768,   feature: 'ziggurat' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1121,8 +1122,9 @@ function _generateDungeonOnce(opts) {
     else if (roll < 0.83)                    r.feature = 'foundry';
     else if (roll < 0.87 && isMidRoom)       r.feature = 'observatory';
     else if (roll < 0.90)                    r.feature = 'sewer';
-    else if (isLargeRoom && roll < 0.96)     r.feature = 'courtyard';
-    else if (isMidRoom && roll < 0.98)       r.feature = 'plaza';
+    else if (isLargeRoom && roll < 0.94)     r.feature = 'courtyard';
+    else if (isMidRoom && roll < 0.96)       r.feature = 'plaza';
+    else if (isMidRoom && roll < 0.99)       r.feature = 'ziggurat';
     else                                     r.feature = 'none';
     // Per-feature room-level overrides — ceiling height, palette swaps and
     // ambient lighting set the mood before sector allocation.
@@ -1181,6 +1183,14 @@ function _generateDungeonOnce(opts) {
       r.ceilH = r.floorH + 224;
       r.light = 200;
       r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT1', 'FLAT5_4', 'FLOOR0_2']) };
+    }
+    // Ziggurat — a stepped pyramid the player climbs to a central peak.
+    // Concentric rings rise 16 units each, adding lots of distinct floor
+    // heights (the verticality the pro maps lean on). Tall ceiling so the
+    // monument has headroom.
+    if (r.feature === 'ziggurat') {
+      r.ceilH = r.floorH + 256;
+      r.light = pick([160, 176, 192]);
     }
     r.special = rand() < 0.15 ? 8 : (rand() < 0.06 ? 17 : 0);
   });
@@ -1265,7 +1275,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
@@ -1443,6 +1453,25 @@ function _generateDungeonOnce(opts) {
         floorTex: r.palette.floor, ceilTex: bRoof,
         light: Math.max(96, r.light - 32), special: 0,
       });
+    }
+    // Ziggurat — allocate the concentric rising stair rings. Each ring is
+    // STAIR_W wide and 16 units higher than the one outside it, so the
+    // player climbs a stepped pyramid to a central peak platform.
+    if (r.feature === 'ziggurat') {
+      const STAIR_W = 48;
+      const maxSteps = Math.floor((minDim / 2 - 80) / STAIR_W);
+      const numSteps = Math.min(7, Math.max(2, maxSteps));
+      r.stairW = STAIR_W;
+      r.stairCount = numSteps;
+      r.stairIds = [];
+      for (let i = 1; i <= numSteps; i++) {
+        r.stairIds.push(allocSec({
+          floorH: r.floorH + i * 16, ceilH: r.ceilH,
+          floorTex: i === numSteps ? r.palette.accent : r.palette.trim,
+          ceilTex: r.hasSky ? 'F_SKY1' : r.palette.ceil,
+          light: Math.min(255, r.light + i * 4), special: 0,
+        }));
+      }
     }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
@@ -1919,6 +1948,20 @@ function _generateDungeonOnce(opts) {
       emitWall(bx + hd, iS, bx - hd, iS, inner, door); // interior face (open)
       emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex }); // west jamb
       emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex }); // east jamb
+    }
+    // Ziggurat — concentric rising stair rings. Same CCW-inset walk as the
+    // trim rings; front = outer (lower) ring, back = inner (higher) ring,
+    // so the resolve pass puts the step face on the lower side.
+    if (!room._fused && room.feature === 'ziggurat' && room.stairIds) {
+      const layers = [room.outerId, ...room.stairIds];
+      for (let i = 1; i <= room.stairCount; i++) {
+        const ringPoly = roomPoly(room, room.stairW * i);
+        if (ringPoly.length < 3) break;
+        for (let j = 0; j < ringPoly.length; j++) {
+          const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
+          emitWall(p1.x, p1.y, p2.x, p2.y, layers[i - 1], layers[i]);
+        }
+      }
     }
   });
 
@@ -4770,7 +4813,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.11</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.12</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -1173,6 +1173,14 @@ function _generateDungeonOnce(opts) {
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
     }
+    // Sky Room — an open-air chamber whose vaulted ceiling opens through a
+    // central oculus to the sky. Force sky + a tall ceiling so the oculus
+    // shaft rises ABOVE the room and reads as open sky (not a sunken panel).
+    if (r.feature === 'sky') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 256;
+      r.light = pick([200, 216, 232]);
+    }
     // Lift — a raised vantage platform reachable only by a working lift.
     if (r.feature === 'lift') {
       r.ceilH = Math.max(r.ceilH, r.floorH + 192);
@@ -1487,12 +1495,6 @@ function _generateDungeonOnce(opts) {
           roofSec: allocSec({ floorH: roofTop, ceilH: r.ceilH,
             floorTex: bRoof, ceilTex: 'F_SKY1',
             light: Math.min(255, r.light + 8), special: 0 }),
-          // Recessed covered entrance — a shadowed porch carved into the south
-          // wall (floor at grade, low roofed ceiling), giving the thick wall a
-          // layered doorway with depth instead of a flat painted panel.
-          porchSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 80,
-            floorTex: r.palette.floor, ceilTex: bRoof,
-            light: Math.max(96, r.light - 24), special: 0 }),
         });
       }
     }
@@ -1704,7 +1706,7 @@ function _generateDungeonOnce(opts) {
     // only (octagon/hexagon flat-side spans are tight). Skip sides that
     // already host corridor attachments. Cap at 2 per room.
     r.alcoves = [];
-    if (!r._fused && r.type === 'square' && r.w >= 384 && r.h >= 384) {
+    if (!r._fused && !flatYard && r.type === 'square' && r.w >= 384 && r.h >= 384) {
       const roomIdx = rooms.indexOf(r);
       const ALCOVE_W = 96, ALCOVE_D = 56, ALCOVE_MARGIN = 96;
       const sideHasCorridor = (side) => {
@@ -2170,22 +2172,21 @@ function _generateDungeonOnce(opts) {
     // panel centred on the south wall and lit window strips on the E/W walls.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
       const bx = b.cx, by = b.cy, Bh = b.half, hd = b.door / 2, hw = b.win / 2;
-      const court = room.outerId, roof = b.roofSec, porch = b.porchSec;
+      const court = room.outerId, roof = b.roofSec;
       const PD = b.porchDepth;
       const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh;
-      const pN = oS + PD; // porch back (north) edge
+      const pN = oS + PD; // recessed entrance back (north) edge
       const wallTex = b.wall;
       const face = tex => ({ frontSide: { lower: tex } });
-      // SOUTH wall — solid segments flank a recessed covered porch. The porch
-      // opening shows the building wall as a lintel above (upper texture); the
-      // porch interior is a shadowed bay with the door panel at its back.
-      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));     // S left of porch
-      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));     // S right of porch
-      emitWall(bx - hd, oS, bx + hd, oS, court, porch,
-        { frontSide: { upper: wallTex }, backSide: { upper: wallTex } }); // porch opening + lintel
-      emitWall(bx - hd, oS, bx - hd, pN, porch, roof, face(wallTex)); // porch W jamb
-      emitWall(bx - hd, pN, bx + hd, pN, porch, roof, face(b.doorTex)); // porch back (door panel)
-      emitWall(bx + hd, pN, bx + hd, oS, porch, roof, face(wallTex)); // porch E jamb
+      // SOUTH wall — the centre jogs inward to form a recessed entrance bay.
+      // The bay floor/ceiling are the open yard (sky), so the recess walls are
+      // ordinary yard↔roof faces (both sky above → no upper-texture seams):
+      // you walk into a shadowed nook with the door panel set at its back.
+      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));      // S left of bay
+      emitWall(bx - hd, oS, bx - hd, pN, court, roof, face(wallTex)); // bay W jamb (recess in)
+      emitWall(bx - hd, pN, bx + hd, pN, court, roof, face(b.doorTex)); // bay back (door panel)
+      emitWall(bx + hd, pN, bx + hd, oS, court, roof, face(wallTex)); // bay E jamb (recess out)
+      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));      // S right of bay
       // EAST wall — split around a window strip.
       emitWall(oE, oS, oE, by - hw, court, roof, face(wallTex));     // E below window
       emitWall(oE, by - hw, oE, by + hw, court, roof, face(b.winTex)); // window strip
@@ -2677,38 +2678,13 @@ function _generateDungeonOnce(opts) {
     for (const a of r.alcoves || []) wallTexBySector.set(a.sectorId, a.wallTex);
   });
   const secMap = new Map(sectors.map(s => [s.id, s]));
-  // Sky-border rooftop trim pre-pass. Wherever a SKY-ceiling sector abuts
-  // a non-sky sector we want a "rooftop" read: the roofed (non-sky) side
-  // keeps its height, and the sky drops a notch below it so the higher
-  // roof edge frames the opening with a real textured upper lip instead of
-  // an abrupt flat-to-flat seam or sky bleeding down a wall. We compute the
-  // LOWEST bordering non-sky ceiling per sky sector, then recess the sky to
-  // (that − 16) once, as long as ≥ 96 headroom remains. Sky sectors with no
-  // non-sky neighbour (fully open-air rooms like the Garden) are untouched.
-  {
-    const minGround = new Map(); // sky sector id -> lowest bordering non-sky ceil
-    for (const l of linedefs) {
-      if (l.front === -1 || l.back === -1) continue;
-      const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
-      if (!fs || !bs) continue;
-      const fsec = secMap.get(fs.sector), bsec = secMap.get(bs.sector);
-      if (!fsec || !bsec) continue;
-      const fSky = fsec.ceilTex === 'F_SKY1', bSky = bsec.ceilTex === 'F_SKY1';
-      if (fSky === bSky) continue;
-      const skySec = fSky ? fsec : bsec;
-      const groundSec = fSky ? bsec : fsec;
-      const cur = minGround.get(skySec.id);
-      if (cur == null || groundSec.ceilH < cur) minGround.set(skySec.id, groundSec.ceilH);
-    }
-    for (const [skyId, gc] of minGround) {
-      const sky = secMap.get(skyId);
-      if (!sky) continue;
-      const target = gc - 16;
-      if (target >= sky.ceilH) continue;           // already recessed enough
-      if (target - sky.floorH < 96) continue;       // keep headroom
-      sky.ceilH = target;
-    }
-  }
+  // NOTE: sky sectors are deliberately kept HIGHER than their non-sky
+  // neighbours (oculus shafts open UPWARD into the sky at +384 above a 256
+  // room). The resolve pass below paints the shaft walls as the upper texture
+  // on the (non-suppressed) higher side, so the skylight reads as open sky
+  // with a textured rim — no recession needed. (An earlier pass recessed sky
+  // BELOW its neighbours, which sank the oculus into a dark panel and put the
+  // trim on only the non-sky side; that behaviour has been removed.)
   for (const l of linedefs) {
     if (l.front === -1 || l.back === -1) continue;
     const fs = sdMap.get(l.front), bs = sdMap.get(l.back);
@@ -5110,7 +5086,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.21</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.22</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

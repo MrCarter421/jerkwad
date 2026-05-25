@@ -736,6 +736,8 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'crusher',     label: 'Crusher',      type: 'square',  w: 448, h: 448, feature: 'crusher' },
   { id: 'platform',    label: 'Platform',     type: 'square',  w: 512, h: 512, feature: 'platform' },
   { id: 'sky',         label: 'Sky Room',     type: 'octagon', r: 448,         feature: 'sky' },
+  { id: 'courtyard',   label: 'Courtyard',    type: 'square',  w: 1024, h: 1024, feature: 'courtyard' },
+  { id: 'plaza',       label: 'Plaza',        type: 'octagon', r: 640,          feature: 'plaza' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1032,7 +1034,16 @@ function _generateDungeonOnce(opts) {
     { wall: 'STONE2',   floor: 'RROCK11',  ceil: 'CEIL3_3', trim: 'STEP2',    accent: 'FLAT5'    },
     { wall: 'WOOD1',    floor: 'FLOOR5_2', ceil: 'CEIL5_1', trim: 'FLOOR5_4', accent: 'TLITE6_4' },
     { wall: 'GRAY5',    floor: 'FLAT5_4',  ceil: 'CEIL3_1', trim: 'STEP1',    accent: 'TLITE6_6' },
+    // Urban / industrial sets — for city blocks, tech bays and brick yards
+    { wall: 'STARTAN3', floor: 'FLOOR0_2', ceil: 'CEIL3_4', trim: 'FLAT1',    accent: 'COMPSPAN' },
+    { wall: 'BROWN144', floor: 'FLAT5_4',  ceil: 'CEIL5_2', trim: 'FLAT5',    accent: 'COMPBLUE' },
+    { wall: 'GRAY7',    floor: 'FLAT1',    ceil: 'CEIL3_4', trim: 'FLAT5_4',  accent: 'LITE5'    },
+    { wall: 'STONE3',   floor: 'RROCK16',  ceil: 'CEIL3_3', trim: 'STEP2',    accent: 'FLAT5_5'  },
   ];
+  // City-block building wall textures — used by the courtyard feature so
+  // central structures read as houses / towers, not generic dungeon walls.
+  const BUILDING_WALLS = ['BROWN1', 'STONE2', 'STARTAN3', 'GRAY7', 'METAL2', 'BROWN144'];
+  const BUILDING_ROOFS = ['FLAT1', 'CEIL5_2', 'FLAT5_4', 'CRATOP1', 'FLAT5_5'];
   // Themed zones: cluster rooms by proximity into 2–3 zones, each zone gets a
   // shared palette. Adjacent rooms in the same zone read as one "area" — a
   // techbase wing, a hellish wing, a wood-floored armory — which is the
@@ -1107,9 +1118,11 @@ function _generateDungeonOnce(opts) {
     else if (roll < 0.71)                    r.feature = 'gallery';
     else if (roll < 0.76 && isMidRoom)       r.feature = 'throne';
     else if (roll < 0.81)                    r.feature = 'mausoleum';
-    else if (roll < 0.85)                    r.feature = 'foundry';
-    else if (roll < 0.89 && isMidRoom)       r.feature = 'observatory';
-    else if (roll < 0.93)                    r.feature = 'sewer';
+    else if (roll < 0.83)                    r.feature = 'foundry';
+    else if (roll < 0.87 && isMidRoom)       r.feature = 'observatory';
+    else if (roll < 0.90)                    r.feature = 'sewer';
+    else if (isLargeRoom && roll < 0.96)     r.feature = 'courtyard';
+    else if (isMidRoom && roll < 0.98)       r.feature = 'plaza';
     else                                     r.feature = 'none';
     // Per-feature room-level overrides — ceiling height, palette swaps and
     // ambient lighting set the mood before sector allocation.
@@ -1151,6 +1164,23 @@ function _generateDungeonOnce(opts) {
       r.ceilH = r.floorH + 128;
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
+    }
+    // Courtyard — an open-sky paved yard with a central enterable BUILDING
+    // (a house/tower silhouette with solid walls, a flat roof and one door).
+    // This is the headline "structures in an open area" feature.
+    if (r.feature === 'courtyard') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 256;
+      r.light = 208;
+      r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT5_4', 'FLOOR0_1', 'RROCK16']) };
+    }
+    // Plaza — open-sky yard dotted with several small solid blocks
+    // (planters / kiosks) that the player weaves between.
+    if (r.feature === 'plaza') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 224;
+      r.light = 200;
+      r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT1', 'FLAT5_4', 'FLOOR0_2']) };
     }
     r.special = rand() < 0.15 ? 8 : (rand() < 0.06 ? 17 : 0);
   });
@@ -1235,7 +1265,9 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    if (!r._fused) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza';
+    if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
+    else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
     // ceiling matches room ceiling — this is the layer doors connect to.
     // Outer ring at the wall. For sky rooms the OUTER ring keeps a TEXTURED
@@ -1392,6 +1424,26 @@ function _generateDungeonOnce(opts) {
         light: Math.max(80, r.light - 32), special: 7,
       });
     }
+    // Courtyard — allocate the central building's interior (roofed, non-sky)
+    // and doorway sectors. The geometry pass emits the thick-walled shell.
+    if (r.feature === 'courtyard') {
+      const bWall = pick(BUILDING_WALLS), bRoof = pick(BUILDING_ROOFS);
+      const bHalf = Math.floor(minDim * 0.22 / 32) * 32; // building half-size
+      r.building = {
+        cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32,
+        half: bHalf, thick: 32, door: 64, wall: bWall,
+      };
+      r.buildingInteriorId = allocSec({
+        floorH: r.floorH, ceilH: r.floorH + 112,
+        floorTex: r.palette.floor, ceilTex: bRoof,
+        light: Math.max(96, r.light - 48), special: 0,
+      });
+      r.buildingDoorId = allocSec({
+        floorH: r.floorH, ceilH: r.floorH + 112,
+        floorTex: r.palette.floor, ceilTex: bRoof,
+        light: Math.max(96, r.light - 32), special: 0,
+      });
+    }
     // 'cathedral', 'crusher', 'colonnade' have no centre sub-sector — the
     // height change or pillar pattern applied below is the whole feature.
     // Pillars in larger rooms — small closed sub-sectors that act as
@@ -1400,7 +1452,21 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r.feature === 'altar') {
+    if (r.feature === 'plaza' && minDim >= 384) {
+      // Scatter a few solid blocks (planters / kiosks) the player weaves
+      // between in the open plaza. Deterministic positions from the RNG.
+      const span = minDim * 0.30;
+      const n = 3 + Math.floor(rand() * 3);
+      for (let i = 0; i < n; i++) {
+        const ang = rand() * Math.PI * 2;
+        const dist = span * (0.4 + rand() * 0.6);
+        r.pillars.push({
+          cx: Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32,
+          cy: Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32,
+          radius: 40 + Math.floor(rand() * 3) * 16,
+        });
+      }
+    } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
     } else if (r.feature === 'observatory' && minDim >= 384) {
@@ -1823,6 +1889,36 @@ function _generateDungeonOnce(opts) {
           emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId);
         }
       }
+    }
+    // Courtyard central building — thick-walled square shell with a roofed
+    // interior and one south-facing door, standing in the open-sky yard.
+    if (!room._fused && room.building) {
+      const b = room.building;
+      const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2;
+      const court = room.outerId, inner = room.buildingInteriorId, door = room.buildingDoorId;
+      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh; // outer ring
+      const iS = by - Bh + T, iN = by + Bh - T, iW = bx - Bh + T, iE = bx + Bh - T; // inner
+      const wallTex = b.wall;
+      // OUTER ring — one-sided, courtyard on the right (walk CCW). The south
+      // wall is split around the door gap [bx-hd, bx+hd].
+      emitWall(oW, oS, bx - hd, oS, court, null, { middle: wallTex }); // S left of door
+      emitWall(bx + hd, oS, oE, oS, court, null, { middle: wallTex }); // S right of door
+      emitWall(oE, oS, oE, oN, court, null, { middle: wallTex });      // E
+      emitWall(oE, oN, oW, oN, court, null, { middle: wallTex });      // N
+      emitWall(oW, oN, oW, oS, court, null, { middle: wallTex });      // W
+      // INNER ring — one-sided, interior on the right (walk CW). South wall
+      // split around the door gap.
+      emitWall(bx - hd, iS, iW, iS, inner, null, { middle: wallTex }); // S left
+      emitWall(iE, iS, bx + hd, iS, inner, null, { middle: wallTex }); // S right
+      emitWall(iW, iS, iW, iN, inner, null, { middle: wallTex });      // W
+      emitWall(iW, iN, iE, iN, inner, null, { middle: wallTex });      // N
+      emitWall(iE, iN, iE, iS, inner, null, { middle: wallTex });      // E
+      // DOOR — a short passage between courtyard and interior through the
+      // wall thickness. Two-sided faces (open) + one-sided jambs.
+      emitWall(bx - hd, oS, bx + hd, oS, court, door, { upper: wallTex, backUpper: wallTex }); // courtyard face
+      emitWall(bx + hd, iS, bx - hd, iS, inner, door); // interior face (open)
+      emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex }); // west jamb
+      emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex }); // east jamb
     }
   });
 
@@ -4674,7 +4770,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.10</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.11</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

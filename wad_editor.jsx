@@ -701,15 +701,17 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
   }));
   const idIndex = new Map(roomSpecs.map((s, i) => [s.id, i]));
   const corridors = [];
+  const teleporters = [];
   if (connectionSpecs) {
     for (const c of connectionSpecs) {
       const a = idIndex.get(c.fromId), b = idIndex.get(c.toId);
       if (a == null || b == null || a === b) continue;
-      corridors.push({ a, b });
+      if (c.kind === 'teleporter') teleporters.push({ a, b });
+      else corridors.push({ a, b });
     }
   }
   const userThings = thingSpecs && thingSpecs.length ? thingSpecs : null;
-  return _generateDungeonOnce({ rooms, corridors, userThings });
+  return _generateDungeonOnce({ rooms, corridors, teleporters, userThings });
 }
 
 // Room presets — the predefined "library" the user picks from in
@@ -939,6 +941,8 @@ function _generateDungeonOnce(opts) {
 
   // -------- 3. user-specified corridors OR auto spanning tree --------
   const corridors = [];
+  const teleportPads = []; // {roomIdx, cx, cy, half, padSecId, ownTag, destTag}
+  const userTeleporters = (opts && opts.teleporters) || [];
   const userCorridors = opts && opts.corridors;
   if (userCorridors) {
     // ShapeShifter explicit connections — try each pair the user drew. If
@@ -1682,6 +1686,81 @@ function _generateDungeonOnce(opts) {
     }
   });
 
+  // -------- 6b. teleporter pads --------
+  // ShapeShifter teleporter connections: place a flush WR-97 pad in each
+  // endpoint room and a type-14 destination thing on it. A pad is a small
+  // flat sub-sector at the room floor (so it sits flush, no step) carved
+  // into the open floor. Restricted to flat-floored rooms (trimLayers===0,
+  // not fused, not ziggurat) so the pad's square loop never crosses a
+  // concentric trim ring (which would produce invalid topology). The pad is
+  // placed clear of the centre feature, pillars, buildings and lift.
+  const padClear = (r, px, py, half) => {
+    const m = 8;
+    // fully inside the room (corners within an inset polygon clear of walls)
+    const ip = roomPoly(r, 40);
+    if (ip.length < 3) return false;
+    for (const [dx, dy] of [[-half, -half], [half, -half], [half, half], [-half, half], [0, 0]]) {
+      if (!pointInPolygon(px + dx, py + dy, ip)) return false;
+    }
+    // clear of the centre feature ring (trimLayers===0 → ring radius = INNER_INSET)
+    if (r.feature !== 'none' && r.featureId) {
+      if (Math.hypot(px - r.cx, py - r.cy) < INNER_INSET + half + m) return false;
+    }
+    // clear of pillars / planters
+    for (const p of (r.pillars || [])) {
+      if (Math.hypot(px - p.cx, py - p.cy) < p.radius + half + m) return false;
+    }
+    // clear of compound buildings
+    for (const b of (r.buildings || [])) {
+      if (Math.abs(px - b.cx) < b.half + half + m && Math.abs(py - b.cy) < b.half + half + m) return false;
+    }
+    // clear of the lift platform
+    if (r.lift && Math.abs(px - r.lift.cx) < r.lift.ph + half + m &&
+        Math.abs(py - r.lift.cy) < r.lift.ph + half + m) return false;
+    // clear of pads already placed in this room
+    for (const q of teleportPads) {
+      if (q.roomIdx !== rooms.indexOf(r)) continue;
+      if (Math.abs(px - q.cx) < q.half + half + 32 && Math.abs(py - q.cy) < q.half + half + 32) return false;
+    }
+    return true;
+  };
+  // Grid-scan the open floor for a clear pad spot, preferring the cell
+  // nearest the partner room so the pad faces the connection.
+  const placePad = (r, towardX, towardY) => {
+    if (r._fused || r.trimLayers !== 0 || r.feature === 'ziggurat') return null;
+    const half = 40;
+    const bb = roomBBox(r, 48);
+    if (bb.maxX - bb.minX < 2 * half || bb.maxY - bb.minY < 2 * half) return null;
+    let best = null, bestD = Infinity;
+    for (let py = Math.ceil(bb.minY / 32) * 32; py <= bb.maxY; py += 32) {
+      for (let px = Math.ceil(bb.minX / 32) * 32; px <= bb.maxX; px += 32) {
+        if (!padClear(r, px, py, half)) continue;
+        const d = Math.hypot(px - towardX, py - towardY);
+        if (d < bestD) { bestD = d; best = { cx: px, cy: py, half }; }
+      }
+    }
+    return best;
+  };
+  for (const tp of userTeleporters) {
+    const ra = rooms[tp.a], rb = rooms[tp.b];
+    if (!ra || !rb) continue;
+    const padA = placePad(ra, rb.cx, rb.cy);
+    const padB = placePad(rb, ra.cx, ra.cy);
+    if (!padA || !padB) continue; // couldn't fit a pad in one of the rooms — skip
+    const tagA = tagCounter++, tagB = tagCounter++;
+    const padFloor = (r, pad, tag) => allocSec({
+      floorH: r.floorH, ceilH: r.ceilH,
+      floorTex: 'GATE1', ceilTex: r.palette.ceil,
+      light: 255, special: 0, tag,
+    });
+    padA.padSecId = padFloor(ra, padA, tagA);
+    padB.padSecId = padFloor(rb, padB, tagB);
+    teleportPads.push({ roomIdx: tp.a, cx: padA.cx, cy: padA.cy, half: padA.half,
+      padSecId: padA.padSecId, ownTag: tagA, destTag: tagB });
+    teleportPads.push({ roomIdx: tp.b, cx: padB.cx, cy: padB.cy, half: padB.half,
+      padSecId: padB.padSecId, ownTag: tagB, destTag: tagA });
+  }
+
   // Corridors: floor = max of two rooms' floors, ceiling = floor + 96 (canon).
   // Light 32 below the brighter neighbour for that "darker corridor → bright
   // room" contrast (Romero's doorway-light-delta rule).
@@ -1966,6 +2045,20 @@ function _generateDungeonOnce(opts) {
           const q1 = pillarPoly[j], q2 = pillarPoly[(j + 1) % pillarPoly.length];
           emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId);
         }
+      }
+    }
+    // Teleporter pads — a flush GATE-floor square carved into the room. Its
+    // boundary lines are two-sided (passable) WR-97 teleport triggers whose
+    // front side faces the room: walking ONTO the pad fires the teleport to
+    // the partner pad's destination (destTag), while arriving from a teleport
+    // (landing on the back side) and walking off does not re-trigger.
+    for (const pad of teleportPads) {
+      if (pad.roomIdx !== roomIdx) continue;
+      const poly = squarePoly(pad.cx, pad.cy, pad.half * 2, pad.half * 2);
+      for (let j = 0; j < poly.length; j++) {
+        const q1 = poly[j], q2 = poly[(j + 1) % poly.length];
+        emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, pad.padSecId,
+          { special: 97, tag: pad.destTag });
       }
     }
     // Courtyard compound — each building is a thick-walled square shell with
@@ -2588,6 +2681,13 @@ function _generateDungeonOnce(opts) {
   if (userThings && !things.some(t => t.type === 1)) {
     things.unshift({ id: 'tps', x: rooms[0].cx | 0, y: rooms[0].cy | 0,
       angle: 90, type: 1, flags: 7 });
+  }
+  // Teleport destinations: a type-14 thing sits on each pad. The partner
+  // pad's WR-97 lines are tagged to this pad's sector, so arriving players
+  // land here. Flags 7 = present on all skill levels.
+  for (const pad of teleportPads) {
+    things.push({ id: 't' + things.length, x: pad.cx, y: pad.cy,
+      angle: 90, type: 14, flags: 7 });
   }
   // Per-zone monster archetypes — combat theme matches palette. Techbase
   // walls draw human grunts; hellish stone draws demons and cacos. Doom
@@ -4358,6 +4458,7 @@ function ShapeShifter() {
   const [selectedId, setSelectedId] = useState(null);          // selected ROOM
   const [selectedThingId, setSelectedThingId] = useState(null); // selected THING
   const [pendingConnect, setPendingConnect] = useState(null);
+  const [connKind, setConnKind] = useState('corridor'); // 'corridor' | 'teleporter'
   const [thingCat, setThingCat] = useState('PLAYER');
   const [pickedThingType, setPickedThingType] = useState(1);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
@@ -4425,15 +4526,24 @@ function ShapeShifter() {
       setHint('These rooms are already connected.');
       return;
     }
-    // Validate via tryCorridor against current placement.
+    // Validate against current placement by building a one-connection probe.
     const specs = rooms.map(r => ({
       type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
     }));
-    const fromIdx = rooms.findIndex(r => r.id === fromId);
-    const toIdx = rooms.findIndex(r => r.id === toId);
-    const test = generateShapeShifterMap(specs, [{ fromId, toId }]);
+    const test = generateShapeShifterMap(specs, [{ fromId, toId, kind: connKind }]);
+    if (connKind === 'teleporter') {
+      // Teleporter is valid when a pad was carved in BOTH rooms (8 WR-97
+      // lines + two type-14 destinations). Pads only fit flat-floored rooms.
+      const padPairOK = test.things.filter(t => t.type === 14).length === 2;
+      const conn = { id: nextId('ssc'), fromId, toId, kind: 'teleporter', valid: padPairOK };
+      setConnections(cs => [...cs, conn]);
+      setHint(padPairOK
+        ? 'Teleporter linked — instant travel between the pads. Keep linking or BUILD.'
+        : 'Teleport pad won’t fit — use open flat rooms (Plaza, Courtyard, Lift Vault).');
+      return;
+    }
     const hasNewDoor = test.linedefs.some(l => l.special === 1);
-    const conn = { id: nextId('ssc'), fromId, toId, valid: hasNewDoor };
+    const conn = { id: nextId('ssc'), fromId, toId, kind: 'corridor', valid: hasNewDoor };
     setConnections(cs => [...cs, conn]);
     if (hasNewDoor) {
       setHint('Corridor drawn — keep linking or hit BUILD.');
@@ -4444,7 +4554,7 @@ function ShapeShifter() {
 
   const deleteConnection = (id) => {
     setConnections(cs => cs.filter(c => c.id !== id));
-    setHint('Corridor removed.');
+    setHint('Connection removed.');
   };
 
   const build = () => {
@@ -4819,15 +4929,25 @@ function ShapeShifter() {
       }
       ctx.stroke();
     }
-    // Connections (drawn before rooms so room outlines sit on top of endpoints)
+    // Connections (drawn before rooms so room outlines sit on top of endpoints).
+    // Teleporters draw as a violet dotted link with ◉ endpoints; corridors as
+    // a solid amber line. Invalid links are red dashed.
     for (const c of connections) {
       const a = roomById(c.fromId), b = roomById(c.toId); if (!a || !b) continue;
       const pa = worldToScreen(a.cx, a.cy), pb = worldToScreen(b.cx, b.cy);
+      const isTele = c.kind === 'teleporter';
       ctx.lineWidth = 4;
-      ctx.strokeStyle = c.valid === false ? COLORS.danger : COLORS.amber;
-      ctx.setLineDash(c.valid === false ? [6, 6] : []);
+      ctx.strokeStyle = c.valid === false ? COLORS.danger : (isTele ? '#9966ff' : COLORS.amber);
+      ctx.setLineDash(c.valid === false ? [6, 6] : (isTele ? [3, 9] : []));
       ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
       ctx.setLineDash([]);
+      if (isTele && c.valid !== false) {
+        ctx.fillStyle = '#9966ff';
+        ctx.font = '16px ui-monospace, monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('◉', pa.x, pa.y);
+        ctx.fillText('◉', pb.x, pb.y);
+      }
     }
     // Rooms — render polygons. Fused rooms get a faint tint only (their
     // outline is replaced by the fusion-pass walls drawn above) so the
@@ -4896,7 +5016,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.15</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.16</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (
@@ -4930,7 +5050,7 @@ function ShapeShifter() {
             <button key={m} onClick={() => {
                 setMode(m); setSelectedId(null); setSelectedThingId(null); setPendingConnect(null);
                 if (m === 'place')   setHint('PLACE: tap a chip, drag rooms to fuse.');
-                if (m === 'connect') setHint('CONNECT: tap two rooms to draw a corridor.');
+                if (m === 'connect') setHint('CONNECT: pick CORRIDOR or TELEPORTER, then tap two rooms.');
                 if (m === 'things')  setHint('THINGS: pick a thing, tap the canvas to drop it.');
               }}
               style={{ padding: '6px 10px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
@@ -4946,6 +5066,28 @@ function ShapeShifter() {
           <span style={{ flex: 1 }}/>
           <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim, alignSelf: 'center' }}>
             {rooms.length}r / {connections.length}c / {thingsList.length}t
+          </span>
+        </div>
+      )}
+      {!previewMap && mode === 'connect' && (
+        <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
+                      display: 'flex', gap: 6, alignItems: 'center', padding: '6px 8px' }}>
+          <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim }}>LINK:</span>
+          {[['corridor', 'CORRIDOR', COLORS.amber], ['teleporter', 'TELEPORTER', '#9966ff']].map(([k, lbl, col]) => (
+            <button key={k} onClick={() => {
+                setConnKind(k); setPendingConnect(null);
+                setHint(k === 'teleporter'
+                  ? 'TELEPORTER: tap two flat rooms (Plaza/Courtyard/Lift) for instant travel.'
+                  : 'CORRIDOR: tap two rooms whose walls overlap to draw a door.');
+              }}
+              style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, fontFamily: monoStack,
+                       color: connKind === k ? COLORS.bg : col,
+                       background: connKind === k ? col : COLORS.bg,
+                       border: '1px solid ' + col, borderRadius: 4 }}>{lbl}</button>
+          ))}
+          <span style={{ flex: 1 }}/>
+          <span style={{ fontFamily: monoStack, fontSize: 10, color: COLORS.textDim }}>
+            {connKind === 'teleporter' ? '◉ violet = warp' : '— amber = walk'}
           </span>
         </div>
       )}

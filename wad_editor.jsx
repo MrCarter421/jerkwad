@@ -1434,25 +1434,36 @@ function _generateDungeonOnce(opts) {
         light: Math.max(80, r.light - 32), special: 7,
       });
     }
-    // Courtyard — allocate the central building's interior (roofed, non-sky)
-    // and doorway sectors. The geometry pass emits the thick-walled shell.
+    // Courtyard — allocate the central building's interior (roofed, non-sky),
+    // doorway, and window sectors. The geometry pass emits the thick-walled
+    // shell. Roof height varies: a low "house" or a taller "tower".
     if (r.feature === 'courtyard') {
       const bWall = pick(BUILDING_WALLS), bRoof = pick(BUILDING_ROOFS);
-      const bHalf = Math.floor(minDim * 0.22 / 32) * 32; // building half-size
+      const bHalf = Math.floor(minDim * 0.22 / 32) * 32;
+      const isTower = rand() < 0.4;
+      const roofTop = r.floorH + (isTower ? 184 : 112);
       r.building = {
         cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32,
-        half: bHalf, thick: 32, door: 64, wall: bWall,
+        half: bHalf, thick: 32, door: 64, win: 96, wall: bWall, roofTop,
       };
       r.buildingInteriorId = allocSec({
-        floorH: r.floorH, ceilH: r.floorH + 112,
+        floorH: r.floorH, ceilH: roofTop,
         floorTex: r.palette.floor, ceilTex: bRoof,
         light: Math.max(96, r.light - 48), special: 0,
       });
       r.buildingDoorId = allocSec({
-        floorH: r.floorH, ceilH: r.floorH + 112,
+        floorH: r.floorH, ceilH: roofTop,
         floorTex: r.palette.floor, ceilTex: bRoof,
         light: Math.max(96, r.light - 32), special: 0,
       });
+      // Two window sectors (east + west): raised sill so you see/shoot
+      // through but can't walk in.
+      r.buildingWindowIds = [
+        allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
+          floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
+        allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
+          floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
+      ];
     }
     // Ziggurat — allocate the concentric rising stair rings. Each ring is
     // STAIR_W wide and 16 units higher than the one outside it, so the
@@ -1920,34 +1931,47 @@ function _generateDungeonOnce(opts) {
       }
     }
     // Courtyard central building — thick-walled square shell with a roofed
-    // interior and one south-facing door, standing in the open-sky yard.
+    // interior, a south door, and a window on the east + west walls.
     if (!room._fused && room.building) {
       const b = room.building;
-      const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2;
+      const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2, hw = b.win / 2;
       const court = room.outerId, inner = room.buildingInteriorId, door = room.buildingDoorId;
+      const wE = room.buildingWindowIds[0], wW = room.buildingWindowIds[1];
       const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh; // outer ring
       const iS = by - Bh + T, iN = by + Bh - T, iW = bx - Bh + T, iE = bx + Bh - T; // inner
       const wallTex = b.wall;
-      // OUTER ring — one-sided, courtyard on the right (walk CCW). The south
-      // wall is split around the door gap [bx-hd, bx+hd].
-      emitWall(oW, oS, bx - hd, oS, court, null, { middle: wallTex }); // S left of door
-      emitWall(bx + hd, oS, oE, oS, court, null, { middle: wallTex }); // S right of door
-      emitWall(oE, oS, oE, oN, court, null, { middle: wallTex });      // E
-      emitWall(oE, oN, oW, oN, court, null, { middle: wallTex });      // N
-      emitWall(oW, oN, oW, oS, court, null, { middle: wallTex });      // W
-      // INNER ring — one-sided, interior on the right (walk CW). South wall
-      // split around the door gap.
-      emitWall(bx - hd, iS, iW, iS, inner, null, { middle: wallTex }); // S left
-      emitWall(iE, iS, bx + hd, iS, inner, null, { middle: wallTex }); // S right
-      emitWall(iW, iS, iW, iN, inner, null, { middle: wallTex });      // W
-      emitWall(iW, iN, iE, iN, inner, null, { middle: wallTex });      // N
-      emitWall(iE, iN, iE, iS, inner, null, { middle: wallTex });      // E
-      // DOOR — a short passage between courtyard and interior through the
-      // wall thickness. Two-sided faces (open) + one-sided jambs.
-      emitWall(bx - hd, oS, bx + hd, oS, court, door, { upper: wallTex, backUpper: wallTex }); // courtyard face
-      emitWall(bx + hd, iS, bx - hd, iS, inner, door); // interior face (open)
-      emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex }); // west jamb
-      emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex }); // east jamb
+      // OUTER ring (one-sided, courtyard on the right / CCW walk). The south
+      // wall is split around the door gap; E/W walls split around windows.
+      emitWall(oW, oS, bx - hd, oS, court, null, { middle: wallTex });   // S left of door
+      emitWall(bx + hd, oS, oE, oS, court, null, { middle: wallTex });   // S right of door
+      emitWall(oE, oS, oE, by - hw, court, null, { middle: wallTex });   // E below window
+      emitWall(oE, by + hw, oE, oN, court, null, { middle: wallTex });   // E above window
+      emitWall(oE, oN, oW, oN, court, null, { middle: wallTex });        // N
+      emitWall(oW, oN, oW, by + hw, court, null, { middle: wallTex });   // W above window
+      emitWall(oW, by - hw, oW, oS, court, null, { middle: wallTex });   // W below window
+      // INNER ring (one-sided, interior on the right / CW walk).
+      emitWall(bx - hd, iS, iW, iS, inner, null, { middle: wallTex });   // S left
+      emitWall(iE, iS, bx + hd, iS, inner, null, { middle: wallTex });   // S right
+      emitWall(iW, iS, iW, by - hw, inner, null, { middle: wallTex });   // W below window
+      emitWall(iW, by + hw, iW, iN, inner, null, { middle: wallTex });   // W above window
+      emitWall(iW, iN, iE, iN, inner, null, { middle: wallTex });        // N
+      emitWall(iE, iN, iE, by + hw, inner, null, { middle: wallTex });   // E above window
+      emitWall(iE, by - hw, iE, iS, inner, null, { middle: wallTex });   // E below window
+      // DOOR — short passage through the wall thickness (open both faces).
+      emitWall(bx - hd, oS, bx + hd, oS, court, door, { upper: wallTex, backUpper: wallTex });
+      emitWall(bx + hd, iS, bx - hd, iS, inner, door);
+      emitWall(bx - hd, oS, bx - hd, iS, door, null, { middle: wallTex });
+      emitWall(bx + hd, iS, bx + hd, oS, door, null, { middle: wallTex });
+      // EAST WINDOW — raised-sill opening; see/shoot through, can't enter.
+      emitWall(oE, by - hw, oE, by + hw, court, wE, { upper: wallTex, backUpper: wallTex }); // courtyard face
+      emitWall(iE, by + hw, iE, by - hw, inner, wE);                                          // interior face
+      emitWall(oE, by - hw, iE, by - hw, wE, null, { middle: wallTex });                      // south jamb
+      emitWall(iE, by + hw, oE, by + hw, wE, null, { middle: wallTex });                      // north jamb
+      // WEST WINDOW
+      emitWall(oW, by + hw, oW, by - hw, court, wW, { upper: wallTex, backUpper: wallTex });   // courtyard face
+      emitWall(iW, by - hw, iW, by + hw, inner, wW);                                           // interior face
+      emitWall(iW, by - hw, oW, by - hw, wW, null, { middle: wallTex });                       // south jamb
+      emitWall(oW, by + hw, iW, by + hw, wW, null, { middle: wallTex });                       // north jamb
     }
     // Ziggurat — concentric rising stair rings. Same CCW-inset walk as the
     // trim rings; front = outer (lower) ring, back = inner (higher) ring,
@@ -4813,7 +4837,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.12</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.13</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

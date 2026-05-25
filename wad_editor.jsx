@@ -1328,10 +1328,13 @@ function _generateDungeonOnce(opts) {
         light: Math.min(255, r.light + 16), special: 0,
       });
     } else if (r.feature === 'sky') {
+      // Open oculus shaft with a raised, brighter dais directly beneath it —
+      // a shaft-of-light altar the player steps up onto. The 16-unit step is
+      // textured by the resolve pass against the innermost trim.
       r.featureId = allocSec({
-        floorH: deepestFloor, ceilH: r.floorH + 384,
-        floorTex: r.palette.floor, ceilTex: 'F_SKY1',
-        light: Math.min(255, r.light + 48), special: 0,
+        floorH: deepestFloor + 16, ceilH: r.floorH + 384,
+        floorTex: r.palette.accent, ceilTex: 'F_SKY1',
+        light: Math.min(255, r.light + 64), special: 0,
       });
     } else if (r.feature === 'pit') {
       r.featureId = allocSec({
@@ -1617,7 +1620,9 @@ function _generateDungeonOnce(opts) {
         const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
         const radius = 40 + Math.floor(rand() * 3) * 16;
         if (!clearOfTerrain(cx, cy, radius)) continue;
-        r.pillars.push({ cx, cy, radius });
+        // Short kiosks/planters (48–80 tall) with open sky above — NOT
+        // floor-to-sky monoliths, so they read as low obstacles in the square.
+        r.pillars.push({ cx, cy, radius, top: r.floorH + 48 + Math.floor(rand() * 3) * 16 });
       }
     } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
@@ -1681,8 +1686,11 @@ function _generateDungeonOnce(opts) {
         r.pillars.push({ cx: r.cx + dx, cy: r.cy + dy, radius: 40 });
       }
     }
-    r.pillarSecIds = r.pillars.map(() => allocSec({
-      floorH: r.ceilH, ceilH: r.ceilH,
+    // A pillar with floor == ceil == room ceiling reads as a solid
+    // floor-to-ceiling column. A pillar with an explicit `top` (< ceil)
+    // is a short raised block (open above) — e.g. plaza kiosks/planters.
+    r.pillarSecIds = r.pillars.map((p) => allocSec({
+      floorH: p.top != null ? p.top : r.ceilH, ceilH: r.ceilH,
       floorTex: r.palette.floor, ceilTex: r.palette.ceil,
       light: r.light, special: 0,
     }));
@@ -5088,7 +5096,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.19</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.20</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

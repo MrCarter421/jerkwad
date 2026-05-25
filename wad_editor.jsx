@@ -1480,13 +1480,19 @@ function _generateDungeonOnce(opts) {
         const roofTop = r.floorH + (isTower ? 160 + Math.floor(rand() * 4) * 16
                                             : 96 + Math.floor(rand() * 3) * 16);
         r.buildings.push({
-          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80,
+          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80, porchDepth: 48,
           wall: pick(BUILDING_WALLS), roofTop, isTower,
           doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
           winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
           roofSec: allocSec({ floorH: roofTop, ceilH: r.ceilH,
             floorTex: bRoof, ceilTex: 'F_SKY1',
             light: Math.min(255, r.light + 8), special: 0 }),
+          // Recessed covered entrance — a shadowed porch carved into the south
+          // wall (floor at grade, low roofed ceiling), giving the thick wall a
+          // layered doorway with depth instead of a flat painted panel.
+          porchSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 80,
+            floorTex: r.palette.floor, ceilTex: bRoof,
+            light: Math.max(96, r.light - 24), special: 0 }),
         });
       }
     }
@@ -2164,14 +2170,22 @@ function _generateDungeonOnce(opts) {
     // panel centred on the south wall and lit window strips on the E/W walls.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
       const bx = b.cx, by = b.cy, Bh = b.half, hd = b.door / 2, hw = b.win / 2;
-      const court = room.outerId, roof = b.roofSec;
+      const court = room.outerId, roof = b.roofSec, porch = b.porchSec;
+      const PD = b.porchDepth;
       const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh;
+      const pN = oS + PD; // porch back (north) edge
       const wallTex = b.wall;
       const face = tex => ({ frontSide: { lower: tex } });
-      // SOUTH wall — split around a tall door panel.
-      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));     // S left of door
-      emitWall(bx - hd, oS, bx + hd, oS, court, roof, face(b.doorTex)); // door panel
-      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));     // S right of door
+      // SOUTH wall — solid segments flank a recessed covered porch. The porch
+      // opening shows the building wall as a lintel above (upper texture); the
+      // porch interior is a shadowed bay with the door panel at its back.
+      emitWall(oW, oS, bx - hd, oS, court, roof, face(wallTex));     // S left of porch
+      emitWall(bx + hd, oS, oE, oS, court, roof, face(wallTex));     // S right of porch
+      emitWall(bx - hd, oS, bx + hd, oS, court, porch,
+        { frontSide: { upper: wallTex }, backSide: { upper: wallTex } }); // porch opening + lintel
+      emitWall(bx - hd, oS, bx - hd, pN, porch, roof, face(wallTex)); // porch W jamb
+      emitWall(bx - hd, pN, bx + hd, pN, porch, roof, face(b.doorTex)); // porch back (door panel)
+      emitWall(bx + hd, pN, bx + hd, oS, porch, roof, face(wallTex)); // porch E jamb
       // EAST wall — split around a window strip.
       emitWall(oE, oS, oE, by - hw, court, roof, face(wallTex));     // E below window
       emitWall(oE, by - hw, oE, by + hw, court, roof, face(b.winTex)); // window strip
@@ -5096,7 +5110,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.20</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.21</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -1441,36 +1441,44 @@ function _generateDungeonOnce(opts) {
         light: Math.max(80, r.light - 32), special: 7,
       });
     }
-    // Courtyard — allocate the central building's interior (roofed, non-sky),
-    // doorway, and window sectors. The geometry pass emits the thick-walled
-    // shell. Roof height varies: a low "house" or a taller "tower".
+    // Courtyard — a compound of 1–4 enterable buildings (houses / towers)
+    // standing in the open-sky yard. Bigger yards hold more buildings laid
+    // out on a grid with "streets" between, like a city block. Each
+    // building gets its own interior, door and two windows.
     if (r.feature === 'courtyard') {
-      const bWall = pick(BUILDING_WALLS), bRoof = pick(BUILDING_ROOFS);
-      const bHalf = Math.floor(minDim * 0.22 / 32) * 32;
-      const isTower = rand() < 0.4;
-      const roofTop = r.floorH + (isTower ? 184 : 112);
-      r.building = {
-        cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32,
-        half: bHalf, thick: 32, door: 64, win: 96, wall: bWall, roofTop,
-      };
-      r.buildingInteriorId = allocSec({
-        floorH: r.floorH, ceilH: roofTop,
-        floorTex: r.palette.floor, ceilTex: bRoof,
-        light: Math.max(96, r.light - 48), special: 0,
-      });
-      r.buildingDoorId = allocSec({
-        floorH: r.floorH, ceilH: roofTop,
-        floorTex: r.palette.floor, ceilTex: bRoof,
-        light: Math.max(96, r.light - 32), special: 0,
-      });
-      // Two window sectors (east + west): raised sill so you see/shoot
-      // through but can't walk in.
-      r.buildingWindowIds = [
-        allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
-          floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
-        allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
-          floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
-      ];
+      const sn32 = v => Math.round(v / 32) * 32;
+      let layout;
+      if (minDim >= 1280) {
+        const o = sn32(minDim * 0.24), h = sn32(minDim * 0.13);
+        layout = [[-o,-o],[o,-o],[-o,o],[o,o]].map(([dx,dy]) => ({ cx: sn32(r.cx)+dx, cy: sn32(r.cy)+dy, half: h }));
+      } else if (minDim >= 1024) {
+        const o = sn32(minDim * 0.22), h = sn32(minDim * 0.16);
+        const axis = rand() < 0.5;
+        layout = [[-o,0],[o,0]].map(([dx,dy]) => ({ cx: sn32(r.cx)+(axis?dx:dy), cy: sn32(r.cy)+(axis?dy:dx), half: h }));
+      } else {
+        layout = [{ cx: sn32(r.cx), cy: sn32(r.cy), half: sn32(minDim * 0.22) }];
+      }
+      r.buildings = [];
+      for (const pos of layout) {
+        if (pos.half < 96) continue;
+        const bRoof = pick(BUILDING_ROOFS);
+        const isTower = rand() < 0.4;
+        const roofTop = r.floorH + (isTower ? 184 : 112);
+        r.buildings.push({
+          cx: pos.cx, cy: pos.cy, half: pos.half, thick: 32, door: 64, win: 96,
+          wall: pick(BUILDING_WALLS), roofTop,
+          interiorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
+            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 48), special: 0 }),
+          doorId: allocSec({ floorH: r.floorH, ceilH: roofTop,
+            floorTex: r.palette.floor, ceilTex: bRoof, light: Math.max(96, r.light - 32), special: 0 }),
+          windowIds: [
+            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
+              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
+            allocSec({ floorH: r.floorH + 40, ceilH: r.floorH + 88,
+              floorTex: r.palette.floor, ceilTex: bRoof, light: r.light, special: 0 }),
+          ],
+        });
+      }
     }
     // Ziggurat — allocate the concentric rising stair rings. Each ring is
     // STAIR_W wide and 16 units higher than the one outside it, so the
@@ -1960,13 +1968,12 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
-    // Courtyard central building — thick-walled square shell with a roofed
-    // interior, a south door, and a window on the east + west walls.
-    if (!room._fused && room.building) {
-      const b = room.building;
+    // Courtyard compound — each building is a thick-walled square shell with
+    // a roofed interior, a south door, and a window on the east + west walls.
+    for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
       const bx = b.cx, by = b.cy, Bh = b.half, T = b.thick, hd = b.door / 2, hw = b.win / 2;
-      const court = room.outerId, inner = room.buildingInteriorId, door = room.buildingDoorId;
-      const wE = room.buildingWindowIds[0], wW = room.buildingWindowIds[1];
+      const court = room.outerId, inner = b.interiorId, door = b.doorId;
+      const wE = b.windowIds[0], wW = b.windowIds[1];
       const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh; // outer ring
       const iS = by - Bh + T, iN = by + Bh - T, iW = bx - Bh + T, iE = bx + Bh - T; // inner
       const wallTex = b.wall;
@@ -4889,7 +4896,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.14</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.15</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -746,6 +746,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'canal',       label: 'Canal',        type: 'square',  w: 896, h: 640,   feature: 'canal' },
   { id: 'bunker',      label: 'Bunker',       type: 'square',  w: 512, h: 512,   feature: 'bunker' },
   { id: 'cityblock',   label: 'City Block',   type: 'square',  w: 1408, h: 1408, feature: 'cityblock' },
+  { id: 'terrain',     label: 'Terrain',      type: 'octagon', r: 768,          feature: 'terrain' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1200,6 +1201,17 @@ function _generateDungeonOnce(opts) {
       r.palette = { ...r.palette, wall: 'METAL', floor: 'FLAT5_4', trim: 'SUPPORT3',
         ceil: 'CEIL5_1', accent: 'CRATELIT' };
     }
+    // Terrain — a large open-sky field of rolling hills: many tightly-packed
+    // concentric rings whose floors undulate up and down in small steps,
+    // reading as terraced rolling ground under open sky.
+    if (r.feature === 'terrain') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 320;
+      r.light = pick([192, 208, 224]);
+      r.palette = { ...r.palette, ceil: 'F_SKY1',
+        floor: pick(['RROCK16', 'GRNROCK', 'MFLR8_1', 'FLAT10']),
+        trim: pick(['RROCK16', 'GRNROCK', 'FLAT10']) };
+    }
     // Sky Room — an open-air chamber whose vaulted ceiling opens through a
     // central oculus to the sky. Force sky + a tall ceiling so the oculus
     // shaft rises ABOVE the room and reads as open sky (not a sunken panel).
@@ -1292,21 +1304,29 @@ function _generateDungeonOnce(opts) {
         else fusedGroups.push(new Set([i, j]));
       }
     }
+    // Terrain/cover ISLAND features survive fusion — their sunken channels/
+    // basins/terraces and pillar cover get rasterized into the fusion grid
+    // below, so a fused canal still has its waterway, a fused plaza its
+    // basin, a fused depot its crates, etc. Concentric/shell features
+    // (centre daises, oculus shafts, trim rings, buildings) still need a
+    // clean convex room, so those are stripped to 'none'.
+    const ISLAND_FUSE = new Set(['canal', 'plaza', 'depot', 'bunker', 'courtyard', 'cityblock']);
     for (const g of fusedGroups) {
       // Equalize FLOOR only — so the player walks between fused rooms with
-      // no step. Keep each room's own CEILING so height variety and sky
-      // openings survive (that variety + the kept pillars/features make
-      // the fused interior interesting rather than a flat box).
+      // no step. Preserve each room's own height (so kept island features
+      // still fit under the ceiling) but flatten to a common floor.
       let fh = -Infinity;
       for (const idx of g) fh = Math.max(fh, rooms[idx].floorH);
       for (const idx of g) {
-        rooms[idx].floorH = fh;
-        if (rooms[idx].ceilH - fh < 96) rooms[idx].ceilH = fh + 128;
-        rooms[idx].trimLayers = 0;  // concentric rings don't fit a fused shape
-        rooms[idx].feature = 'none'; // centre features need a clean convex room
-        rooms[idx]._fused = true;
-        // Pillars ARE kept — they get rasterized into the fusion grid below
-        // as solid columns, so fused rooms still have combat cover / detail.
+        const rm = rooms[idx];
+        const gap = rm.ceilH - rm.floorH;
+        rm.floorH = fh;
+        rm.ceilH = fh + Math.max(128, gap);
+        rm.trimLayers = 0;  // concentric rings don't fit a fused shape
+        if (!ISLAND_FUSE.has(rm.feature)) rm.feature = 'none';
+        rm._fused = true;
+        // Pillars AND island terrain are kept — they get rasterized into the
+        // fusion grid below, so fused rooms still have cover / waterways.
       }
     }
   }
@@ -1332,6 +1352,8 @@ function _generateDungeonOnce(opts) {
     const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
+    // Terrain rooms pack many tightly-spaced rings for the rolling-hills look.
+    if (r.feature === 'terrain' && !r._fused) r.trimLayers = Math.min(8 + Math.floor(rand() * 5), maxTrim);
     // Outer sector: the ring at the room wall. Floor matches room floor and
     // ceiling matches room ceiling — this is the layer doors connect to.
     // Outer ring at the wall. For sky rooms the OUTER ring keeps a TEXTURED
@@ -1348,13 +1370,26 @@ function _generateDungeonOnce(opts) {
     // F_SKY1 through the ring, making the room read as an open dome with a
     // top oculus. Lower / upper textures get filled by the resolve pass.
     r.trimIds = [];
+    let terrH = r.floorH;  // running floor height for the rolling-hills walk
     for (let i = 1; i <= r.trimLayers; i++) {
-      r.trimIds.push(allocSec({
-        floorH: r.floorH - i * 8, ceilH: r.ceilH + i * 8,
-        floorTex: r.palette.trim,
-        ceilTex: r.palette.ceil,
-        light: Math.max(64, r.light - i * 6), special: 0,
-      }));
+      if (r.feature === 'terrain') {
+        // Rolling hills: a small seeded up/down step each ring, clamped to a
+        // gentle relief band. Ceiling stays a constant open sky.
+        terrH += pick([-16, -8, -8, 8, 8, 16]);
+        terrH = Math.max(r.floorH - 56, Math.min(r.floorH + 56, terrH));
+        r.trimIds.push(allocSec({
+          floorH: terrH, ceilH: r.ceilH,
+          floorTex: r.palette.floor, ceilTex: 'F_SKY1',
+          light: Math.max(160, r.light - i * 2), special: 0,
+        }));
+      } else {
+        r.trimIds.push(allocSec({
+          floorH: r.floorH - i * 8, ceilH: r.ceilH + i * 8,
+          floorTex: r.palette.trim,
+          ceilTex: r.palette.ceil,
+          light: Math.max(64, r.light - i * 6), special: 0,
+        }));
+      }
     }
     // Skip the centre feature if it wouldn't fit inside the innermost trim
     // (negative-size polygon = inverted winding = broken topology).
@@ -1872,7 +1907,7 @@ function _generateDungeonOnce(opts) {
     // rise into the open sky) and storage tanks (low wide cylinders) scattered
     // across the open yard for set dressing and cover. Placed clear of the
     // buildings, terrain and the central spawn so they never trap the player.
-    if ((r.feature === 'courtyard' || r.feature === 'cityblock') && !r._fused && r.buildings) {
+    if ((r.feature === 'courtyard' || r.feature === 'cityblock') && r.buildings) {
       const sn = v => Math.round(v / 32) * 32;
       const lim = minDim / 2 - 112;
       const metalTex = ['METAL', 'SHAWN2', 'SILVER1', 'SUPPORT3', 'COMPSPAN'];
@@ -2497,6 +2532,10 @@ function _generateDungeonOnce(opts) {
     }
   });
 
+  // Preferred riser (lower) texture for rasterized fused-grid sectors — e.g.
+  // a building silhouette gets its facade texture instead of a generic step.
+  // Consumed by the resolve pass (8b).
+  const gridRiserTex = new Map();
   // -------- 7a. Grid-based emit for fused groups --------
   // Each fused group is rasterized to a 32-unit grid; each cell is assigned
   // to the LATEST-placed room whose polygon contains it. Cells of the same
@@ -2537,6 +2576,54 @@ function _generateDungeonOnce(opts) {
             cellSec[gy * W + gx] = rooms[idx].outerId;
             cellTex[gy * W + gx] = rooms[idx].palette.wall;
             break;
+          }
+        }
+      }
+    }
+    // Overlay terrain islands (sunken channels/basins, raised terraces) —
+    // cells inside a terrain patch that still belong to the room's floor
+    // become that terrain's sector, so fused canals/plazas keep their
+    // waterways and platforms. The grid wall pass below paints the risers.
+    for (const idx of groupArr) {
+      const room = rooms[idx];
+      if (!room.terrains || !room.terrains.length) continue;
+      for (const t of room.terrains) {
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== room.outerId) continue;
+            const cx = minX + (gx + 0.5) * CELL;
+            const cy = minY + (gy + 0.5) * CELL;
+            if (Math.abs(cx - t.cx) < t.hw && Math.abs(cy - t.cy) < t.hh) {
+              cellSec[gy * W + gx] = t.secId;
+              cellTex[gy * W + gx] = room.palette.wall;
+            }
+          }
+        }
+      }
+    }
+    // Overlay buildings — collapse each footprint to a solid raised
+    // silhouette (the roof block, or the wall slab for an enterable shed)
+    // so fused courtyards/city-blocks keep their structures. The fine
+    // facade detail (door bay, windows, parapet) doesn't survive the
+    // 32-grid, but the building mass and its wall texture do.
+    for (const idx of groupArr) {
+      const room = rooms[idx];
+      if (!room.buildings || !room.buildings.length) continue;
+      for (const b of room.buildings) {
+        const blockSec = b.enterable ? b.slabSec : b.roofSec;
+        if (!blockSec) continue;
+        gridRiserTex.set(blockSec, b.wall);
+        const Hx = (b.halfX != null ? b.halfX : b.half);
+        const Hy = (b.halfY != null ? b.halfY : b.half);
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== room.outerId) continue;
+            const cx = minX + (gx + 0.5) * CELL;
+            const cy = minY + (gy + 0.5) * CELL;
+            if (Math.abs(cx - b.cx) < Hx && Math.abs(cy - b.cy) < Hy) {
+              cellSec[gy * W + gx] = blockSec;
+              cellTex[gy * W + gx] = b.wall;
+            }
           }
         }
       }
@@ -2962,7 +3049,10 @@ function _generateDungeonOnce(opts) {
         const highSec = fsec.floorH > bsec.floorH ? fsec : bsec;
         const isPillar = highSec && highSec.floorH === highSec.ceilH;
         const delta = Math.abs(fsec.floorH - bsec.floorH);
-        if (isPillar) lowSide.lower = 'SUPPORT2';
+        // A rasterized fused-grid building silhouette carries its own facade.
+        const riser = highSec && gridRiserTex.get(highSec.id);
+        if (riser) lowSide.lower = riser;
+        else if (isPillar) lowSide.lower = 'SUPPORT2';
         else if (delta >= 72) lowSide.lower = 'STARTAN2';
         else lowSide.lower = 'STEP1';
       }
@@ -3228,7 +3318,13 @@ function _generateDungeonOnce(opts) {
     }
   }
 
-  return { vertices: verts, linedefs, sidedefs, sectors, things };
+  // Prune orphan sectors: any sector allocated but never referenced by a
+  // sidedef (e.g. an island whose grid cells were all claimed by a later
+  // overlapping room) would have no walls and break sector-loop validation.
+  const usedSectorIds = new Set(sidedefs.map(sd => sd.sector));
+  const prunedSectors = sectors.filter(s => usedSectorIds.has(s.id));
+
+  return { vertices: verts, linedefs, sidedefs, sectors: prunedSectors, things };
 }
 
 // ============================================================================
@@ -5347,7 +5443,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.31</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.34</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

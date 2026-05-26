@@ -744,6 +744,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'lift',        label: 'Lift Vault',   type: 'square',  w: 640, h: 640,   feature: 'lift' },
   { id: 'depot',       label: 'Depot',        type: 'square',  w: 768, h: 768,   feature: 'depot' },
   { id: 'canal',       label: 'Canal',        type: 'square',  w: 896, h: 640,   feature: 'canal' },
+  { id: 'bunker',      label: 'Bunker',       type: 'square',  w: 512, h: 512,   feature: 'bunker' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1175,6 +1176,13 @@ function _generateDungeonOnce(opts) {
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
     }
+    // Bunker — a low fortified concrete vault: dim, thick-walled, with a
+    // central support column and low sandbag-style cover blocks.
+    if (r.feature === 'bunker') {
+      r.ceilH = r.floorH + 104;
+      r.light = pick([112, 128, 144]);
+      r.palette = { ...r.palette, wall: 'GRAY7', floor: 'FLOOR5_4', trim: 'GRAY5', ceil: 'CEIL5_2', accent: 'GRAYVINE' };
+    }
     // Canal — an industrial channel hall: a sunken liquid waterway runs
     // across the room, split by a central land crossing the player walks
     // over (or drops into the channel and wades through).
@@ -1312,7 +1320,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
@@ -1661,7 +1669,16 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r.feature === 'depot' && minDim >= 384) {
+    if (r.feature === 'bunker') {
+      // Central support column + a ring of low sandbag cover blocks.
+      r.pillars.push({ cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32, radius: 40 });
+      const ring = Math.round(minDim * 0.30 / 32) * 32;
+      for (const [dx, dy] of [[-ring, -ring], [ring, -ring], [-ring, ring], [ring, ring]]) {
+        if (rand() < 0.35) continue;
+        r.pillars.push({ cx: Math.round((r.cx + dx) / 32) * 32, cy: Math.round((r.cy + dy) / 32) * 32,
+          radius: 40, top: r.floorH + 40, tex: 'GRAYVINE' });
+      }
+    } else if (r.feature === 'depot' && minDim >= 384) {
       // Stacked-crate cover: a deterministic scatter of square-ish crate
       // blocks at varied heights (64/96/full) the player fights around. Use
       // square footprints (octagonPoly with radius reads as a chunky crate).
@@ -5172,7 +5189,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.25</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.26</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

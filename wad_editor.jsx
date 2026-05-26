@@ -1538,9 +1538,10 @@ function _generateDungeonOnce(opts) {
                                             : 96 + Math.floor(rand() * 3) * 16);
         const plinthH = r.floorH + 12;     // base podium height
         const capH = roofTop + 16;         // parapet cap (lip) height
-        r.buildings.push({
+        const parapetW = 56;
+        const b = {
           cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80,
-          porchDepth: 48, plinthW: 24, parapetW: 56,
+          porchDepth: 48, plinthW: 24, parapetW,
           wall: pick(BUILDING_WALLS), roofTop, isTower, plinthH, capH,
           doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
           winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
@@ -1558,7 +1559,22 @@ function _generateDungeonOnce(opts) {
           plinthSec: allocSec({ floorH: plinthH, ceilH: r.ceilH,
             floorTex: r.palette.floor, ceilTex: 'F_SKY1',
             light: r.light, special: 0 }),
-        });
+        };
+        // Rooftop unit — a solid tank/housing block on the recessed roof that
+        // rises above the parapet, giving the skyline a stepped silhouette.
+        // Only when the roof centre is big enough to hold one.
+        const innerHalf = pos.half - parapetW;
+        if (innerHalf >= 64) {
+          const unitH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
+          b.roofUnit = {
+            half: Math.min(sn32(innerHalf * 0.55), innerHalf - 16),
+            tex: pick(['METAL', 'COMPSPAN', 'SILVER1', 'SHAWN2', 'SUPPORT3']),
+            sec: allocSec({ floorH: unitH, ceilH: unitH,
+              floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
+              light: Math.min(255, r.light + 8), special: 0 }),
+          };
+        }
+        r.buildings.push(b);
       }
     }
     // Ziggurat — allocate the concentric rising stair rings. Each ring is
@@ -2321,6 +2337,14 @@ function _generateDungeonOnce(opts) {
         for (let j = 0; j < rp.length; j++) {
           const q1 = rp[j], q2 = rp[(j + 1) % rp.length];
           emitWall(q1.x, q1.y, q2.x, q2.y, cap, roof, { backSide: { lower: b.capTex } });
+        }
+      }
+      // ROOFTOP UNIT — a solid tank/housing block standing on the roof centre.
+      if (b.roofUnit) {
+        const up = squarePoly(bx, by, b.roofUnit.half * 2, b.roofUnit.half * 2);
+        for (let j = 0; j < up.length; j++) {
+          const q1 = up[j], q2 = up[(j + 1) % up.length];
+          emitWall(q1.x, q1.y, q2.x, q2.y, roof, b.roofUnit.sec, { frontSide: { lower: b.roofUnit.tex } });
         }
       }
     }
@@ -5212,7 +5236,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.27</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.28</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

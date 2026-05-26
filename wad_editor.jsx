@@ -746,6 +746,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'canal',       label: 'Canal',        type: 'square',  w: 896, h: 640,   feature: 'canal' },
   { id: 'bunker',      label: 'Bunker',       type: 'square',  w: 512, h: 512,   feature: 'bunker' },
   { id: 'cityblock',   label: 'City Block',   type: 'square',  w: 1408, h: 1408, feature: 'cityblock' },
+  { id: 'terrain',     label: 'Terrain',      type: 'octagon', r: 768,          feature: 'terrain' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1200,6 +1201,17 @@ function _generateDungeonOnce(opts) {
       r.palette = { ...r.palette, wall: 'METAL', floor: 'FLAT5_4', trim: 'SUPPORT3',
         ceil: 'CEIL5_1', accent: 'CRATELIT' };
     }
+    // Terrain — a large open-sky field of rolling hills: many tightly-packed
+    // concentric rings whose floors undulate up and down in small steps,
+    // reading as terraced rolling ground under open sky.
+    if (r.feature === 'terrain') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 320;
+      r.light = pick([192, 208, 224]);
+      r.palette = { ...r.palette, ceil: 'F_SKY1',
+        floor: pick(['RROCK16', 'GRNROCK', 'MFLR8_1', 'FLAT10']),
+        trim: pick(['RROCK16', 'GRNROCK', 'FLAT10']) };
+    }
     // Sky Room — an open-air chamber whose vaulted ceiling opens through a
     // central oculus to the sky. Force sky + a tall ceiling so the oculus
     // shaft rises ABOVE the room and reads as open sky (not a sunken panel).
@@ -1340,6 +1352,8 @@ function _generateDungeonOnce(opts) {
     const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
+    // Terrain rooms pack many tightly-spaced rings for the rolling-hills look.
+    if (r.feature === 'terrain' && !r._fused) r.trimLayers = Math.min(8 + Math.floor(rand() * 5), maxTrim);
     // Outer sector: the ring at the room wall. Floor matches room floor and
     // ceiling matches room ceiling — this is the layer doors connect to.
     // Outer ring at the wall. For sky rooms the OUTER ring keeps a TEXTURED
@@ -1356,13 +1370,26 @@ function _generateDungeonOnce(opts) {
     // F_SKY1 through the ring, making the room read as an open dome with a
     // top oculus. Lower / upper textures get filled by the resolve pass.
     r.trimIds = [];
+    let terrH = r.floorH;  // running floor height for the rolling-hills walk
     for (let i = 1; i <= r.trimLayers; i++) {
-      r.trimIds.push(allocSec({
-        floorH: r.floorH - i * 8, ceilH: r.ceilH + i * 8,
-        floorTex: r.palette.trim,
-        ceilTex: r.palette.ceil,
-        light: Math.max(64, r.light - i * 6), special: 0,
-      }));
+      if (r.feature === 'terrain') {
+        // Rolling hills: a small seeded up/down step each ring, clamped to a
+        // gentle relief band. Ceiling stays a constant open sky.
+        terrH += pick([-16, -8, -8, 8, 8, 16]);
+        terrH = Math.max(r.floorH - 56, Math.min(r.floorH + 56, terrH));
+        r.trimIds.push(allocSec({
+          floorH: terrH, ceilH: r.ceilH,
+          floorTex: r.palette.floor, ceilTex: 'F_SKY1',
+          light: Math.max(160, r.light - i * 2), special: 0,
+        }));
+      } else {
+        r.trimIds.push(allocSec({
+          floorH: r.floorH - i * 8, ceilH: r.ceilH + i * 8,
+          floorTex: r.palette.trim,
+          ceilTex: r.palette.ceil,
+          light: Math.max(64, r.light - i * 6), special: 0,
+        }));
+      }
     }
     // Skip the centre feature if it wouldn't fit inside the innermost trim
     // (negative-size polygon = inverted winding = broken topology).
@@ -5416,7 +5443,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.33</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.34</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

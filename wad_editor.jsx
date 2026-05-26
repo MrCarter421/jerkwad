@@ -745,6 +745,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'depot',       label: 'Depot',        type: 'square',  w: 768, h: 768,   feature: 'depot' },
   { id: 'canal',       label: 'Canal',        type: 'square',  w: 896, h: 640,   feature: 'canal' },
   { id: 'bunker',      label: 'Bunker',       type: 'square',  w: 512, h: 512,   feature: 'bunker' },
+  { id: 'cityblock',   label: 'City Block',   type: 'square',  w: 1408, h: 1408, feature: 'cityblock' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1211,6 +1212,14 @@ function _generateDungeonOnce(opts) {
     if (r.feature === 'lift') {
       r.ceilH = Math.max(r.ceilH, r.floorH + 192);
     }
+    // City Block — an open-sky urban grid of solid buildings separated by
+    // narrow streets the player threads through (DOOMCITY vibe).
+    if (r.feature === 'cityblock') {
+      r.hasSky = true;
+      r.ceilH = r.floorH + 256;
+      r.light = 208;
+      r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT5_4', 'FLOOR0_1', 'FLAT1']) };
+    }
     // Courtyard — an open-sky paved yard with a central enterable BUILDING
     // (a house/tower silhouette with solid walls, a flat roof and one door).
     // This is the headline "structures in an open area" feature.
@@ -1320,7 +1329,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
@@ -1486,10 +1495,24 @@ function _generateDungeonOnce(opts) {
     // standing in the open-sky yard. Bigger yards hold more buildings laid
     // out on a grid with "streets" between, like a city block. Each
     // building gets its own interior, door and two windows.
-    if (r.feature === 'courtyard') {
+    if (r.feature === 'courtyard' || r.feature === 'cityblock') {
       const sn32 = v => Math.round(v / 32) * 32;
       let layout;
-      if (minDim >= 1280) {
+      if (r.feature === 'cityblock') {
+        // Dense N×N grid of smaller buildings with streets between them.
+        const N = minDim >= 1280 ? 3 : 2;
+        const cell = sn32(minDim / (N + 0.5));
+        const bh = sn32(cell * 0.36);
+        const mid = (N - 1) / 2;
+        layout = [];
+        for (let gy = 0; gy < N; gy++) for (let gx = 0; gx < N; gx++) {
+          // Leave the exact-centre cell open as a plaza (spawn-safe + a town
+          // square), for odd grids only.
+          if (N % 2 === 1 && gx === mid && gy === mid) continue;
+          layout.push({ cx: sn32(r.cx) + (gx - mid) * cell,
+            cy: sn32(r.cy) + (gy - mid) * cell, half: bh });
+        }
+      } else if (minDim >= 1280) {
         const o = sn32(minDim * 0.24), h = sn32(minDim * 0.13);
         layout = [[-o,-o],[o,-o],[-o,o],[o,o]].map(([dx,dy]) => ({ cx: sn32(r.cx)+dx, cy: sn32(r.cy)+dy, half: h }));
       } else if (minDim >= 1024) {
@@ -5189,7 +5212,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.26</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.27</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

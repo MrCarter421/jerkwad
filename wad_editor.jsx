@@ -742,6 +742,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'plaza',       label: 'Plaza',        type: 'octagon', r: 640,          feature: 'plaza' },
   { id: 'ziggurat',    label: 'Ziggurat',     type: 'square',  w: 768, h: 768,   feature: 'ziggurat' },
   { id: 'lift',        label: 'Lift Vault',   type: 'square',  w: 640, h: 640,   feature: 'lift' },
+  { id: 'depot',       label: 'Depot',        type: 'square',  w: 768, h: 768,   feature: 'depot' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1173,6 +1174,14 @@ function _generateDungeonOnce(opts) {
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
     }
+    // Depot — an enclosed industrial warehouse: a combat hall packed with
+    // stacked-crate cover at varied heights under a metal-trussed ceiling.
+    if (r.feature === 'depot') {
+      r.ceilH = r.floorH + 160;
+      r.light = pick([144, 160, 176]);
+      r.palette = { ...r.palette, wall: 'METAL', floor: 'FLAT5_4', trim: 'SUPPORT3',
+        ceil: 'CEIL5_1', accent: 'CRATELIT' };
+    }
     // Sky Room — an open-air chamber whose vaulted ceiling opens through a
     // central oculus to the sky. Force sky + a tall ceiling so the oculus
     // shaft rises ABOVE the room and reads as open sky (not a sunken panel).
@@ -1294,7 +1303,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
@@ -1624,7 +1633,26 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
-    if (r.feature === 'plaza' && minDim >= 384) {
+    if (r.feature === 'depot' && minDim >= 384) {
+      // Stacked-crate cover: a deterministic scatter of square-ish crate
+      // blocks at varied heights (64/96/full) the player fights around. Use
+      // square footprints (octagonPoly with radius reads as a chunky crate).
+      const span = minDim * 0.34;
+      const crateTex = ['CRATE1', 'CRATE2', 'CRATWIDE', 'CRATELIT'];
+      const n = 5 + Math.floor(rand() * 4);
+      for (let i = 0; i < n; i++) {
+        const ang = rand() * Math.PI * 2;
+        const dist = span * (0.25 + rand() * 0.75);
+        const cx = Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32;
+        const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
+        const radius = 48 + Math.floor(rand() * 3) * 16;
+        const roll = rand();
+        const top = roll < 0.35 ? r.floorH + 64 : roll < 0.7 ? r.floorH + 96 : r.ceilH;
+        if (r.pillars.some(p => Math.abs(p.cx - cx) < p.radius + radius + 24 &&
+                                Math.abs(p.cy - cy) < p.radius + radius + 24)) continue;
+        r.pillars.push({ cx, cy, radius, top, tex: pick(crateTex) });
+      }
+    } else if (r.feature === 'plaza' && minDim >= 384) {
       // Scatter a few solid blocks (planters / kiosks) the player weaves
       // between in the open plaza, kept to the OUTER ring so they clear the
       // sunken basin and raised terraces. Deterministic positions from RNG.
@@ -2149,9 +2177,12 @@ function _generateDungeonOnce(opts) {
         const p = room.pillars[k];
         const pillarSecId = room.pillarSecIds[k];
         const pillarPoly = octagonPoly(p.cx, p.cy, p.radius);
+        // Optional explicit face texture (e.g. crate blocks); otherwise the
+        // resolve pass picks a step/wall texture from the height delta.
+        const props = p.tex ? { frontSide: { lower: p.tex } } : {};
         for (let j = 0; j < pillarPoly.length; j++) {
           const q1 = pillarPoly[j], q2 = pillarPoly[(j + 1) % pillarPoly.length];
-          emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId);
+          emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId, props);
         }
       }
     }
@@ -5113,7 +5144,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.23</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.24</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

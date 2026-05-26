@@ -743,6 +743,7 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'ziggurat',    label: 'Ziggurat',     type: 'square',  w: 768, h: 768,   feature: 'ziggurat' },
   { id: 'lift',        label: 'Lift Vault',   type: 'square',  w: 640, h: 640,   feature: 'lift' },
   { id: 'depot',       label: 'Depot',        type: 'square',  w: 768, h: 768,   feature: 'depot' },
+  { id: 'canal',       label: 'Canal',        type: 'square',  w: 896, h: 640,   feature: 'canal' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1174,6 +1175,14 @@ function _generateDungeonOnce(opts) {
       r.light = Math.max(80, r.light - 48);
       r.palette = { ...r.palette, floor: 'FLAT5_4', trim: 'STEP1', ceil: 'CEIL5_2' };
     }
+    // Canal — an industrial channel hall: a sunken liquid waterway runs
+    // across the room, split by a central land crossing the player walks
+    // over (or drops into the channel and wades through).
+    if (r.feature === 'canal') {
+      r.ceilH = r.floorH + 192;
+      r.light = pick([160, 176, 192]);
+      r.palette = { ...r.palette, wall: 'STONE2', floor: 'FLOOR0_1', trim: 'SUPPORT3', ceil: 'CEIL5_2' };
+    }
     // Depot — an enclosed industrial warehouse: a combat hall packed with
     // stacked-crate cover at varied heights under a metal-trussed ceiling.
     if (r.feature === 'depot') {
@@ -1303,7 +1312,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Outer sector: the ring at the room wall. Floor matches room floor and
@@ -1570,6 +1579,25 @@ function _generateDungeonOnce(opts) {
     // sub-sectors; the resolve pass textures the risers, and the sky ceiling
     // continues unbroken above them. Stored for the emit pass + clearance.
     r.terrains = [];
+    if (r.feature === 'canal') {
+      // Sunken liquid channel across the room (E–W), split by a central land
+      // crossing. Two sunken segments left/right of the crossing; the player
+      // walks the crossing or drops 24 into the channel and wades.
+      const sn = v => Math.round(v / 32) * 32;
+      const halfW = (r.type === 'square' ? r.w : minDim) / 2;
+      const chHalfH = 80, crossHalf = 64;
+      const liquid = pick(['NUKAGE1', 'FWATER1', 'BLOOD1']);
+      const dmg = liquid === 'FWATER1' ? 0 : 7;
+      const inset = sn(halfW - 64);
+      for (const [x0, x1] of [[-inset, -crossHalf], [crossHalf, inset]]) {
+        const hw = sn((x1 - x0) / 2);
+        if (hw < 48) continue;
+        r.terrains.push({ cx: sn(r.cx + (x0 + x1) / 2), cy: sn(r.cy), hw, hh: chHalfH, kind: 'channel',
+          secId: allocSec({ floorH: r.floorH - 24, ceilH: r.ceilH,
+            floorTex: liquid, ceilTex: r.palette.ceil,
+            light: Math.max(96, r.light - 32), special: dmg }) });
+      }
+    }
     if (r.feature === 'plaza' && minDim >= 640) {
       const sn = v => Math.round(v / 32) * 32;
       const bHalf = sn(minDim * 0.15);
@@ -5144,7 +5172,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.24</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.25</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

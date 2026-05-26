@@ -1522,6 +1522,26 @@ function _generateDungeonOnce(opts) {
       } else {
         layout = [{ cx: sn32(r.cx), cy: sn32(r.cy), half: sn32(minDim * 0.22) }];
       }
+      // Varied footprints — give courtyard buildings a non-square aspect when
+      // there's room (wide or deep), keeping a square fallback if stretching
+      // would collide with an already-placed building. City-block lots stay
+      // square so they don't overflow the street grid.
+      const placedFP = [];
+      for (const pos of layout) {
+        let hx = pos.half, hy = pos.half;
+        if (r.feature !== 'cityblock') {
+          const roll = rand();
+          let thx = hx, thy = hy;
+          if (roll < 0.3) thx = sn32(hx * 1.35);
+          else if (roll < 0.6) thy = sn32(hy * 1.35);
+          const fits = placedFP.every(q => Math.abs(pos.cx - q.cx) >= thx + q.hx + 96 ||
+                                            Math.abs(pos.cy - q.cy) >= thy + q.hy + 96);
+          if (fits) { hx = thx; hy = thy; }
+        }
+        pos.halfX = hx; pos.halfY = hy;
+        pos.half = Math.max(hx, hy);
+        placedFP.push({ cx: pos.cx, cy: pos.cy, hx, hy });
+      }
       r.buildings = [];
       for (const pos of layout) {
         if (pos.half < 96) continue;
@@ -1540,8 +1560,8 @@ function _generateDungeonOnce(opts) {
         const capH = roofTop + 16;         // parapet cap (lip) height
         const parapetW = 56;
         const b = {
-          cx: pos.cx, cy: pos.cy, half: pos.half, door: 96, win: 80,
-          porchDepth: 48, plinthW: 24, parapetW,
+          cx: pos.cx, cy: pos.cy, half: pos.half, halfX: pos.halfX, halfY: pos.halfY,
+          door: 96, win: 80, porchDepth: 48, plinthW: 24, parapetW,
           wall: pick(BUILDING_WALLS), roofTop, isTower, plinthH, capH,
           doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
           winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
@@ -1563,7 +1583,7 @@ function _generateDungeonOnce(opts) {
         // Rooftop unit — a solid tank/housing block on the recessed roof that
         // rises above the parapet, giving the skyline a stepped silhouette.
         // Only when the roof centre is big enough to hold one.
-        const innerHalf = pos.half - parapetW;
+        const innerHalf = Math.min(pos.halfX, pos.halfY) - parapetW;
         if (innerHalf >= 64) {
           const unitH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
           b.roofUnit = {
@@ -2303,11 +2323,15 @@ function _generateDungeonOnce(opts) {
     //   • a PARAPET cap lip around a slightly recessed flat ROOF centre.
     // Every band's ceiling is sky, so there are no sky/non-sky upper seams.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
-      const bx = b.cx, by = b.cy, Bh = b.half, hd = b.door / 2, hw = b.win / 2;
+      const bx = b.cx, by = b.cy, hd = b.door / 2, hw = b.win / 2;
+      const Bhx = b.halfX != null ? b.halfX : b.half;
+      const Bhy = b.halfY != null ? b.halfY : b.half;
       const court = room.outerId, plinth = b.plinthSec, cap = b.capSec, roof = b.roofSec;
-      const PD = b.porchDepth, PBh = Bh + b.plinthW, IBh = Bh - b.parapetW;
-      const oS = by - Bh, oN = by + Bh, oW = bx - Bh, oE = bx + Bh;
-      const pS = by - PBh, pN = by + PBh, pW = bx - PBh, pE = bx + PBh;
+      const PD = b.porchDepth;
+      const IBhx = Bhx - b.parapetW, IBhy = Bhy - b.parapetW;
+      const oS = by - Bhy, oN = by + Bhy, oW = bx - Bhx, oE = bx + Bhx;
+      const pS = by - (Bhy + b.plinthW), pN = by + (Bhy + b.plinthW);
+      const pW = bx - (Bhx + b.plinthW), pE = bx + (Bhx + b.plinthW);
       const rN = oS + PD; // recessed-entrance back edge
       const wallTex = b.wall;
       const lo = tex => ({ frontSide: { lower: tex } });
@@ -2332,8 +2356,8 @@ function _generateDungeonOnce(opts) {
       emitWall(oW, by + hw, oW, by - hw, plinth, cap, lo(b.winTex)); // W window
       emitWall(oW, by - hw, oW, oS, plinth, cap, lo(wallTex));   // W below window
       // PARAPET cap → recessed ROOF centre: a raised lip ring around the roof.
-      if (IBh >= 32) {
-        const rp = squarePoly(bx, by, IBh * 2, IBh * 2);
+      if (IBhx >= 32 && IBhy >= 32) {
+        const rp = squarePoly(bx, by, IBhx * 2, IBhy * 2);
         for (let j = 0; j < rp.length; j++) {
           const q1 = rp[j], q2 = rp[(j + 1) % rp.length];
           emitWall(q1.x, q1.y, q2.x, q2.y, cap, roof, { backSide: { lower: b.capTex } });
@@ -5236,7 +5260,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.28</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.29</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

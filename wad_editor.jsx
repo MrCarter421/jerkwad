@@ -1868,6 +1868,34 @@ function _generateDungeonOnce(opts) {
         r.pillars.push({ cx: r.cx + dx, cy: r.cy + dy, radius: 40 });
       }
     }
+    // Industrial props — freestanding metal silos (tall narrow cylinders that
+    // rise into the open sky) and storage tanks (low wide cylinders) scattered
+    // across the open yard for set dressing and cover. Placed clear of the
+    // buildings, terrain and the central spawn so they never trap the player.
+    if ((r.feature === 'courtyard' || r.feature === 'cityblock') && !r._fused && r.buildings) {
+      const sn = v => Math.round(v / 32) * 32;
+      const lim = minDim / 2 - 112;
+      const metalTex = ['METAL', 'SHAWN2', 'SILVER1', 'SUPPORT3', 'COMPSPAN'];
+      const n = 2 + Math.floor(rand() * 4);
+      const bHx = b => (b.halfX != null ? b.halfX : b.half);
+      const bHy = b => (b.halfY != null ? b.halfY : b.half);
+      for (let tries = 0; r.pillars.length < n && tries < 48; tries++) {
+        const cx = sn(r.cx + (rand() * 2 - 1) * lim);
+        const cy = sn(r.cy + (rand() * 2 - 1) * lim);
+        const isSilo = rand() < 0.5;
+        const radius = isSilo ? 32 + Math.floor(rand() * 2) * 16 : 48 + Math.floor(rand() * 3) * 16;
+        const top = isSilo ? r.floorH + 160 + Math.floor(rand() * 4) * 16
+                           : r.floorH + 56 + Math.floor(rand() * 3) * 16;
+        const clr = radius + 56;
+        if (Math.hypot(cx - r.cx, cy - r.cy) < clr + 112) continue;       // clear of spawn/plaza
+        if (!r.buildings.every(b => Math.abs(cx - b.cx) >= bHx(b) + clr ||
+                                    Math.abs(cy - b.cy) >= bHy(b) + clr)) continue;
+        if (!(r.terrains || []).every(t => Math.abs(cx - t.cx) >= t.hw + clr ||
+                                           Math.abs(cy - t.cy) >= t.hh + clr)) continue;
+        if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 48)) continue;
+        r.pillars.push({ cx, cy, radius, top, tex: pick(metalTex) });
+      }
+    }
     // A pillar with floor == ceil == room ceiling reads as a solid
     // floor-to-ceiling column. A pillar with an explicit `top` (< ceil)
     // is a short raised block (open above) — e.g. plaza kiosks/planters.
@@ -5319,7 +5347,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.30</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.31</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -1292,21 +1292,29 @@ function _generateDungeonOnce(opts) {
         else fusedGroups.push(new Set([i, j]));
       }
     }
+    // Terrain/cover ISLAND features survive fusion — their sunken channels/
+    // basins/terraces and pillar cover get rasterized into the fusion grid
+    // below, so a fused canal still has its waterway, a fused plaza its
+    // basin, a fused depot its crates, etc. Concentric/shell features
+    // (centre daises, oculus shafts, trim rings, buildings) still need a
+    // clean convex room, so those are stripped to 'none'.
+    const ISLAND_FUSE = new Set(['canal', 'plaza', 'depot', 'bunker']);
     for (const g of fusedGroups) {
       // Equalize FLOOR only — so the player walks between fused rooms with
-      // no step. Keep each room's own CEILING so height variety and sky
-      // openings survive (that variety + the kept pillars/features make
-      // the fused interior interesting rather than a flat box).
+      // no step. Preserve each room's own height (so kept island features
+      // still fit under the ceiling) but flatten to a common floor.
       let fh = -Infinity;
       for (const idx of g) fh = Math.max(fh, rooms[idx].floorH);
       for (const idx of g) {
-        rooms[idx].floorH = fh;
-        if (rooms[idx].ceilH - fh < 96) rooms[idx].ceilH = fh + 128;
-        rooms[idx].trimLayers = 0;  // concentric rings don't fit a fused shape
-        rooms[idx].feature = 'none'; // centre features need a clean convex room
-        rooms[idx]._fused = true;
-        // Pillars ARE kept — they get rasterized into the fusion grid below
-        // as solid columns, so fused rooms still have combat cover / detail.
+        const rm = rooms[idx];
+        const gap = rm.ceilH - rm.floorH;
+        rm.floorH = fh;
+        rm.ceilH = fh + Math.max(128, gap);
+        rm.trimLayers = 0;  // concentric rings don't fit a fused shape
+        if (!ISLAND_FUSE.has(rm.feature)) rm.feature = 'none';
+        rm._fused = true;
+        // Pillars AND island terrain are kept — they get rasterized into the
+        // fusion grid below, so fused rooms still have cover / waterways.
       }
     }
   }
@@ -2541,6 +2549,27 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
+    // Overlay terrain islands (sunken channels/basins, raised terraces) —
+    // cells inside a terrain patch that still belong to the room's floor
+    // become that terrain's sector, so fused canals/plazas keep their
+    // waterways and platforms. The grid wall pass below paints the risers.
+    for (const idx of groupArr) {
+      const room = rooms[idx];
+      if (!room.terrains || !room.terrains.length) continue;
+      for (const t of room.terrains) {
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== room.outerId) continue;
+            const cx = minX + (gx + 0.5) * CELL;
+            const cy = minY + (gy + 0.5) * CELL;
+            if (Math.abs(cx - t.cx) < t.hw && Math.abs(cy - t.cy) < t.hh) {
+              cellSec[gy * W + gx] = t.secId;
+              cellTex[gy * W + gx] = room.palette.wall;
+            }
+          }
+        }
+      }
+    }
     // Overlay pillars as solid columns — cells inside a pillar's radius
     // (and currently belonging to that pillar's room) become the pillar's
     // closed sector. They read as floor-to-ceiling columns.
@@ -3228,7 +3257,13 @@ function _generateDungeonOnce(opts) {
     }
   }
 
-  return { vertices: verts, linedefs, sidedefs, sectors, things };
+  // Prune orphan sectors: any sector allocated but never referenced by a
+  // sidedef (e.g. an island whose grid cells were all claimed by a later
+  // overlapping room) would have no walls and break sector-loop validation.
+  const usedSectorIds = new Set(sidedefs.map(sd => sd.sector));
+  const prunedSectors = sectors.filter(s => usedSectorIds.has(s.id));
+
+  return { vertices: verts, linedefs, sidedefs, sectors: prunedSectors, things };
 }
 
 // ============================================================================
@@ -5347,7 +5382,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.31</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.32</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

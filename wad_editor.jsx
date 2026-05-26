@@ -1298,7 +1298,7 @@ function _generateDungeonOnce(opts) {
     // basin, a fused depot its crates, etc. Concentric/shell features
     // (centre daises, oculus shafts, trim rings, buildings) still need a
     // clean convex room, so those are stripped to 'none'.
-    const ISLAND_FUSE = new Set(['canal', 'plaza', 'depot', 'bunker']);
+    const ISLAND_FUSE = new Set(['canal', 'plaza', 'depot', 'bunker', 'courtyard', 'cityblock']);
     for (const g of fusedGroups) {
       // Equalize FLOOR only — so the player walks between fused rooms with
       // no step. Preserve each room's own height (so kept island features
@@ -1880,7 +1880,7 @@ function _generateDungeonOnce(opts) {
     // rise into the open sky) and storage tanks (low wide cylinders) scattered
     // across the open yard for set dressing and cover. Placed clear of the
     // buildings, terrain and the central spawn so they never trap the player.
-    if ((r.feature === 'courtyard' || r.feature === 'cityblock') && !r._fused && r.buildings) {
+    if ((r.feature === 'courtyard' || r.feature === 'cityblock') && r.buildings) {
       const sn = v => Math.round(v / 32) * 32;
       const lim = minDim / 2 - 112;
       const metalTex = ['METAL', 'SHAWN2', 'SILVER1', 'SUPPORT3', 'COMPSPAN'];
@@ -2505,6 +2505,10 @@ function _generateDungeonOnce(opts) {
     }
   });
 
+  // Preferred riser (lower) texture for rasterized fused-grid sectors — e.g.
+  // a building silhouette gets its facade texture instead of a generic step.
+  // Consumed by the resolve pass (8b).
+  const gridRiserTex = new Map();
   // -------- 7a. Grid-based emit for fused groups --------
   // Each fused group is rasterized to a 32-unit grid; each cell is assigned
   // to the LATEST-placed room whose polygon contains it. Cells of the same
@@ -2565,6 +2569,33 @@ function _generateDungeonOnce(opts) {
             if (Math.abs(cx - t.cx) < t.hw && Math.abs(cy - t.cy) < t.hh) {
               cellSec[gy * W + gx] = t.secId;
               cellTex[gy * W + gx] = room.palette.wall;
+            }
+          }
+        }
+      }
+    }
+    // Overlay buildings — collapse each footprint to a solid raised
+    // silhouette (the roof block, or the wall slab for an enterable shed)
+    // so fused courtyards/city-blocks keep their structures. The fine
+    // facade detail (door bay, windows, parapet) doesn't survive the
+    // 32-grid, but the building mass and its wall texture do.
+    for (const idx of groupArr) {
+      const room = rooms[idx];
+      if (!room.buildings || !room.buildings.length) continue;
+      for (const b of room.buildings) {
+        const blockSec = b.enterable ? b.slabSec : b.roofSec;
+        if (!blockSec) continue;
+        gridRiserTex.set(blockSec, b.wall);
+        const Hx = (b.halfX != null ? b.halfX : b.half);
+        const Hy = (b.halfY != null ? b.halfY : b.half);
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== room.outerId) continue;
+            const cx = minX + (gx + 0.5) * CELL;
+            const cy = minY + (gy + 0.5) * CELL;
+            if (Math.abs(cx - b.cx) < Hx && Math.abs(cy - b.cy) < Hy) {
+              cellSec[gy * W + gx] = blockSec;
+              cellTex[gy * W + gx] = b.wall;
             }
           }
         }
@@ -2991,7 +3022,10 @@ function _generateDungeonOnce(opts) {
         const highSec = fsec.floorH > bsec.floorH ? fsec : bsec;
         const isPillar = highSec && highSec.floorH === highSec.ceilH;
         const delta = Math.abs(fsec.floorH - bsec.floorH);
-        if (isPillar) lowSide.lower = 'SUPPORT2';
+        // A rasterized fused-grid building silhouette carries its own facade.
+        const riser = highSec && gridRiserTex.get(highSec.id);
+        if (riser) lowSide.lower = riser;
+        else if (isPillar) lowSide.lower = 'SUPPORT2';
         else if (delta >= 72) lowSide.lower = 'STARTAN2';
         else lowSide.lower = 'STEP1';
       }
@@ -5382,7 +5416,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.32</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.33</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

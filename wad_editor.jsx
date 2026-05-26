@@ -1542,9 +1542,37 @@ function _generateDungeonOnce(opts) {
         pos.half = Math.max(hx, hy);
         placedFP.push({ cx: pos.cx, cy: pos.cy, hx, hy });
       }
+      // Enterable warehouse — in a large courtyard, make the biggest building
+      // a hollow shed the player can walk into through a south doorway.
+      if (r.feature === 'courtyard' && minDim >= 1024) {
+        let bigIdx = -1, bigHalf = 0;
+        for (let i = 0; i < layout.length; i++) {
+          if (layout[i].half >= 140 && layout[i].half > bigHalf) { bigHalf = layout[i].half; bigIdx = i; }
+        }
+        if (bigIdx >= 0 && rand() < 0.75) layout[bigIdx].enterable = true;
+      }
       r.buildings = [];
       for (const pos of layout) {
         if (pos.half < 96) continue;
+        if (pos.enterable) {
+          // Hollow shed built from a SOLID wall-slab frame (floor==ceil, so it
+          // blocks naturally — no impassable flag) whose facade is a LOWER
+          // texture (two-sided middles get stripped by the resolve pass, so we
+          // can't use them). The frame wraps a textured-ceiling interior with a
+          // door throat notched in on the south.
+          r.buildings.push({
+            cx: pos.cx, cy: pos.cy, half: pos.half, halfX: pos.halfX, halfY: pos.halfY,
+            enterable: true, wall: pick(BUILDING_WALLS), intWall: pick(['METAL2', 'STARTAN2', 'GRAY7', 'BROWN1']),
+            wallTop: r.floorH + 168,
+            slabSec: allocSec({ floorH: r.floorH + 168, ceilH: r.floorH + 168,
+              floorTex: pick(BUILDING_ROOFS), ceilTex: 'F_SKY1', light: r.light, special: 0 }),
+            intSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 144,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8']),
+              ceilTex: pick(['CEIL5_1', 'CEIL5_2', 'TLITE6_4', 'FLAT5_4']),
+              light: pick([128, 144, 160]), special: 0 }),
+          });
+          continue;
+        }
         // Solid roofed structure: walls rise to a flat roof with OPEN SKY
         // above it (the roof sector's ceiling is sky too), so the building
         // reads consistently from every angle — wall face up to the roofline,
@@ -2323,6 +2351,37 @@ function _generateDungeonOnce(opts) {
     //   • a PARAPET cap lip around a slightly recessed flat ROOF centre.
     // Every band's ceiling is sky, so there are no sky/non-sky upper seams.
     for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
+      // Enterable warehouse: a solid wall-slab frame (court↔slab, facade as a
+      // LOWER texture) wrapping a hollow interior, with a door throat notched
+      // into the interior on the south so the player walks straight in.
+      if (b.enterable) {
+        const court = room.outerId, slab = b.slabSec, intr = b.intSec;
+        const fac = b.wall, iw = b.intWall, ehd = 64, T = 24;
+        const cx = b.cx, cy = b.cy;
+        const oW = cx - b.halfX, oE = cx + b.halfX, oS = cy - b.halfY, oN = cy + b.halfY;
+        const iW = oW + T, iE = oE - T, iS = oS + T, iN = oN - T;
+        const dL = cx - ehd, dR = cx + ehd;
+        const loF = { frontSide: { lower: fac } };   // facade (court sees slab rise)
+        const loI = { frontSide: { lower: iw } };    // interior wall
+        // OUTER facade ring (court → slab), door gap on south.
+        emitWall(oW, oS, dL, oS, court, slab, loF);
+        emitWall(dR, oS, oE, oS, court, slab, loF);
+        emitWall(oE, oS, oE, oN, court, slab, loF);
+        emitWall(oE, oN, oW, oN, court, slab, loF);
+        emitWall(oW, oN, oW, oS, court, slab, loF);
+        // DOOR opening (court → interior, passable; interior ceil is below sky
+        // so the entrance is a tall open portal).
+        emitWall(dL, oS, dR, oS, court, intr, {});
+        // INNER ring + door jambs (interior → slab).
+        emitWall(iW, iS, dL, iS, intr, slab, loI);
+        emitWall(dL, iS, dL, oS, intr, slab, loI);   // west jamb
+        emitWall(dR, oS, dR, iS, intr, slab, loI);   // east jamb
+        emitWall(dR, iS, iE, iS, intr, slab, loI);
+        emitWall(iE, iS, iE, iN, intr, slab, loI);
+        emitWall(iE, iN, iW, iN, intr, slab, loI);
+        emitWall(iW, iN, iW, iS, intr, slab, loI);
+        continue;
+      }
       const bx = b.cx, by = b.cy, hd = b.door / 2, hw = b.win / 2;
       const Bhx = b.halfX != null ? b.halfX : b.half;
       const Bhy = b.halfY != null ? b.halfY : b.half;
@@ -5260,7 +5319,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.29</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.30</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

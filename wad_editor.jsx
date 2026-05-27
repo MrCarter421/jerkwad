@@ -1624,7 +1624,7 @@ function _generateDungeonOnce(opts) {
         const parapetW = 56;
         const b = {
           cx: pos.cx, cy: pos.cy, half: pos.half, halfX: pos.halfX, halfY: pos.halfY,
-          door: 96, win: 80, porchDepth: 48, plinthW: 24, parapetW,
+          door: 96, win: 80, porchDepth: 48, plinthW: 32, parapetW,
           wall: pick(BUILDING_WALLS), roofTop, isTower, plinthH, capH,
           doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
           winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
@@ -2333,6 +2333,42 @@ function _generateDungeonOnce(opts) {
     }
   }
 
+  // Decide which fused-room buildings can keep their CRISP precise facade
+  // (door bay, windows, parapet) vs collapse to a rasterized block. A
+  // building is "precise" when its 32-aligned footprint (plus a small margin)
+  // lies wholly inside its own room AND no later-placed room in the same
+  // fused group overlaps it (later rooms win those grid cells). Precise
+  // buildings get a clean punched hole in the fusion grid that their plinth
+  // wall abuts exactly; the rest are rasterized.
+  {
+    const groupOf = new Map();
+    for (const group of fusedGroups) {
+      const arr = [...group].sort((a, b) => a - b);
+      for (const idx of arr) groupOf.set(idx, arr);
+    }
+    rooms.forEach((room, ri) => {
+      if (!room._fused || !room.buildings) return;
+      const later = (groupOf.get(ri) || [ri]).filter(j => j > ri);
+      const myPoly = roomPoly(room);
+      const laterPolys = later.map(j => roomPoly(rooms[j]));
+      for (const b of room.buildings) {
+        const hx = (b.enterable ? b.halfX : b.halfX + b.plinthW) + 8;
+        const hy = (b.enterable ? b.halfY : b.halfY + b.plinthW) + 8;
+        const NS = 5;
+        let clear = true;
+        for (let sx = 0; sx <= NS && clear; sx++) {
+          for (let sy = 0; sy <= NS && clear; sy++) {
+            const px = b.cx - hx + (2 * hx) * sx / NS;
+            const py = b.cy - hy + (2 * hy) * sy / NS;
+            if (!pointInPolygon(px, py, myPoly)) clear = false;
+            else if (laterPolys.some(p => pointInPolygon(px, py, p))) clear = false;
+          }
+        }
+        b._fusedPrecise = clear;
+      }
+    });
+  }
+
   // For each room: outer polygon CW walk (with corridor cuts), then one ring
   // per trim layer (CCW walk around the inset polygon, layer-N-1 on front,
   // layer-N on back), then optional centre feature ring.
@@ -2413,7 +2449,8 @@ function _generateDungeonOnce(opts) {
     //     the south, lit window strips on E/W),
     //   • a PARAPET cap lip around a slightly recessed flat ROOF centre.
     // Every band's ceiling is sky, so there are no sky/non-sky upper seams.
-    for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
+    for (const b of (room.buildings || [])) {
+      if (room._fused && !b._fusedPrecise) continue;
       // Enterable warehouse: a solid wall-slab frame (court↔slab, facade as a
       // LOWER texture) wrapping a hollow interior, with a door throat notched
       // into the interior on the south so the player walks straight in.
@@ -2601,15 +2638,32 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
-    // Overlay buildings — collapse each footprint to a solid raised
-    // silhouette (the roof block, or the wall slab for an enterable shed)
-    // so fused courtyards/city-blocks keep their structures. The fine
-    // facade detail (door bay, windows, parapet) doesn't survive the
-    // 32-grid, but the building mass and its wall texture do.
+    // Overlay buildings. A "precise" building (footprint clear of other rooms)
+    // gets a clean punched HOLE — its 32-aligned footprint cells are marked
+    // PRECISE so the grid neither fills nor walls them; the detailed emit pass
+    // draws the crisp facade (door bay, windows, parapet) whose plinth wall
+    // abuts these cell boundaries exactly. The rest collapse to a solid raised
+    // silhouette (roof block, or wall slab for an enterable shed).
     for (const idx of groupArr) {
       const room = rooms[idx];
       if (!room.buildings || !room.buildings.length) continue;
       for (const b of room.buildings) {
+        if (b._fusedPrecise) {
+          // Punch the footprint (plinth-outer for solid, wall-outer for shed).
+          const Hx = (b.enterable ? b.halfX : b.halfX + b.plinthW);
+          const Hy = (b.enterable ? b.halfY : b.halfY + b.plinthW);
+          for (let gy = 0; gy < H; gy++) {
+            for (let gx = 0; gx < W; gx++) {
+              if (cellSec[gy * W + gx] !== room.outerId) continue;
+              const cx = minX + (gx + 0.5) * CELL;
+              const cy = minY + (gy + 0.5) * CELL;
+              if (Math.abs(cx - b.cx) < Hx && Math.abs(cy - b.cy) < Hy) {
+                cellSec[gy * W + gx] = 'PRECISE';
+              }
+            }
+          }
+          continue;
+        }
         const blockSec = b.enterable ? b.slabSec : b.roofSec;
         if (!blockSec) continue;
         gridRiserTex.set(blockSec, b.wall);
@@ -2655,7 +2709,7 @@ function _generateDungeonOnce(opts) {
     for (let gy = 0; gy < H; gy++) {
       for (let gx = 0; gx < W; gx++) {
         const here = cellSec[gy * W + gx];
-        if (here === null) continue;
+        if (here === null || here === 'PRECISE') continue;
         const tex = cellTex[gy * W + gx];
         const xMin = minX + gx * CELL, xMax = xMin + CELL;
         const yMin = minY + gy * CELL, yMax = yMin + CELL;
@@ -2669,6 +2723,10 @@ function _generateDungeonOnce(opts) {
         ];
         for (const e of edges) {
           if (e.s === here) continue;
+          // A PRECISE neighbour's boundary is drawn by the detailed building
+          // emit (its plinth wall sits exactly on this cell edge) — skip it
+          // here so the wall isn't drawn twice.
+          if (e.s === 'PRECISE') continue;
           emitWall(e.x1, e.y1, e.x2, e.y2, here, e.s,
                    e.s === null ? { middle: tex } : {});
         }
@@ -5443,7 +5501,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.34</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.35</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

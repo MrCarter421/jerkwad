@@ -1765,6 +1765,15 @@ function _generateDungeonOnce(opts) {
             floorTex: liquid, ceilTex: r.palette.ceil,
             light: Math.max(96, r.light - 32), special: dmg }) });
       }
+      // Bridge deck — a small raised metal-grating platform tucked between
+      // the two channels (with a small floor strip around it so its walls
+      // don't collide with the channel walls), reading as a crossing the
+      // player walks UP onto rather than a flush continuation of the floor.
+      r.terrains.push({ cx: sn(r.cx), cy: sn(r.cy), hw: crossHalf - 16, hh: chHalfH - 16, kind: 'bridge',
+        secId: allocSec({ floorH: r.floorH + 8, ceilH: r.ceilH,
+          floorTex: pick(['CEIL5_2', 'METAL', 'SHAWN2', 'SUPPORT3', 'FLOOR0_3']),
+          ceilTex: r.palette.ceil,
+          light: Math.min(255, r.light + 16), special: 0 }) });
     }
     if (r.feature === 'plaza' && minDim >= 640) {
       const sn = v => Math.round(v / 32) * 32;
@@ -5540,7 +5549,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.36</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.37</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -1624,7 +1624,7 @@ function _generateDungeonOnce(opts) {
         const parapetW = 56;
         const b = {
           cx: pos.cx, cy: pos.cy, half: pos.half, halfX: pos.halfX, halfY: pos.halfY,
-          door: 96, win: 80, porchDepth: 48, plinthW: 24, parapetW,
+          door: 96, win: 80, porchDepth: 48, plinthW: 32, parapetW,
           wall: pick(BUILDING_WALLS), roofTop, isTower, plinthH, capH,
           doorTex: pick(['BIGDOOR2', 'BIGDOOR4', 'BIGDOOR1', 'BIGDOOR7']),
           winTex: pick(['LITE5', 'LITE3', 'SHAWN2', 'BROWN96']),
@@ -1643,19 +1643,57 @@ function _generateDungeonOnce(opts) {
             floorTex: r.palette.floor, ceilTex: 'F_SKY1',
             light: r.light, special: 0 }),
         };
-        // Rooftop unit — a solid tank/housing block on the recessed roof that
-        // rises above the parapet, giving the skyline a stepped silhouette.
-        // Only when the roof centre is big enough to hold one.
+        // Rooftop units — solid tank/AC/antenna blocks on the recessed roof
+        // that rise above the parapet, giving the skyline a stepped urban
+        // silhouette. Towers earn a tall antenna pole alongside the main
+        // housing; houses get a single varied AC/tank centerpiece. The roof
+        // centre must be big enough to hold them.
+        b.roofUnits = [];
         const innerHalf = Math.min(pos.halfX, pos.halfY) - parapetW;
         if (innerHalf >= 64) {
-          const unitH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
-          b.roofUnit = {
-            half: Math.min(sn32(innerHalf * 0.55), innerHalf - 16),
+          const sn32u = v => Math.round(v / 32) * 32;
+          const mainHalf = Math.min(sn32u(innerHalf * 0.55), innerHalf - 16);
+          const mainH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
+          b.roofUnits.push({
+            cx: b.cx, cy: b.cy, half: mainHalf,
             tex: pick(['METAL', 'COMPSPAN', 'SILVER1', 'SHAWN2', 'SUPPORT3']),
-            sec: allocSec({ floorH: unitH, ceilH: unitH,
+            sec: allocSec({ floorH: mainH, ceilH: mainH,
               floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
               light: Math.min(255, r.light + 8), special: 0 }),
-          };
+          });
+          // Tower: add an antenna pole tucked at a corner of the roof centre,
+          // taller than the main unit so it pokes up against the sky.
+          let antCx = null, antCy = null;
+          if (isTower && innerHalf - mainHalf >= 48) {
+            const off = innerHalf - 24;
+            const sx = rand() < 0.5 ? -1 : 1, sy = rand() < 0.5 ? -1 : 1;
+            antCx = sx; antCy = sy;
+            const antH = mainH + 64 + Math.floor(rand() * 4) * 16;
+            b.roofUnits.push({
+              cx: b.cx + sx * off, cy: b.cy + sy * off, half: 16,
+              tex: pick(['METAL', 'SUPPORT2', 'SUPPORT3']),
+              sec: allocSec({ floorH: antH, ceilH: antH,
+                floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
+                light: Math.min(255, r.light + 16), special: 0 }),
+            });
+          }
+          // Vent / AC box — a small auxiliary unit on a different corner from
+          // the antenna, for the cluttered industrial roofscape look. Only
+          // when the roof has clear space outside the main unit.
+          if (innerHalf >= 96 && innerHalf - mainHalf >= 56 && rand() < 0.7) {
+            const vHalf = 20;
+            const vOff = innerHalf - vHalf - 8;
+            let vsx = rand() < 0.5 ? -1 : 1, vsy = rand() < 0.5 ? -1 : 1;
+            if (antCx !== null && vsx === antCx && vsy === antCy) vsy = -vsy;
+            const vH = mainH + Math.floor(rand() * 3) * 8;
+            b.roofUnits.push({
+              cx: b.cx + vsx * vOff, cy: b.cy + vsy * vOff, half: vHalf,
+              tex: pick(['SHAWN2', 'COMPSPAN', 'SUPPORT2', 'METAL2']),
+              sec: allocSec({ floorH: vH, ceilH: vH,
+                floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
+                light: Math.min(255, r.light + 8), special: 0 }),
+            });
+          }
         }
         r.buildings.push(b);
       }
@@ -1727,6 +1765,15 @@ function _generateDungeonOnce(opts) {
             floorTex: liquid, ceilTex: r.palette.ceil,
             light: Math.max(96, r.light - 32), special: dmg }) });
       }
+      // Bridge deck — a small raised metal-grating platform tucked between
+      // the two channels (with a small floor strip around it so its walls
+      // don't collide with the channel walls), reading as a crossing the
+      // player walks UP onto rather than a flush continuation of the floor.
+      r.terrains.push({ cx: sn(r.cx), cy: sn(r.cy), hw: crossHalf - 16, hh: chHalfH - 16, kind: 'bridge',
+        secId: allocSec({ floorH: r.floorH + 8, ceilH: r.ceilH,
+          floorTex: pick(['CEIL5_2', 'METAL', 'SHAWN2', 'SUPPORT3', 'FLOOR0_3']),
+          ceilTex: r.palette.ceil,
+          light: Math.min(255, r.light + 16), special: 0 }) });
     }
     if (r.feature === 'plaza' && minDim >= 640) {
       const sn = v => Math.round(v / 32) * 32;
@@ -1929,6 +1976,27 @@ function _generateDungeonOnce(opts) {
                                            Math.abs(cy - t.cy) >= t.hh + clr)) continue;
         if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 48)) continue;
         r.pillars.push({ cx, cy, radius, top, tex: pick(metalTex) });
+      }
+      // Streetlamps — thin lit poles scattered between buildings. Doom can't
+      // actually emit point light from a pillar, but a glowing LITE/BROWN96
+      // texture on a small pole reads convincingly as a lamp post and
+      // animates the urban skyline at ground level.
+      const lampTex = ['LITE5', 'LITE3', 'BROWN96', 'LITERED', 'LITEBLU4'];
+      const nL = 2 + Math.floor(rand() * 3);
+      let lamps = 0;
+      for (let tries = 0; lamps < nL && tries < 40; tries++) {
+        const cx = sn(r.cx + (rand() * 2 - 1) * lim);
+        const cy = sn(r.cy + (rand() * 2 - 1) * lim);
+        const radius = 16, clr = radius + 24;
+        if (Math.hypot(cx - r.cx, cy - r.cy) < clr + 80) continue;
+        if (!r.buildings.every(b => Math.abs(cx - b.cx) >= bHx(b) + clr ||
+                                    Math.abs(cy - b.cy) >= bHy(b) + clr)) continue;
+        if (!(r.terrains || []).every(t => Math.abs(cx - t.cx) >= t.hw + clr ||
+                                           Math.abs(cy - t.cy) >= t.hh + clr)) continue;
+        if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 32)) continue;
+        const top = r.floorH + 96 + Math.floor(rand() * 3) * 8;
+        r.pillars.push({ cx, cy, radius, top, tex: pick(lampTex), lamp: true });
+        lamps++;
       }
     }
     // A pillar with floor == ceil == room ceiling reads as a solid
@@ -2333,6 +2401,42 @@ function _generateDungeonOnce(opts) {
     }
   }
 
+  // Decide which fused-room buildings can keep their CRISP precise facade
+  // (door bay, windows, parapet) vs collapse to a rasterized block. A
+  // building is "precise" when its 32-aligned footprint (plus a small margin)
+  // lies wholly inside its own room AND no later-placed room in the same
+  // fused group overlaps it (later rooms win those grid cells). Precise
+  // buildings get a clean punched hole in the fusion grid that their plinth
+  // wall abuts exactly; the rest are rasterized.
+  {
+    const groupOf = new Map();
+    for (const group of fusedGroups) {
+      const arr = [...group].sort((a, b) => a - b);
+      for (const idx of arr) groupOf.set(idx, arr);
+    }
+    rooms.forEach((room, ri) => {
+      if (!room._fused || !room.buildings) return;
+      const later = (groupOf.get(ri) || [ri]).filter(j => j > ri);
+      const myPoly = roomPoly(room);
+      const laterPolys = later.map(j => roomPoly(rooms[j]));
+      for (const b of room.buildings) {
+        const hx = (b.enterable ? b.halfX : b.halfX + b.plinthW) + 8;
+        const hy = (b.enterable ? b.halfY : b.halfY + b.plinthW) + 8;
+        const NS = 5;
+        let clear = true;
+        for (let sx = 0; sx <= NS && clear; sx++) {
+          for (let sy = 0; sy <= NS && clear; sy++) {
+            const px = b.cx - hx + (2 * hx) * sx / NS;
+            const py = b.cy - hy + (2 * hy) * sy / NS;
+            if (!pointInPolygon(px, py, myPoly)) clear = false;
+            else if (laterPolys.some(p => pointInPolygon(px, py, p))) clear = false;
+          }
+        }
+        b._fusedPrecise = clear;
+      }
+    });
+  }
+
   // For each room: outer polygon CW walk (with corridor cuts), then one ring
   // per trim layer (CCW walk around the inset polygon, layer-N-1 on front,
   // layer-N on back), then optional centre feature ring.
@@ -2413,7 +2517,8 @@ function _generateDungeonOnce(opts) {
     //     the south, lit window strips on E/W),
     //   • a PARAPET cap lip around a slightly recessed flat ROOF centre.
     // Every band's ceiling is sky, so there are no sky/non-sky upper seams.
-    for (const b of (!room._fused && room.buildings ? room.buildings : [])) {
+    for (const b of (room.buildings || [])) {
+      if (room._fused && !b._fusedPrecise) continue;
       // Enterable warehouse: a solid wall-slab frame (court↔slab, facade as a
       // LOWER texture) wrapping a hollow interior, with a door throat notched
       // into the interior on the south so the player walks straight in.
@@ -2485,12 +2590,13 @@ function _generateDungeonOnce(opts) {
           emitWall(q1.x, q1.y, q2.x, q2.y, cap, roof, { backSide: { lower: b.capTex } });
         }
       }
-      // ROOFTOP UNIT — a solid tank/housing block standing on the roof centre.
-      if (b.roofUnit) {
-        const up = squarePoly(bx, by, b.roofUnit.half * 2, b.roofUnit.half * 2);
+      // ROOFTOP UNITS — solid tank / AC / antenna blocks standing on the roof
+      // centre. Towers get a tall thin antenna alongside the main housing.
+      for (const u of (b.roofUnits || [])) {
+        const up = squarePoly(u.cx, u.cy, u.half * 2, u.half * 2);
         for (let j = 0; j < up.length; j++) {
           const q1 = up[j], q2 = up[(j + 1) % up.length];
-          emitWall(q1.x, q1.y, q2.x, q2.y, roof, b.roofUnit.sec, { frontSide: { lower: b.roofUnit.tex } });
+          emitWall(q1.x, q1.y, q2.x, q2.y, roof, u.sec, { frontSide: { lower: u.tex } });
         }
       }
     }
@@ -2601,15 +2707,32 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
-    // Overlay buildings — collapse each footprint to a solid raised
-    // silhouette (the roof block, or the wall slab for an enterable shed)
-    // so fused courtyards/city-blocks keep their structures. The fine
-    // facade detail (door bay, windows, parapet) doesn't survive the
-    // 32-grid, but the building mass and its wall texture do.
+    // Overlay buildings. A "precise" building (footprint clear of other rooms)
+    // gets a clean punched HOLE — its 32-aligned footprint cells are marked
+    // PRECISE so the grid neither fills nor walls them; the detailed emit pass
+    // draws the crisp facade (door bay, windows, parapet) whose plinth wall
+    // abuts these cell boundaries exactly. The rest collapse to a solid raised
+    // silhouette (roof block, or wall slab for an enterable shed).
     for (const idx of groupArr) {
       const room = rooms[idx];
       if (!room.buildings || !room.buildings.length) continue;
       for (const b of room.buildings) {
+        if (b._fusedPrecise) {
+          // Punch the footprint (plinth-outer for solid, wall-outer for shed).
+          const Hx = (b.enterable ? b.halfX : b.halfX + b.plinthW);
+          const Hy = (b.enterable ? b.halfY : b.halfY + b.plinthW);
+          for (let gy = 0; gy < H; gy++) {
+            for (let gx = 0; gx < W; gx++) {
+              if (cellSec[gy * W + gx] !== room.outerId) continue;
+              const cx = minX + (gx + 0.5) * CELL;
+              const cy = minY + (gy + 0.5) * CELL;
+              if (Math.abs(cx - b.cx) < Hx && Math.abs(cy - b.cy) < Hy) {
+                cellSec[gy * W + gx] = 'PRECISE';
+              }
+            }
+          }
+          continue;
+        }
         const blockSec = b.enterable ? b.slabSec : b.roofSec;
         if (!blockSec) continue;
         gridRiserTex.set(blockSec, b.wall);
@@ -2655,7 +2778,7 @@ function _generateDungeonOnce(opts) {
     for (let gy = 0; gy < H; gy++) {
       for (let gx = 0; gx < W; gx++) {
         const here = cellSec[gy * W + gx];
-        if (here === null) continue;
+        if (here === null || here === 'PRECISE') continue;
         const tex = cellTex[gy * W + gx];
         const xMin = minX + gx * CELL, xMax = xMin + CELL;
         const yMin = minY + gy * CELL, yMax = yMin + CELL;
@@ -2669,6 +2792,10 @@ function _generateDungeonOnce(opts) {
         ];
         for (const e of edges) {
           if (e.s === here) continue;
+          // A PRECISE neighbour's boundary is drawn by the detailed building
+          // emit (its plinth wall sits exactly on this cell edge) — skip it
+          // here so the wall isn't drawn twice.
+          if (e.s === 'PRECISE') continue;
           emitWall(e.x1, e.y1, e.x2, e.y2, here, e.s,
                    e.s === null ? { middle: tex } : {});
         }
@@ -5443,7 +5570,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.34</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.38</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -2568,12 +2568,17 @@ function _generateDungeonOnce(opts) {
         // shows from the throat ceiling up to the taller interior ceiling.
         emitWall(dL, iS, dR, iS, throat, intr, { backSide: { upper: 'BROWN96' } });
         // Interior south walls split by the door throat, then the rest of
-        // the interior ring (E / N / W).
-        emitWall(iW, iS, dL, iS, intr, slab, loI);
-        emitWall(dR, iS, iE, iS, intr, slab, loI);
-        emitWall(iE, iS, iE, iN, intr, slab, loI);
-        emitWall(iE, iN, iW, iN, intr, slab, loI);
-        emitWall(iW, iN, iW, iS, intr, slab, loI);
+        // the interior ring (E / N / W). All wound so the FRONT sidedef
+        // (which carries the interior-wall texture in loI) is on the
+        // geometric interior side of each line — node-builders use this
+        // to assign subsectors, so wrong winding inside a fused-precise
+        // building can sink the camera subsector into the closed SLAB
+        // (sky-ceiling) and bleed sky through the walls.
+        emitWall(dL, iS, iW, iS, intr, slab, loI);   // S, west of throat (west: right=N=intr)
+        emitWall(iE, iS, dR, iS, intr, slab, loI);   // S, east of throat
+        emitWall(iE, iN, iE, iS, intr, slab, loI);   // E (south: right=W=intr)
+        emitWall(iW, iN, iE, iN, intr, slab, loI);   // N (east: right=S=intr)
+        emitWall(iW, iS, iW, iN, intr, slab, loI);   // W (north: right=E=intr)
         continue;
       }
       const bx = b.cx, by = b.cy, hd = b.door / 2, hw = b.win / 2;
@@ -5045,6 +5050,9 @@ function ShapeShifter() {
   const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
   const [needP1Confirm, setNeedP1Confirm] = useState(false);
+  // Modal "Working…" overlay shown during long-running synchronous work
+  // (BUILD) so the app doesn't look frozen while JS blocks the main thread.
+  const [busy, setBusy] = useState(null);
   const canvasRef = useRef(null);
   const pointersRef = useRef(new Map());
   const gestureRef = useRef(null);
@@ -5137,7 +5145,7 @@ function ShapeShifter() {
     setHint('Connection removed.');
   };
 
-  const build = () => {
+  const build = async () => {
     if (rooms.length < 1) { setHint('Place at least one room first.'); return; }
     // Warn (once) if no Player 1 start was placed. Tap BUILD again to
     // auto-place one at the first room.
@@ -5148,6 +5156,13 @@ function ShapeShifter() {
       return;
     }
     setNeedP1Confirm(false);
+    // Show the "Working…" overlay and wait two frames so React commits the
+    // overlay into the DOM before the synchronous generator blocks the main
+    // thread — otherwise the dim/spinner never paints and the app reads as
+    // frozen on big maps.
+    setBusy('Building map…');
+    await new Promise(r => requestAnimationFrame(r));
+    await new Promise(r => requestAnimationFrame(r));
     try {
       const specs = rooms.map(r => ({
         type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
@@ -5169,6 +5184,8 @@ function ShapeShifter() {
       }
     } catch (e) {
       setHint('Build failed: ' + e.message);
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -5592,11 +5609,24 @@ function ShapeShifter() {
   return (
     <div className="w-full h-screen flex flex-col overflow-hidden select-none"
       style={{ background: COLORS.bg, color: COLORS.text, fontFamily: fontStack, touchAction: 'none' }}>
+      {busy ? (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 10000,
+          background: 'rgba(0,0,0,0.55)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontFamily: fontStack, color: '#fff', fontSize: 16, letterSpacing: 1 }}>
+          <div style={{ padding: '18px 28px', background: COLORS.bgPanel,
+            border: '1px solid ' + COLORS.border, borderRadius: 4,
+            textAlign: 'center', minWidth: 220 }}>
+            <div style={{ fontSize: 22, marginBottom: 10 }}>{busy}</div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>The app may be unresponsive for a moment — please wait.</div>
+          </div>
+        </div>
+      ) : null}
       <div className="flex items-center justify-between px-2 py-1.5 border-b"
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.39</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.40</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

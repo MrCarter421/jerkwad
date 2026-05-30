@@ -1577,14 +1577,19 @@ function _generateDungeonOnce(opts) {
         pos.half = Math.max(hx, hy);
         placedFP.push({ cx: pos.cx, cy: pos.cy, hx, hy });
       }
-      // Enterable warehouse — in a large courtyard, make the biggest building
-      // a hollow shed the player can walk into through a south doorway.
+      // Enterable buildings — courtyard makes ANY large building enterable
+      // (50% each, was only the biggest at 75%) so a yard can hold several
+      // shelters. City-block scatters smaller shops/shelters across its lots
+      // so the player can duck in and out while threading the streets.
       if (r.feature === 'courtyard' && minDim >= 1024) {
-        let bigIdx = -1, bigHalf = 0;
-        for (let i = 0; i < layout.length; i++) {
-          if (layout[i].half >= 140 && layout[i].half > bigHalf) { bigHalf = layout[i].half; bigIdx = i; }
+        for (const pos of layout) {
+          if (pos.halfX >= 140 && pos.halfY >= 140 && rand() < 0.5) pos.enterable = true;
         }
-        if (bigIdx >= 0 && rand() < 0.75) layout[bigIdx].enterable = true;
+      }
+      if (r.feature === 'cityblock') {
+        for (const pos of layout) {
+          if (pos.halfX >= 112 && pos.halfY >= 96 && rand() < 0.4) pos.enterable = true;
+        }
       }
       r.buildings = [];
       for (const pos of layout) {
@@ -1593,8 +1598,11 @@ function _generateDungeonOnce(opts) {
           // Hollow shed built from a SOLID wall-slab frame (floor==ceil, so it
           // blocks naturally — no impassable flag) whose facade is a LOWER
           // texture (two-sided middles get stripped by the resolve pass, so we
-          // can't use them). The frame wraps a textured-ceiling interior with a
-          // door throat notched in on the south.
+          // can't use them). The frame wraps a textured-ceiling interior, with
+          // a DOOR THROAT — a small recessed entry on the south whose low
+          // ceiling forms the visible lintel and whose DOORTRAK side jambs
+          // read as the door frame.
+          const intLight = pick([128, 144, 160]);
           r.buildings.push({
             cx: pos.cx, cy: pos.cy, half: pos.half, halfX: pos.halfX, halfY: pos.halfY,
             enterable: true, wall: pick(BUILDING_WALLS), intWall: pick(['METAL2', 'STARTAN2', 'GRAY7', 'BROWN1']),
@@ -1604,7 +1612,11 @@ function _generateDungeonOnce(opts) {
             intSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 144,
               floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8']),
               ceilTex: pick(['CEIL5_1', 'CEIL5_2', 'TLITE6_4', 'FLAT5_4']),
-              light: pick([128, 144, 160]), special: 0 }),
+              light: intLight, special: 0 }),
+            throatSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 88,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8']),
+              ceilTex: pick(['FLAT5_4', 'FLAT1', 'CEIL5_1']),
+              light: Math.max(96, intLight - 24), special: 0 }),
           });
           continue;
         }
@@ -2523,8 +2535,12 @@ function _generateDungeonOnce(opts) {
       // LOWER texture) wrapping a hollow interior, with a door throat notched
       // into the interior on the south so the player walks straight in.
       if (b.enterable) {
-        const court = room.outerId, slab = b.slabSec, intr = b.intSec;
-        const fac = b.wall, iw = b.intWall, ehd = 64, T = 24;
+        const court = room.outerId, slab = b.slabSec, intr = b.intSec, throat = b.throatSec;
+        const fac = b.wall, iw = b.intWall, T = 24;
+        // Door width scales with the building: 96 for the standard warehouse,
+        // smaller for narrower city-block shops so the door doesn't eat the
+        // whole south face.
+        const ehd = Math.min(64, Math.max(40, b.halfX - 48));
         const cx = b.cx, cy = b.cy;
         const oW = cx - b.halfX, oE = cx + b.halfX, oS = cy - b.halfY, oN = cy + b.halfY;
         const iW = oW + T, iE = oE - T, iS = oS + T, iN = oN - T;
@@ -2537,13 +2553,23 @@ function _generateDungeonOnce(opts) {
         emitWall(oE, oS, oE, oN, court, slab, loF);
         emitWall(oE, oN, oW, oN, court, slab, loF);
         emitWall(oW, oN, oW, oS, court, slab, loF);
-        // DOOR opening (court → interior, passable; interior ceil is below sky
-        // so the entrance is a tall open portal).
-        emitWall(dL, oS, dR, oS, court, intr, {});
-        // INNER ring + door jambs (interior → slab).
+        // DOOR OPENING — court → throat (passable). The throat's low ceiling
+        // (door-height) makes the upper above the entry read as the LINTEL,
+        // which carries the building's own facade texture so the door reads
+        // as a recessed cut in the wall rather than a tall portal.
+        emitWall(dL, oS, dR, oS, court, throat, { frontSide: { upper: fac } });
+        // THROAT side jambs (throat ↔ slab on E/W of the door). DOORTRAK
+        // gives the cross-hatched frame, LOWER_UNPEGGED (flag 16) anchors
+        // the track at the floor so it doesn't slide.
+        const trim = { frontSide: { lower: 'DOORTRAK' }, flags: 16 };
+        emitWall(dL, oS, dL, iS, throat, slab, trim);
+        emitWall(dR, iS, dR, oS, throat, slab, trim);
+        // THROAT back wall (throat → interior, passable). Small header trim
+        // shows from the throat ceiling up to the taller interior ceiling.
+        emitWall(dL, iS, dR, iS, throat, intr, { backSide: { upper: 'BROWN96' } });
+        // Interior south walls split by the door throat, then the rest of
+        // the interior ring (E / N / W).
         emitWall(iW, iS, dL, iS, intr, slab, loI);
-        emitWall(dL, iS, dL, oS, intr, slab, loI);   // west jamb
-        emitWall(dR, oS, dR, iS, intr, slab, loI);   // east jamb
         emitWall(dR, iS, iE, iS, intr, slab, loI);
         emitWall(iE, iS, iE, iN, intr, slab, loI);
         emitWall(iE, iN, iW, iN, intr, slab, loI);
@@ -5570,7 +5596,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.38</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.39</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

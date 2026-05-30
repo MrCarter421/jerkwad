@@ -1643,19 +1643,57 @@ function _generateDungeonOnce(opts) {
             floorTex: r.palette.floor, ceilTex: 'F_SKY1',
             light: r.light, special: 0 }),
         };
-        // Rooftop unit — a solid tank/housing block on the recessed roof that
-        // rises above the parapet, giving the skyline a stepped silhouette.
-        // Only when the roof centre is big enough to hold one.
+        // Rooftop units — solid tank/AC/antenna blocks on the recessed roof
+        // that rise above the parapet, giving the skyline a stepped urban
+        // silhouette. Towers earn a tall antenna pole alongside the main
+        // housing; houses get a single varied AC/tank centerpiece. The roof
+        // centre must be big enough to hold them.
+        b.roofUnits = [];
         const innerHalf = Math.min(pos.halfX, pos.halfY) - parapetW;
         if (innerHalf >= 64) {
-          const unitH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
-          b.roofUnit = {
-            half: Math.min(sn32(innerHalf * 0.55), innerHalf - 16),
+          const sn32u = v => Math.round(v / 32) * 32;
+          const mainHalf = Math.min(sn32u(innerHalf * 0.55), innerHalf - 16);
+          const mainH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
+          b.roofUnits.push({
+            cx: b.cx, cy: b.cy, half: mainHalf,
             tex: pick(['METAL', 'COMPSPAN', 'SILVER1', 'SHAWN2', 'SUPPORT3']),
-            sec: allocSec({ floorH: unitH, ceilH: unitH,
+            sec: allocSec({ floorH: mainH, ceilH: mainH,
               floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
               light: Math.min(255, r.light + 8), special: 0 }),
-          };
+          });
+          // Tower: add an antenna pole tucked at a corner of the roof centre,
+          // taller than the main unit so it pokes up against the sky.
+          let antCx = null, antCy = null;
+          if (isTower && innerHalf - mainHalf >= 48) {
+            const off = innerHalf - 24;
+            const sx = rand() < 0.5 ? -1 : 1, sy = rand() < 0.5 ? -1 : 1;
+            antCx = sx; antCy = sy;
+            const antH = mainH + 64 + Math.floor(rand() * 4) * 16;
+            b.roofUnits.push({
+              cx: b.cx + sx * off, cy: b.cy + sy * off, half: 16,
+              tex: pick(['METAL', 'SUPPORT2', 'SUPPORT3']),
+              sec: allocSec({ floorH: antH, ceilH: antH,
+                floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
+                light: Math.min(255, r.light + 16), special: 0 }),
+            });
+          }
+          // Vent / AC box — a small auxiliary unit on a different corner from
+          // the antenna, for the cluttered industrial roofscape look. Only
+          // when the roof has clear space outside the main unit.
+          if (innerHalf >= 96 && innerHalf - mainHalf >= 56 && rand() < 0.7) {
+            const vHalf = 20;
+            const vOff = innerHalf - vHalf - 8;
+            let vsx = rand() < 0.5 ? -1 : 1, vsy = rand() < 0.5 ? -1 : 1;
+            if (antCx !== null && vsx === antCx && vsy === antCy) vsy = -vsy;
+            const vH = mainH + Math.floor(rand() * 3) * 8;
+            b.roofUnits.push({
+              cx: b.cx + vsx * vOff, cy: b.cy + vsy * vOff, half: vHalf,
+              tex: pick(['SHAWN2', 'COMPSPAN', 'SUPPORT2', 'METAL2']),
+              sec: allocSec({ floorH: vH, ceilH: vH,
+                floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
+                light: Math.min(255, r.light + 8), special: 0 }),
+            });
+          }
         }
         r.buildings.push(b);
       }
@@ -2522,12 +2560,13 @@ function _generateDungeonOnce(opts) {
           emitWall(q1.x, q1.y, q2.x, q2.y, cap, roof, { backSide: { lower: b.capTex } });
         }
       }
-      // ROOFTOP UNIT — a solid tank/housing block standing on the roof centre.
-      if (b.roofUnit) {
-        const up = squarePoly(bx, by, b.roofUnit.half * 2, b.roofUnit.half * 2);
+      // ROOFTOP UNITS — solid tank / AC / antenna blocks standing on the roof
+      // centre. Towers get a tall thin antenna alongside the main housing.
+      for (const u of (b.roofUnits || [])) {
+        const up = squarePoly(u.cx, u.cy, u.half * 2, u.half * 2);
         for (let j = 0; j < up.length; j++) {
           const q1 = up[j], q2 = up[(j + 1) % up.length];
-          emitWall(q1.x, q1.y, q2.x, q2.y, roof, b.roofUnit.sec, { frontSide: { lower: b.roofUnit.tex } });
+          emitWall(q1.x, q1.y, q2.x, q2.y, roof, u.sec, { frontSide: { lower: u.tex } });
         }
       }
     }
@@ -5501,7 +5540,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.35</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.36</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

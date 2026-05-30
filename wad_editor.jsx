@@ -1977,6 +1977,27 @@ function _generateDungeonOnce(opts) {
         if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 48)) continue;
         r.pillars.push({ cx, cy, radius, top, tex: pick(metalTex) });
       }
+      // Streetlamps — thin lit poles scattered between buildings. Doom can't
+      // actually emit point light from a pillar, but a glowing LITE/BROWN96
+      // texture on a small pole reads convincingly as a lamp post and
+      // animates the urban skyline at ground level.
+      const lampTex = ['LITE5', 'LITE3', 'BROWN96', 'LITERED', 'LITEBLU4'];
+      const nL = 2 + Math.floor(rand() * 3);
+      let lamps = 0;
+      for (let tries = 0; lamps < nL && tries < 40; tries++) {
+        const cx = sn(r.cx + (rand() * 2 - 1) * lim);
+        const cy = sn(r.cy + (rand() * 2 - 1) * lim);
+        const radius = 16, clr = radius + 24;
+        if (Math.hypot(cx - r.cx, cy - r.cy) < clr + 80) continue;
+        if (!r.buildings.every(b => Math.abs(cx - b.cx) >= bHx(b) + clr ||
+                                    Math.abs(cy - b.cy) >= bHy(b) + clr)) continue;
+        if (!(r.terrains || []).every(t => Math.abs(cx - t.cx) >= t.hw + clr ||
+                                           Math.abs(cy - t.cy) >= t.hh + clr)) continue;
+        if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 32)) continue;
+        const top = r.floorH + 96 + Math.floor(rand() * 3) * 8;
+        r.pillars.push({ cx, cy, radius, top, tex: pick(lampTex), lamp: true });
+        lamps++;
+      }
     }
     // A pillar with floor == ceil == room ceiling reads as a solid
     // floor-to-ceiling column. A pillar with an explicit `top` (< ceil)
@@ -5549,7 +5570,7 @@ function ShapeShifter() {
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.37</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.38</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

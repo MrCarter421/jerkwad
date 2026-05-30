@@ -1908,16 +1908,32 @@ function _generateDungeonOnce(opts) {
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 48 });
     } else if (r.feature === 'lake' && minDim >= 768) {
       // Four temple pillars at the centre of the pool — a tight square
-      // structure rising from the water.
+      // structure rising from the water. Enclosed by the lake's water sector
+      // (featureId) so the floor around their bases reads as the pool.
       const t = Math.floor(minDim / 8 / 32) * 32;
-      r.pillars.push({ cx: r.cx - t, cy: r.cy - t, radius: 32 });
-      r.pillars.push({ cx: r.cx + t, cy: r.cy - t, radius: 32 });
-      r.pillars.push({ cx: r.cx - t, cy: r.cy + t, radius: 32 });
-      r.pillars.push({ cx: r.cx + t, cy: r.cy + t, radius: 32 });
+      const waterEnc = r.featureId || undefined;
+      r.pillars.push({ cx: r.cx - t, cy: r.cy - t, radius: 32, enclosingId: waterEnc });
+      r.pillars.push({ cx: r.cx + t, cy: r.cy - t, radius: 32, enclosingId: waterEnc });
+      r.pillars.push({ cx: r.cx - t, cy: r.cy + t, radius: 32, enclosingId: waterEnc });
+      r.pillars.push({ cx: r.cx + t, cy: r.cy + t, radius: 32, enclosingId: waterEnc });
+      // Central altar column — a thicker marble pillar at the heart of the
+      // temple, the focal point the player can shoot into the water around.
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 40, enclosingId: waterEnc,
+        tex: pick(['MARBLE1', 'MARBLE2', 'GSTGARG', 'SP_DUDE5']) });
       // Two extra outer pillars suggesting scattered islands.
       const o = Math.floor(minDim / 3 / 32) * 32;
-      r.pillars.push({ cx: r.cx - o, cy: r.cy, radius: 24 });
-      r.pillars.push({ cx: r.cx + o, cy: r.cy, radius: 24 });
+      r.pillars.push({ cx: r.cx - o, cy: r.cy, radius: 24, enclosingId: waterEnc });
+      r.pillars.push({ cx: r.cx + o, cy: r.cy, radius: 24, enclosingId: waterEnc });
+      // Stepping stones — low islands raised just above the water surface so
+      // the player can hop between the temple and the shore. Placed off the
+      // cardinal axes to leave clear sightlines across the pool.
+      const stoneTop = r.floorH - r.trimLayers * 8 - 16;  // water_floor + 16
+      const s = Math.floor((t + o) / 2 / 32) * 32;
+      for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+        r.pillars.push({ cx: r.cx + sx * s, cy: r.cy + sy * s, radius: 24,
+          top: stoneTop, enclosingId: waterEnc,
+          tex: pick(['STONE', 'STONE2', 'STONE3', 'ROCK1']) });
+      }
     } else if (r.feature === 'colonnade' && minDim >= 384) {
       // A row of 3 pillars across the room's longer axis — feels like a
       // temple nave.
@@ -1936,6 +1952,23 @@ function _generateDungeonOnce(opts) {
       r.pillars.push({ cx: r.cx + off, cy: r.cy - off, radius: 40 });
       r.pillars.push({ cx: r.cx - off, cy: r.cy + off, radius: 40 });
       r.pillars.push({ cx: r.cx + off, cy: r.cy + off, radius: 40 });
+      // Central altar / reliquary — a thicker marble pillar at the heart of
+      // the nave between the colonnade, giving the vaulted space a focal
+      // point instead of an empty floor.
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 48,
+        tex: pick(['MARBLE1', 'MARBLE2', 'GSTGARG', 'SP_DUDE5']) });
+      // Side aisles — a pair of smaller reliquary columns on the long axis,
+      // breaking up the floor between the central altar and the colonnade.
+      if (minDim >= 768) {
+        const midAxis = Math.floor(minDim / 6 / 32) * 32;
+        const longX = r.type !== 'square' || (r.w || r.r * 2) >= (r.h || r.r * 2);
+        const dx = longX ? midAxis * 2 : 0;
+        const dy = longX ? 0 : midAxis * 2;
+        r.pillars.push({ cx: r.cx - dx, cy: r.cy - dy, radius: 28,
+          tex: pick(['MARBLE3', 'GSTONE1', 'STONE6']) });
+        r.pillars.push({ cx: r.cx + dx, cy: r.cy + dy, radius: 28,
+          tex: pick(['MARBLE3', 'GSTONE1', 'STONE6']) });
+      }
     } else if (r.feature === 'none') {
       if (minDim >= 1024) {
         const off = Math.floor(minDim / 5 / 32) * 32;
@@ -2483,7 +2516,7 @@ function _generateDungeonOnce(opts) {
       }
     }
     if (!room._fused && room.pillars && room.pillars.length) {
-      const enclosing = layerIds[layerIds.length - 1];
+      const defaultEnclosing = layerIds[layerIds.length - 1];
       for (let k = 0; k < room.pillars.length; k++) {
         const p = room.pillars[k];
         const pillarSecId = room.pillarSecIds[k];
@@ -2491,6 +2524,12 @@ function _generateDungeonOnce(opts) {
         // Optional explicit face texture (e.g. crate blocks); otherwise the
         // resolve pass picks a step/wall texture from the height delta.
         const props = p.tex ? { frontSide: { lower: p.tex } } : {};
+        // Optional enclosing-sector override — a pillar geometrically inside
+        // a centre feature (a temple column rising from a lake pool, a
+        // stepping stone on the water) is enclosed by the FEATURE sector,
+        // not the surrounding trim ring, so its riser texture and the floor
+        // around it read against the right neighbour.
+        const enclosing = p.enclosingId || defaultEnclosing;
         for (let j = 0; j < pillarPoly.length; j++) {
           const q1 = pillarPoly[j], q2 = pillarPoly[(j + 1) % pillarPoly.length];
           emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, pillarSecId, props);
@@ -5623,10 +5662,11 @@ function ShapeShifter() {
         </div>
       ) : null}
       <div className="flex items-center justify-between px-2 py-1.5 border-b"
-        style={{ borderColor: COLORS.border, background: COLORS.bgPanel }}>
+        style={{ borderColor: COLORS.border, background: COLORS.bgPanel,
+          paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.40</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.41</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

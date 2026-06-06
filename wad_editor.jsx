@@ -1903,6 +1903,36 @@ function _generateDungeonOnce(opts) {
     } else if (r.feature === 'altar') {
       // Tall column at the centre of the altar dais.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32 });
+    } else if (r.feature === 'throne') {
+      // Throne backrest — a thick column rising from the back of the dais,
+      // with red-marble texture so it reads as the actual throne.
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 40,
+        tex: pick(['MARBFAC2', 'MARBFAC3', 'GSTONE2', 'SP_HOT1', 'REDWALL']),
+        enclosingId: r.featureId || undefined });
+    } else if (r.feature === 'reactor') {
+      // Reactor core column — a glowing pillar rising from the cell-tech
+      // well at the centre, capping the reactor with a vertical accent.
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32,
+        tex: pick(['LITE5', 'LITEBLU4', 'TEKLITE', 'SLADWALL', 'COMPSPAN']),
+        enclosingId: r.featureId || undefined });
+    } else if (r.feature === 'pool' && minDim >= 512) {
+      // Diving plinth — a small raised stone island in the centre of the
+      // pool, just above the water surface (a step out of the liquid).
+      const poolFloor = r.floorH - r.trimLayers * 8 - 24;
+      r.pillars.push({ cx: r.cx, cy: r.cy, radius: 32, top: poolFloor + 16,
+        tex: pick(['STONE', 'STONE2', 'MARBLE1', 'GSTONE1']),
+        enclosingId: r.featureId || undefined });
+    } else if (r.feature === 'pit' && minDim >= 512) {
+      // Four small stepping stones in the corners of the pit, just above
+      // the liquid, so the player can hop across instead of wading.
+      const pitFloor = r.floorH - r.trimLayers * 8 - 16;
+      const off = Math.floor(minDim / 6 / 32) * 32;
+      const stoneTop = pitFloor + 16;
+      for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+        r.pillars.push({ cx: r.cx + sx * off, cy: r.cy + sy * off, radius: 20,
+          top: stoneTop, enclosingId: r.featureId || undefined,
+          tex: pick(['STONE', 'STONE2', 'STONE3', 'ROCK1']) });
+      }
     } else if (r.feature === 'observatory' && minDim >= 384) {
       // The central telescope — a thick floor-to-ceiling column.
       r.pillars.push({ cx: r.cx, cy: r.cy, radius: 48 });
@@ -2712,6 +2742,59 @@ function _generateDungeonOnce(opts) {
   // a building silhouette gets its facade texture instead of a generic step.
   // Consumed by the resolve pass (8b).
   const gridRiserTex = new Map();
+
+  // Corridor door attachments on FUSED rooms. The non-fused emitOuterEdge
+  // path cuts the room wall and inserts a header→doorBody chain at every
+  // corridor attachment — but it's gated `!room._fused`, so a corridor
+  // hooked to a room that became fused (e.g. because another room is nested
+  // inside it) loses its door at that end. The grid wall pass below uses
+  // this map to replace the cell's void-facing wall with a passable wall
+  // straight to the corridor's doorBody; the DR-1 resolve pass then turns
+  // it into a real door.
+  const outerIdToRoomIdx = new Map();
+  rooms.forEach((r, i) => { outerIdToRoomIdx.set(r.outerId, i); });
+  const fusedDoorAtts = new Map();  // roomIdx -> [{ side, coord, rMin, rMax, body }]
+  for (const co of corridors) {
+    const isH = co.orient === 'H';
+    const ends = isH
+      ? [[co.wIdx, 'E', co.minX], [co.eIdx, 'W', co.maxX]]
+      : [[co.sIdx, 'N', co.minY], [co.nIdx, 'S', co.maxY]];
+    for (let k = 0; k < ends.length; k++) {
+      const [ri, side, coord] = ends[k];
+      if (ri == null || !rooms[ri] || !rooms[ri]._fused) continue;
+      if (!fusedDoorAtts.has(ri)) fusedDoorAtts.set(ri, []);
+      fusedDoorAtts.get(ri).push({
+        side, coord,
+        rMin: isH ? co.minY : co.minX,
+        rMax: isH ? co.maxY : co.maxX,
+        body: k === 0 ? co.doorAId : co.doorBId,
+      });
+    }
+  }
+  // Given a cell at (gx,gy) in a grid with origin (minX,minY) and 32-unit
+  // cells, sector `here`, and an edge direction, return the doorBodyId if
+  // the cell's edge sits exactly on a fused-room corridor attachment range.
+  const fusedDoorAt = (here, dir, xMin, yMin, xMax, yMax, minX, minY) => {
+    const ri = outerIdToRoomIdx.get(here);
+    if (ri == null) return null;
+    const atts = fusedDoorAtts.get(ri);
+    if (!atts) return null;
+    for (const a of atts) {
+      if (a.side !== dir) continue;
+      if (dir === 'E' && Math.abs(a.coord - xMax) > 0.5) continue;
+      if (dir === 'W' && Math.abs(a.coord - xMin) > 0.5) continue;
+      if (dir === 'N' && Math.abs(a.coord - yMax) > 0.5) continue;
+      if (dir === 'S' && Math.abs(a.coord - yMin) > 0.5) continue;
+      const eMin = (dir === 'E' || dir === 'W') ? yMin : xMin;
+      const eMax = (dir === 'E' || dir === 'W') ? yMax : xMax;
+      // The cell wall is 32 wide; require it to lie entirely inside the
+      // attachment range (corridor doorways are 32-aligned).
+      if (eMin < a.rMin - 0.5 || eMax > a.rMax + 0.5) continue;
+      return a.body;
+    }
+    return null;
+  };
+
   // -------- 7a. Grid-based emit for fused groups --------
   // Each fused group is rasterized to a 32-unit grid; each cell is assigned
   // to the LATEST-placed room whose polygon contains it. Cells of the same
@@ -2855,10 +2938,10 @@ function _generateDungeonOnce(opts) {
         const nb = (ggx, ggy) => (ggx >= 0 && ggx < W && ggy >= 0 && ggy < H)
           ? cellSec[ggy * W + ggx] : null;
         const edges = [
-          { s: nb(gx, gy + 1), x1: xMin, y1: yMax, x2: xMax, y2: yMax }, // N
-          { s: nb(gx + 1, gy), x1: xMax, y1: yMax, x2: xMax, y2: yMin }, // E
-          { s: nb(gx, gy - 1), x1: xMax, y1: yMin, x2: xMin, y2: yMin }, // S
-          { s: nb(gx - 1, gy), x1: xMin, y1: yMin, x2: xMin, y2: yMax }, // W
+          { s: nb(gx, gy + 1), x1: xMin, y1: yMax, x2: xMax, y2: yMax, dir: 'N' },
+          { s: nb(gx + 1, gy), x1: xMax, y1: yMax, x2: xMax, y2: yMin, dir: 'E' },
+          { s: nb(gx, gy - 1), x1: xMax, y1: yMin, x2: xMin, y2: yMin, dir: 'S' },
+          { s: nb(gx - 1, gy), x1: xMin, y1: yMin, x2: xMin, y2: yMax, dir: 'W' },
         ];
         for (const e of edges) {
           if (e.s === here) continue;
@@ -2866,6 +2949,16 @@ function _generateDungeonOnce(opts) {
           // emit (its plinth wall sits exactly on this cell edge) — skip it
           // here so the wall isn't drawn twice.
           if (e.s === 'PRECISE') continue;
+          // Corridor attached to this fused room: replace the void-facing
+          // wall with a passable wall straight to the corridor's doorBody.
+          // The DR-1 resolve pass below upgrades it to a real door.
+          if (e.s === null) {
+            const body = fusedDoorAt(here, e.dir, xMin, yMin, xMax, yMax, minX, minY);
+            if (body) {
+              emitWall(e.x1, e.y1, e.x2, e.y2, here, body, {});
+              continue;
+            }
+          }
           emitWall(e.x1, e.y1, e.x2, e.y2, here, e.s,
                    e.s === null ? { middle: tex } : {});
         }
@@ -5666,7 +5759,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.41</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.42</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

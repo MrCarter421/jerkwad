@@ -1601,15 +1601,28 @@ function _generateDungeonOnce(opts) {
           // can't use them). The frame wraps a textured-ceiling interior, with
           // a DOOR THROAT — a small recessed entry on the south whose low
           // ceiling forms the visible lintel and whose DOORTRAK side jambs
-          // read as the door frame.
+          // read as the door frame. Larger interiors can also get a working
+          // LIFT that takes the player up to a raised MEZZANINE (true two-
+          // floor verticality — the office-tower experience).
           const intLight = pick([128, 144, 160]);
-          r.buildings.push({
+          // Multi-room office layouts and internal lifts compete for the
+          // same large interiors; either pick is exclusive so we don't try
+          // to fit both into one building.
+          const eligibleLarge = pos.halfX >= 128 && pos.halfY >= 144;
+          const multiRoom = eligibleLarge && rand() < 0.35;
+          const hasLift = !multiRoom && eligibleLarge && rand() < 0.55;
+          const liftTag = hasLift ? tagCounter++ : 0;
+          // Lift buildings are taller (216 / 192) than regular sheds (168 /
+          // 144) so the raised mezzanine has enough clearance for the player.
+          const wallTop = r.floorH + (hasLift ? 216 : 168);
+          const intCeilH = r.floorH + (hasLift ? 192 : 144);
+          const b = {
             cx: pos.cx, cy: pos.cy, half: pos.half, halfX: pos.halfX, halfY: pos.halfY,
             enterable: true, wall: pick(BUILDING_WALLS), intWall: pick(['METAL2', 'STARTAN2', 'GRAY7', 'BROWN1']),
-            wallTop: r.floorH + 168,
-            slabSec: allocSec({ floorH: r.floorH + 168, ceilH: r.floorH + 168,
+            wallTop,
+            slabSec: allocSec({ floorH: wallTop, ceilH: wallTop,
               floorTex: pick(BUILDING_ROOFS), ceilTex: 'F_SKY1', light: r.light, special: 0 }),
-            intSec: allocSec({ floorH: r.floorH, ceilH: r.floorH + 144,
+            intSec: allocSec({ floorH: r.floorH, ceilH: intCeilH,
               floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8']),
               ceilTex: pick(['CEIL5_1', 'CEIL5_2', 'TLITE6_4', 'FLAT5_4']),
               light: intLight, special: 0 }),
@@ -1617,7 +1630,49 @@ function _generateDungeonOnce(opts) {
               floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8']),
               ceilTex: pick(['FLAT5_4', 'FLAT1', 'CEIL5_1']),
               light: Math.max(96, intLight - 24), special: 0 }),
-          });
+            hasLift, liftTag, multiRoom,
+          };
+          if (multiRoom) {
+            // Office-style two-room interior — a partition wall splits the
+            // building into FRONT (door entry) and BACK rooms connected by
+            // an internal doorway. The doorway is its own header sector
+            // (ceil = fh + 72) so the upper above the opening reads as a
+            // proper lintel/archway instead of a tall wall.
+            b.backRoomSec = allocSec({
+              floorH: r.floorH, ceilH: intCeilH,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8', 'FLAT1']),
+              ceilTex: pick(['CEIL5_1', 'CEIL5_2', 'TLITE6_4', 'FLAT5_4']),
+              light: intLight, special: 0,
+            });
+            b.doorwaySec = allocSec({
+              floorH: r.floorH, ceilH: r.floorH + 72,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1']),
+              ceilTex: pick(['FLAT5_4', 'FLAT1', 'CEIL5_1']),
+              light: Math.max(96, intLight - 16), special: 0,
+            });
+          }
+          if (hasLift) {
+            // Lift platform — closed-state floor is at mezzanine height; SR-62
+            // on the player-facing wall lowers it to the interior, waits,
+            // raises back up. Standing on the lift takes the player up one
+            // story to the mezzanine.
+            b.liftSec = allocSec({
+              floorH: r.floorH + 96, ceilH: intCeilH,
+              floorTex: pick(['FLOOR0_3', 'CEIL5_2', 'FLAT5_4', 'PLAT1']),
+              ceilTex: pick(['CEIL5_1', 'TLITE6_4']),
+              light: Math.min(255, intLight + 24), special: 0, tag: liftTag,
+            });
+            // Raised mezzanine — a small office-style upper floor north of the
+            // lift, lit slightly brighter than the ground floor so it reads as
+            // the upper deck.
+            b.mezzSec = allocSec({
+              floorH: r.floorH + 96, ceilH: intCeilH,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8', 'FLAT1']),
+              ceilTex: pick(['TLITE6_4', 'CEIL5_1', 'CEIL5_2']),
+              light: Math.min(255, intLight + 16), special: 0,
+            });
+          }
+          r.buildings.push(b);
           continue;
         }
         // Solid roofed structure: walls rise to a flat roof with OPEN SKY
@@ -1628,9 +1683,15 @@ function _generateDungeonOnce(opts) {
         // make these solid skyline structures with a textured facade.) Houses
         // are 96–128 tall, towers 160–208, for a varied skyline.
         const bRoof = pick(BUILDING_ROOFS);
-        const isTower = rand() < 0.4;
-        const roofTop = r.floorH + (isTower ? 160 + Math.floor(rand() * 4) * 16
-                                            : 96 + Math.floor(rand() * 3) * 16);
+        // City-block lots have a 30% chance to spawn a proper SKYSCRAPER
+        // silhouette (256-320 tall) for the urban-canyon look; otherwise the
+        // building rolls house vs tower (96-128 / 160-208) as before.
+        const isSkyscraper = r.feature === 'cityblock' && pos.halfX >= 96 && pos.halfY >= 96 && rand() < 0.3;
+        const isTower = !isSkyscraper && rand() < 0.4;
+        const roofTop = r.floorH + (
+          isSkyscraper ? 256 + Math.floor(rand() * 5) * 16 :
+          isTower      ? 160 + Math.floor(rand() * 4) * 16 :
+                          96 + Math.floor(rand() * 3) * 16);
         const plinthH = r.floorH + 12;     // base podium height
         const capH = roofTop + 16;         // parapet cap (lip) height
         const parapetW = 56;
@@ -2643,11 +2704,74 @@ function _generateDungeonOnce(opts) {
         // to assign subsectors, so wrong winding inside a fused-precise
         // building can sink the camera subsector into the closed SLAB
         // (sky-ceiling) and bleed sky through the walls.
-        emitWall(dL, iS, iW, iS, intr, slab, loI);   // S, west of throat (west: right=N=intr)
-        emitWall(iE, iS, dR, iS, intr, slab, loI);   // S, east of throat
-        emitWall(iE, iN, iE, iS, intr, slab, loI);   // E (south: right=W=intr)
-        emitWall(iW, iN, iE, iN, intr, slab, loI);   // N (east: right=S=intr)
-        emitWall(iW, iS, iW, iN, intr, slab, loI);   // W (north: right=E=intr)
+        if (b.multiRoom) {
+          // Office layout: a 24-thick PARTITION runs east-west through the
+          // interior at y=cy with a 96-wide DOORWAY gap in the centre. The
+          // front room (south of the partition) holds the door throat; the
+          // back room sits north of the partition. Partition wings are part
+          // of the existing slab sector (so we don't allocate a new sector
+          // for the wall) — only the doorway gets its own header sector.
+          const back = b.backRoomSec, door = b.doorwaySec;
+          const partS = cy - 12, partN = cy + 12;
+          const dW = cx - 48, dE = cx + 48;
+          const upI = { frontSide: { upper: iw } };
+          const upIB = { backSide: { upper: iw } };
+          // Front-room ring (intr south of partition).
+          emitWall(dL, iS, iW, iS, intr, slab, loI);     // S, west of throat
+          emitWall(iE, iS, dR, iS, intr, slab, loI);     // S, east of throat
+          emitWall(iE, partS, iE, iS, intr, slab, loI);  // E (up to partition)
+          emitWall(iW, iS, iW, partS, intr, slab, loI);  // W (up to partition)
+          // Partition: 2 slab wings + a doorway header sector in the middle.
+          emitWall(iW, partS, dW, partS, intr, slab, loI);   // wing W (intr↔slab)
+          emitWall(dE, partS, iE, partS, intr, slab, loI);   // wing E (intr↔slab)
+          emitWall(dW, partS, dE, partS, intr, door, upI);   // door south face — lintel upper on intr side
+          emitWall(dE, partN, dE, partS, door, slab, loI);   // door east jamb
+          emitWall(dW, partS, dW, partN, door, slab, loI);   // door west jamb
+          emitWall(dW, partN, dE, partN, door, back, upIB);  // door north face — lintel upper on back side
+          // Back-room ring (back north of partition).
+          emitWall(dW, partN, iW, partN, back, slab, loI);   // partition wing W (back↔slab)
+          emitWall(iE, partN, dE, partN, back, slab, loI);   // partition wing E (back↔slab)
+          emitWall(iW, iN, iE, iN, back, slab, loI);         // N (east: right=S=back)
+          emitWall(iE, iN, iE, partN, back, slab, loI);      // E (south: right=W=back)
+          emitWall(iW, partN, iW, iN, back, slab, loI);      // W (north: right=E=back)
+        } else {
+          emitWall(dL, iS, iW, iS, intr, slab, loI);   // S, west of throat (west: right=N=intr)
+          emitWall(iE, iS, dR, iS, intr, slab, loI);   // S, east of throat
+          emitWall(iE, iN, iE, iS, intr, slab, loI);   // E (south: right=W=intr)
+          emitWall(iW, iN, iE, iN, intr, slab, loI);   // N (east: right=S=intr)
+          emitWall(iW, iS, iW, iN, intr, slab, loI);   // W (north: right=E=intr)
+        }
+        // Optional working LIFT + raised MEZZANINE inside the interior. The
+        // lift sits on the interior floor as a 64-wide closed-state platform
+        // at mezzanine height; pressing the SW1BRCOM switch on its player-
+        // facing south wall fires SR-62 (Lower Lift, Wait, Raise). Riding the
+        // lift up deposits the player onto the mezzanine north of the lift —
+        // a small office-style upper deck inset against the slab walls.
+        if (b.hasLift) {
+          const lift = b.liftSec, mezz = b.mezzSec;
+          const lHx = 32, lHy = 32, mHx = 48, mHy = 32;
+          const lCy = cy - 16, mCy = lCy + lHy + mHy;
+          const lW = cx - lHx, lE = cx + lHx, lS = lCy - lHy, lN = lCy + lHy;
+          const mW = cx - mHx, mE = cx + mHx, mS = mCy - mHy, mN = mCy + mHy;
+          const stepLo = { frontSide: { lower: iw } };
+          // Lift box (intr ↔ lift). All four sides are 96-tall risers when
+          // the lift is up; the SOUTH side carries the SR-62 + switch.
+          emitWall(lW, lS, lE, lS, intr, lift,
+            { frontSide: { lower: 'SW1BRCOM' }, special: 62, tag: b.liftTag });
+          emitWall(lE, lS, lE, lN, intr, lift, stepLo);
+          emitWall(lW, lN, lW, lS, intr, lift, stepLo);
+          // Lift NORTH face — between lift and mezzanine. Same floor (mezz
+          // height) so it's a passable seam the player steps across.
+          emitWall(lE, lN, lW, lN, mezz, lift, {});
+          // Mezzanine ring against the interior (E / N / W + the south wings
+          // that flank the lift). The wider mezz (48 vs lift's 32 half) means
+          // 16-unit wings poke south past the lift on each side.
+          emitWall(lE, mS, mE, mS, intr, mezz, stepLo);
+          emitWall(mE, mS, mE, mN, intr, mezz, stepLo);
+          emitWall(mE, mN, mW, mN, intr, mezz, stepLo);
+          emitWall(mW, mN, mW, mS, intr, mezz, stepLo);
+          emitWall(mW, mS, lW, mS, intr, mezz, stepLo);
+        }
         continue;
       }
       const bx = b.cx, by = b.cy, hd = b.door / 2, hw = b.win / 2;
@@ -2747,28 +2871,34 @@ function _generateDungeonOnce(opts) {
   // path cuts the room wall and inserts a header→doorBody chain at every
   // corridor attachment — but it's gated `!room._fused`, so a corridor
   // hooked to a room that became fused (e.g. because another room is nested
-  // inside it) loses its door at that end. The grid wall pass below uses
-  // this map to replace the cell's void-facing wall with a passable wall
-  // straight to the corridor's doorBody; the DR-1 resolve pass then turns
-  // it into a real door.
+  // inside it) loses its door at that end. The grid pass below uses these
+  // maps to (a) replace the edge cell at each attachment with the
+  // corridor's HEADER sector — capping the door upper at 72 so the DOOR1
+  // panel fits exactly instead of tiling up the much taller interior wall
+  // — and (b) replace the header cell's void-facing wall with a passable
+  // wall straight to the corridor's doorBody. The DR-1 resolve pass then
+  // upgrades that wall to a real door.
   const outerIdToRoomIdx = new Map();
   rooms.forEach((r, i) => { outerIdToRoomIdx.set(r.outerId, i); });
-  const fusedDoorAtts = new Map();  // roomIdx -> [{ side, coord, rMin, rMax, body }]
+  const fusedDoorAtts = new Map();  // roomIdx -> [{ side, coord, rMin, rMax, body, header }]
+  const headerToDoorBody = new Map(); // headerSecId -> doorBodyId
   for (const co of corridors) {
     const isH = co.orient === 'H';
     const ends = isH
-      ? [[co.wIdx, 'E', co.minX], [co.eIdx, 'W', co.maxX]]
-      : [[co.sIdx, 'N', co.minY], [co.nIdx, 'S', co.maxY]];
-    for (let k = 0; k < ends.length; k++) {
-      const [ri, side, coord] = ends[k];
+      ? [[co.wIdx, 'E', co.minX, co.headerAId, co.doorAId],
+         [co.eIdx, 'W', co.maxX, co.headerBId, co.doorBId]]
+      : [[co.sIdx, 'N', co.minY, co.headerAId, co.doorAId],
+         [co.nIdx, 'S', co.maxY, co.headerBId, co.doorBId]];
+    for (const [ri, side, coord, header, body] of ends) {
       if (ri == null || !rooms[ri] || !rooms[ri]._fused) continue;
       if (!fusedDoorAtts.has(ri)) fusedDoorAtts.set(ri, []);
       fusedDoorAtts.get(ri).push({
         side, coord,
         rMin: isH ? co.minY : co.minX,
         rMax: isH ? co.maxY : co.maxX,
-        body: k === 0 ? co.doorAId : co.doorBId,
+        body, header,
       });
+      headerToDoorBody.set(header, body);
     }
   }
   // Given a cell at (gx,gy) in a grid with origin (minX,minY) and 32-unit
@@ -2927,6 +3057,33 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
+    // Overwrite the edge cell at each fused-room corridor attachment with
+    // the corridor's HEADER sector. This caps the door upper at the header
+    // ceiling (fh+72) instead of leaving it stretched up to the full
+    // interior ceiling, so the DOOR1 panel fits exactly instead of tiling
+    // 2-3 copies of itself up the wall.
+    for (const idx of groupArr) {
+      const atts = fusedDoorAtts.get(idx);
+      if (!atts) continue;
+      const outerId = rooms[idx].outerId;
+      for (const a of atts) {
+        const isH = a.side === 'E' || a.side === 'W';
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== outerId) continue;
+            const xMin = minX + gx * CELL, xMax = xMin + CELL;
+            const yMin = minY + gy * CELL, yMax = yMin + CELL;
+            const edge = a.side === 'E' ? xMax : a.side === 'W' ? xMin :
+                         a.side === 'N' ? yMax : yMin;
+            if (Math.abs(edge - a.coord) > 0.5) continue;
+            const pMin = isH ? yMin : xMin;
+            const pMax = isH ? yMax : xMax;
+            if (pMin < a.rMin - 0.5 || pMax > a.rMax + 0.5) continue;
+            cellSec[gy * W + gx] = a.header;
+          }
+        }
+      }
+    }
     // Emit walls along cell boundaries where the neighbour's sector differs.
     for (let gy = 0; gy < H; gy++) {
       for (let gx = 0; gx < W; gx++) {
@@ -2951,9 +3108,13 @@ function _generateDungeonOnce(opts) {
           if (e.s === 'PRECISE') continue;
           // Corridor attached to this fused room: replace the void-facing
           // wall with a passable wall straight to the corridor's doorBody.
-          // The DR-1 resolve pass below upgrades it to a real door.
+          // The DR-1 resolve pass below upgrades it to a real door. The
+          // edge cell will normally have been overwritten with the
+          // corridor's HEADER sector above (so the DOOR1 upper fits), in
+          // which case headerToDoorBody picks up the matching doorBody.
           if (e.s === null) {
-            const body = fusedDoorAt(here, e.dir, xMin, yMin, xMax, yMax, minX, minY);
+            const body = headerToDoorBody.get(here) ||
+              fusedDoorAt(here, e.dir, xMin, yMin, xMax, yMax, minX, minY);
             if (body) {
               emitWall(e.x1, e.y1, e.x2, e.y2, here, body, {});
               continue;
@@ -5759,7 +5920,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.42</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.45</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

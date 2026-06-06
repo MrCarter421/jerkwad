@@ -2815,28 +2815,34 @@ function _generateDungeonOnce(opts) {
   // path cuts the room wall and inserts a header→doorBody chain at every
   // corridor attachment — but it's gated `!room._fused`, so a corridor
   // hooked to a room that became fused (e.g. because another room is nested
-  // inside it) loses its door at that end. The grid wall pass below uses
-  // this map to replace the cell's void-facing wall with a passable wall
-  // straight to the corridor's doorBody; the DR-1 resolve pass then turns
-  // it into a real door.
+  // inside it) loses its door at that end. The grid pass below uses these
+  // maps to (a) replace the edge cell at each attachment with the
+  // corridor's HEADER sector — capping the door upper at 72 so the DOOR1
+  // panel fits exactly instead of tiling up the much taller interior wall
+  // — and (b) replace the header cell's void-facing wall with a passable
+  // wall straight to the corridor's doorBody. The DR-1 resolve pass then
+  // upgrades that wall to a real door.
   const outerIdToRoomIdx = new Map();
   rooms.forEach((r, i) => { outerIdToRoomIdx.set(r.outerId, i); });
-  const fusedDoorAtts = new Map();  // roomIdx -> [{ side, coord, rMin, rMax, body }]
+  const fusedDoorAtts = new Map();  // roomIdx -> [{ side, coord, rMin, rMax, body, header }]
+  const headerToDoorBody = new Map(); // headerSecId -> doorBodyId
   for (const co of corridors) {
     const isH = co.orient === 'H';
     const ends = isH
-      ? [[co.wIdx, 'E', co.minX], [co.eIdx, 'W', co.maxX]]
-      : [[co.sIdx, 'N', co.minY], [co.nIdx, 'S', co.maxY]];
-    for (let k = 0; k < ends.length; k++) {
-      const [ri, side, coord] = ends[k];
+      ? [[co.wIdx, 'E', co.minX, co.headerAId, co.doorAId],
+         [co.eIdx, 'W', co.maxX, co.headerBId, co.doorBId]]
+      : [[co.sIdx, 'N', co.minY, co.headerAId, co.doorAId],
+         [co.nIdx, 'S', co.maxY, co.headerBId, co.doorBId]];
+    for (const [ri, side, coord, header, body] of ends) {
       if (ri == null || !rooms[ri] || !rooms[ri]._fused) continue;
       if (!fusedDoorAtts.has(ri)) fusedDoorAtts.set(ri, []);
       fusedDoorAtts.get(ri).push({
         side, coord,
         rMin: isH ? co.minY : co.minX,
         rMax: isH ? co.maxY : co.maxX,
-        body: k === 0 ? co.doorAId : co.doorBId,
+        body, header,
       });
+      headerToDoorBody.set(header, body);
     }
   }
   // Given a cell at (gx,gy) in a grid with origin (minX,minY) and 32-unit
@@ -2995,6 +3001,33 @@ function _generateDungeonOnce(opts) {
         }
       }
     }
+    // Overwrite the edge cell at each fused-room corridor attachment with
+    // the corridor's HEADER sector. This caps the door upper at the header
+    // ceiling (fh+72) instead of leaving it stretched up to the full
+    // interior ceiling, so the DOOR1 panel fits exactly instead of tiling
+    // 2-3 copies of itself up the wall.
+    for (const idx of groupArr) {
+      const atts = fusedDoorAtts.get(idx);
+      if (!atts) continue;
+      const outerId = rooms[idx].outerId;
+      for (const a of atts) {
+        const isH = a.side === 'E' || a.side === 'W';
+        for (let gy = 0; gy < H; gy++) {
+          for (let gx = 0; gx < W; gx++) {
+            if (cellSec[gy * W + gx] !== outerId) continue;
+            const xMin = minX + gx * CELL, xMax = xMin + CELL;
+            const yMin = minY + gy * CELL, yMax = yMin + CELL;
+            const edge = a.side === 'E' ? xMax : a.side === 'W' ? xMin :
+                         a.side === 'N' ? yMax : yMin;
+            if (Math.abs(edge - a.coord) > 0.5) continue;
+            const pMin = isH ? yMin : xMin;
+            const pMax = isH ? yMax : xMax;
+            if (pMin < a.rMin - 0.5 || pMax > a.rMax + 0.5) continue;
+            cellSec[gy * W + gx] = a.header;
+          }
+        }
+      }
+    }
     // Emit walls along cell boundaries where the neighbour's sector differs.
     for (let gy = 0; gy < H; gy++) {
       for (let gx = 0; gx < W; gx++) {
@@ -3019,9 +3052,13 @@ function _generateDungeonOnce(opts) {
           if (e.s === 'PRECISE') continue;
           // Corridor attached to this fused room: replace the void-facing
           // wall with a passable wall straight to the corridor's doorBody.
-          // The DR-1 resolve pass below upgrades it to a real door.
+          // The DR-1 resolve pass below upgrades it to a real door. The
+          // edge cell will normally have been overwritten with the
+          // corridor's HEADER sector above (so the DOOR1 upper fits), in
+          // which case headerToDoorBody picks up the matching doorBody.
           if (e.s === null) {
-            const body = fusedDoorAt(here, e.dir, xMin, yMin, xMax, yMax, minX, minY);
+            const body = headerToDoorBody.get(here) ||
+              fusedDoorAt(here, e.dir, xMin, yMin, xMax, yMax, minX, minY);
             if (body) {
               emitWall(e.x1, e.y1, e.x2, e.y2, here, body, {});
               continue;
@@ -5827,7 +5864,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.43</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.44</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

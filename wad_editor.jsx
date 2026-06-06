@@ -2358,6 +2358,18 @@ function _generateDungeonOnce(opts) {
   };
   const sidedefs = [];
   const linedefs = [];
+  // O(1) lookups for the hot post-emit passes — IDs are 'vN'/'sdN'/'lN' with
+  // N == array index, so we can slice the prefix instead of linear-scanning.
+  const vById = (id) => verts[+id.slice(1)];
+  const sdById = (id) => sidedefs[+id.slice(2)];
+  // Vertex-pair -> linedef map. Replaces emitWall's linedefs.find() scan
+  // (which was the quadratic killer on large fused levels — every wall
+  // emit walked the entire growing linedef array looking for a duplicate).
+  const lineByVerts = new Map();
+  const vertKey = (a, b) => {
+    const na = +a.slice(1), nb = +b.slice(1);
+    return na < nb ? na + '|' + nb : nb + '|' + na;
+  };
   const newSd = (sectorId, props = {}) => {
     const id = 'sd' + sidedefs.length;
     sidedefs.push({ id, xOff: 0, yOff: 0, upper: '-', lower: '-', middle: 'STARTAN2', sector: sectorId, ...props });
@@ -2366,8 +2378,8 @@ function _generateDungeonOnce(opts) {
   function emitWall(x1, y1, x2, y2, sectorId, sharedSector, props = {}) {
     const v1 = getV(x1, y1), v2 = getV(x2, y2);
     if (v1 === v2) return null;
-    const existing = linedefs.find(l =>
-      (l.v1 === v1 && l.v2 === v2) || (l.v1 === v2 && l.v2 === v1));
+    const key = vertKey(v1, v2);
+    const existing = lineByVerts.get(key);
     if (existing) {
       if (existing.back === -1) {
         existing.back = newSd(sectorId, { middle: '-', ...props.backSide });
@@ -2376,7 +2388,7 @@ function _generateDungeonOnce(opts) {
         // wall) and we just attached a SECOND room's outer wall to its
         // back. Clear the front's wall-texture middle so the passage
         // reads as a clean opening instead of a glass-pane wall.
-        const frontSd = sidedefs.find(s => s.id === existing.front);
+        const frontSd = sdById(existing.front);
         if (frontSd && frontSd.middle && frontSd.middle !== '-' &&
             frontSd.middle !== 'DOORTRAK' && frontSd.middle !== 'SW1EXIT') {
           frontSd.middle = '-';
@@ -2395,6 +2407,7 @@ function _generateDungeonOnce(opts) {
       special: props.special || 0, tag: props.tag || 0, front, back,
     };
     linedefs.push(ld);
+    lineByVerts.set(key, ld);
     return ld;
   }
 
@@ -3181,7 +3194,7 @@ function _generateDungeonOnce(opts) {
   {
     function cloneSidedef(sdId) {
       if (sdId === -1) return -1;
-      const src = sidedefs.find(s => s.id === sdId);
+      const src = sdById(sdId);
       if (!src) return -1;
       const nid = 'sd' + sidedefs.length;
       sidedefs.push({ ...src, id: nid });
@@ -3189,9 +3202,9 @@ function _generateDungeonOnce(opts) {
     }
     function trySplitAt(line, atV) {
       if (line.v1 === atV || line.v2 === atV) return null;
-      const v = verts.find(x => x.id === atV);
-      const a = verts.find(x => x.id === line.v1);
-      const b = verts.find(x => x.id === line.v2);
+      const v = vById(atV);
+      const a = vById(line.v1);
+      const b = vById(line.v2);
       if (!v || !a || !b) return null;
       const dx = b.x - a.x, dy = b.y - a.y;
       const lenSq = dx * dx + dy * dy;
@@ -3200,11 +3213,16 @@ function _generateDungeonOnce(opts) {
       if (t <= 0.001 || t >= 0.999) return null;
       const projX = a.x + t * dx, projY = a.y + t * dy;
       if ((v.x - projX) ** 2 + (v.y - projY) ** 2 > 1) return null;
+      // Update lineByVerts: remove the old key for `line` (its v2 is about
+      // to change), add the new keys for both halves.
+      lineByVerts.delete(vertKey(line.v1, line.v2));
       const half2 = {
         ...line, id: 'l' + linedefs.length, v1: atV,
         front: cloneSidedef(line.front), back: cloneSidedef(line.back),
       };
       line.v2 = atV;
+      lineByVerts.set(vertKey(line.v1, line.v2), line);
+      lineByVerts.set(vertKey(half2.v1, half2.v2), half2);
       return half2;
     }
     // Iterate: collect endpoints of all one-sided walls, split any line
@@ -3225,34 +3243,51 @@ function _generateDungeonOnce(opts) {
       }
     }
     // Merge identical one-sided wall pairs (between DIFFERENT sectors) into
-    // a single two-sided passable line. Clears the front wall texture.
-    const removed = new Set();
+    // a single two-sided passable line. The vertex-pair map lets us find
+    // the OTHER one-sided wall on the same key in O(1) instead of an N^2
+    // nested scan, but the map only holds one entry per key so we group
+    // duplicates by key first.
+    const byKey = new Map();
     for (let i = 0; i < linedefs.length; i++) {
-      if (removed.has(i)) continue;
-      const l1 = linedefs[i];
-      if (l1.back !== -1) continue;
-      for (let j = i + 1; j < linedefs.length; j++) {
+      const l = linedefs[i];
+      if (l.back !== -1) continue;
+      const k = vertKey(l.v1, l.v2);
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(i);
+    }
+    const removed = new Set();
+    for (const [, idxs] of byKey) {
+      if (idxs.length < 2) continue;
+      // Pair them off — pick the first as the "kept" line and merge the
+      // others into it as backs (only the first merge actually happens
+      // since a wall can only have two sides; further duplicates get
+      // dropped).
+      const keepI = idxs[0];
+      const l1 = linedefs[keepI];
+      for (let k = 1; k < idxs.length; k++) {
+        const j = idxs[k];
         if (removed.has(j)) continue;
         const l2 = linedefs[j];
-        if (l2.back !== -1) continue;
-        const sameVerts = (l1.v1 === l2.v1 && l1.v2 === l2.v2) ||
-                          (l1.v1 === l2.v2 && l1.v2 === l2.v1);
-        if (!sameVerts) continue;
-        const fs1 = sidedefs.find(s => s.id === l1.front);
-        const fs2 = sidedefs.find(s => s.id === l2.front);
+        const fs1 = sdById(l1.front);
+        const fs2 = sdById(l2.front);
         if (!fs1 || !fs2 || fs1.sector === fs2.sector) continue;
-        l1.back = l2.front;
-        l1.flags = (l1.flags | 4) & ~1;
-        if (fs1.middle && fs1.middle !== '-' &&
-            fs1.middle !== 'DOORTRAK' && fs1.middle !== 'SW1EXIT') {
-          fs1.middle = '-';
+        if (l1.back === -1) {
+          l1.back = l2.front;
+          l1.flags = (l1.flags | 4) & ~1;
+          if (fs1.middle && fs1.middle !== '-' &&
+              fs1.middle !== 'DOORTRAK' && fs1.middle !== 'SW1EXIT') {
+            fs1.middle = '-';
+          }
         }
         removed.add(j);
-        break;
       }
     }
-    for (let i = linedefs.length - 1; i >= 0; i--) {
-      if (removed.has(i)) linedefs.splice(i, 1);
+    if (removed.size) {
+      for (let i = linedefs.length - 1; i >= 0; i--) {
+        if (removed.has(i)) linedefs.splice(i, 1);
+      }
+      // The map's stale entries are fine — they reference live linedefs
+      // (the survivor in each merge pair).
     }
   }
 
@@ -3279,10 +3314,10 @@ function _generateDungeonOnce(opts) {
     for (let i = 0; i < linedefs.length; i++) {
       const l = linedefs[i];
       if (l.back !== -1) continue;
-      const fs = sidedefs.find(s => s.id === l.front);
+      const fs = sdById(l.front);
       if (!fs || !roomSecs.has(fs.sector)) continue;
-      const v1 = verts.find(v => v.id === l.v1);
-      const v2 = verts.find(v => v.id === l.v2);
+      const v1 = vById(l.v1);
+      const v2 = vById(l.v2);
       if (!v1 || !v2) continue;
       const mx = (v1.x + v2.x) / 2, my = (v1.y + v2.y) / 2;
       // Find an enclosing OTHER room (not this wall's own room).
@@ -3333,12 +3368,12 @@ function _generateDungeonOnce(opts) {
     }
     for (const l of linedefs) {
       if (l.back === -1) continue; // one-sided: trust the original emit
-      const fs = sidedefs.find(s => s.id === l.front);
-      const bs = sidedefs.find(s => s.id === l.back);
+      const fs = sdById(l.front);
+      const bs = sdById(l.back);
       if (!fs || !bs) continue;
       if (fs.sector === bs.sector) continue; // degenerate, skip
-      const v1 = verts.find(v => v.id === l.v1);
-      const v2 = verts.find(v => v.id === l.v2);
+      const v1 = vById(l.v1);
+      const v2 = vById(l.v2);
       if (!v1 || !v2) continue;
       const mx = (v1.x + v2.x) / 2, my = (v1.y + v2.y) / 2;
       const dx = v2.x - v1.x, dy = v2.y - v1.y;
@@ -3370,11 +3405,11 @@ function _generateDungeonOnce(opts) {
       if (l1.special !== 0 || l2.special !== 0) return false;
       if (l1.flags !== l2.flags) return false;
       // front sectors equal, back sectors equal (both -1 or same)
-      const f1 = sidedefs.find(s => s.id === l1.front);
-      const f2 = sidedefs.find(s => s.id === l2.front);
+      const f1 = sdById(l1.front);
+      const f2 = sdById(l2.front);
       if (!f1 || !f2 || f1.sector !== f2.sector || !sameTex(f1, f2)) return false;
-      const b1 = l1.back === -1 ? null : sidedefs.find(s => s.id === l1.back);
-      const b2 = l2.back === -1 ? null : sidedefs.find(s => s.id === l2.back);
+      const b1 = l1.back === -1 ? null : sdById(l1.back);
+      const b2 = l2.back === -1 ? null : sdById(l2.back);
       if ((b1 == null) !== (b2 == null)) return false;
       if (b1 && b2 && (b1.sector !== b2.sector || !sameTex(b1, b2))) return false;
       // collinear and same direction
@@ -3707,7 +3742,7 @@ function _generateDungeonOnce(opts) {
       const hostCeil = hostSec.ceilH;
       postLines.forEach((pl, idx) => {
         if (!pl) return;
-        const pfs = sidedefs.find(s => s.id === pl.front);
+        const pfs = sdById(pl.front);
         if (!pfs) return;
         pfs.lower = (idx === 0) ? 'SW1EXIT' : postWall;
         if (hostCeil > postFloor) pfs.upper = postWall;
@@ -5920,7 +5955,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.45</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.46</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

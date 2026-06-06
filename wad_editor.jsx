@@ -3031,9 +3031,24 @@ function _generateDungeonOnce(opts) {
         }
         const blockSec = b.enterable ? b.slabSec : b.roofSec;
         if (!blockSec) continue;
-        gridRiserTex.set(blockSec, b.wall);
         const Hx = (b.halfX != null ? b.halfX : b.half);
         const Hy = (b.halfY != null ? b.halfY : b.half);
+        // Bail out early if the footprint is partially claimed by another
+        // overlapping room — rasterizing into a few stray cells leaves a
+        // slab fragment with 2-5 walls and breaks topology. Skipping
+        // lets the orphan-sector prune at the end drop the un-emitted
+        // slab / interior / throat sectors cleanly.
+        let canRasterize = true;
+        for (let gy = 0; gy < H && canRasterize; gy++) {
+          for (let gx = 0; gx < W && canRasterize; gx++) {
+            const cx = minX + (gx + 0.5) * CELL;
+            const cy = minY + (gy + 0.5) * CELL;
+            if (Math.abs(cx - b.cx) >= Hx || Math.abs(cy - b.cy) >= Hy) continue;
+            if (cellSec[gy * W + gx] !== room.outerId) canRasterize = false;
+          }
+        }
+        if (!canRasterize) continue;
+        gridRiserTex.set(blockSec, b.wall);
         for (let gy = 0; gy < H; gy++) {
           for (let gx = 0; gx < W; gx++) {
             if (cellSec[gy * W + gx] !== room.outerId) continue;
@@ -5955,7 +5970,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.46</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.47</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

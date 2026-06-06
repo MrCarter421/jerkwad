@@ -1605,7 +1605,12 @@ function _generateDungeonOnce(opts) {
           // LIFT that takes the player up to a raised MEZZANINE (true two-
           // floor verticality — the office-tower experience).
           const intLight = pick([128, 144, 160]);
-          const hasLift = pos.halfX >= 128 && pos.halfY >= 144 && rand() < 0.55;
+          // Multi-room office layouts and internal lifts compete for the
+          // same large interiors; either pick is exclusive so we don't try
+          // to fit both into one building.
+          const eligibleLarge = pos.halfX >= 128 && pos.halfY >= 144;
+          const multiRoom = eligibleLarge && rand() < 0.35;
+          const hasLift = !multiRoom && eligibleLarge && rand() < 0.55;
           const liftTag = hasLift ? tagCounter++ : 0;
           // Lift buildings are taller (216 / 192) than regular sheds (168 /
           // 144) so the raised mezzanine has enough clearance for the player.
@@ -1625,8 +1630,27 @@ function _generateDungeonOnce(opts) {
               floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8']),
               ceilTex: pick(['FLAT5_4', 'FLAT1', 'CEIL5_1']),
               light: Math.max(96, intLight - 24), special: 0 }),
-            hasLift, liftTag,
+            hasLift, liftTag, multiRoom,
           };
+          if (multiRoom) {
+            // Office-style two-room interior — a partition wall splits the
+            // building into FRONT (door entry) and BACK rooms connected by
+            // an internal doorway. The doorway is its own header sector
+            // (ceil = fh + 72) so the upper above the opening reads as a
+            // proper lintel/archway instead of a tall wall.
+            b.backRoomSec = allocSec({
+              floorH: r.floorH, ceilH: intCeilH,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1', 'FLOOR4_8', 'FLAT1']),
+              ceilTex: pick(['CEIL5_1', 'CEIL5_2', 'TLITE6_4', 'FLAT5_4']),
+              light: intLight, special: 0,
+            });
+            b.doorwaySec = allocSec({
+              floorH: r.floorH, ceilH: r.floorH + 72,
+              floorTex: pick(['FLAT5_4', 'FLOOR0_1']),
+              ceilTex: pick(['FLAT5_4', 'FLAT1', 'CEIL5_1']),
+              light: Math.max(96, intLight - 16), special: 0,
+            });
+          }
           if (hasLift) {
             // Lift platform — closed-state floor is at mezzanine height; SR-62
             // on the player-facing wall lowers it to the interior, waits,
@@ -2680,11 +2704,43 @@ function _generateDungeonOnce(opts) {
         // to assign subsectors, so wrong winding inside a fused-precise
         // building can sink the camera subsector into the closed SLAB
         // (sky-ceiling) and bleed sky through the walls.
-        emitWall(dL, iS, iW, iS, intr, slab, loI);   // S, west of throat (west: right=N=intr)
-        emitWall(iE, iS, dR, iS, intr, slab, loI);   // S, east of throat
-        emitWall(iE, iN, iE, iS, intr, slab, loI);   // E (south: right=W=intr)
-        emitWall(iW, iN, iE, iN, intr, slab, loI);   // N (east: right=S=intr)
-        emitWall(iW, iS, iW, iN, intr, slab, loI);   // W (north: right=E=intr)
+        if (b.multiRoom) {
+          // Office layout: a 24-thick PARTITION runs east-west through the
+          // interior at y=cy with a 96-wide DOORWAY gap in the centre. The
+          // front room (south of the partition) holds the door throat; the
+          // back room sits north of the partition. Partition wings are part
+          // of the existing slab sector (so we don't allocate a new sector
+          // for the wall) — only the doorway gets its own header sector.
+          const back = b.backRoomSec, door = b.doorwaySec;
+          const partS = cy - 12, partN = cy + 12;
+          const dW = cx - 48, dE = cx + 48;
+          const upI = { frontSide: { upper: iw } };
+          const upIB = { backSide: { upper: iw } };
+          // Front-room ring (intr south of partition).
+          emitWall(dL, iS, iW, iS, intr, slab, loI);     // S, west of throat
+          emitWall(iE, iS, dR, iS, intr, slab, loI);     // S, east of throat
+          emitWall(iE, partS, iE, iS, intr, slab, loI);  // E (up to partition)
+          emitWall(iW, iS, iW, partS, intr, slab, loI);  // W (up to partition)
+          // Partition: 2 slab wings + a doorway header sector in the middle.
+          emitWall(iW, partS, dW, partS, intr, slab, loI);   // wing W (intr↔slab)
+          emitWall(dE, partS, iE, partS, intr, slab, loI);   // wing E (intr↔slab)
+          emitWall(dW, partS, dE, partS, intr, door, upI);   // door south face — lintel upper on intr side
+          emitWall(dE, partN, dE, partS, door, slab, loI);   // door east jamb
+          emitWall(dW, partS, dW, partN, door, slab, loI);   // door west jamb
+          emitWall(dW, partN, dE, partN, door, back, upIB);  // door north face — lintel upper on back side
+          // Back-room ring (back north of partition).
+          emitWall(dW, partN, iW, partN, back, slab, loI);   // partition wing W (back↔slab)
+          emitWall(iE, partN, dE, partN, back, slab, loI);   // partition wing E (back↔slab)
+          emitWall(iW, iN, iE, iN, back, slab, loI);         // N (east: right=S=back)
+          emitWall(iE, iN, iE, partN, back, slab, loI);      // E (south: right=W=back)
+          emitWall(iW, partN, iW, iN, back, slab, loI);      // W (north: right=E=back)
+        } else {
+          emitWall(dL, iS, iW, iS, intr, slab, loI);   // S, west of throat (west: right=N=intr)
+          emitWall(iE, iS, dR, iS, intr, slab, loI);   // S, east of throat
+          emitWall(iE, iN, iE, iS, intr, slab, loI);   // E (south: right=W=intr)
+          emitWall(iW, iN, iE, iN, intr, slab, loI);   // N (east: right=S=intr)
+          emitWall(iW, iS, iW, iN, intr, slab, loI);   // W (north: right=E=intr)
+        }
         // Optional working LIFT + raised MEZZANINE inside the interior. The
         // lift sits on the interior floor as a 64-wide closed-state platform
         // at mezzanine height; pressing the SW1BRCOM switch on its player-
@@ -5864,7 +5920,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.44</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.45</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

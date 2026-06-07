@@ -698,6 +698,7 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
     cx: s.cx | 0, cy: s.cy | 0,
     w: s.w, h: s.h, r: s.r,
     _userFeature: s.feature || null,
+    _customSpec: s.customSpec || null,
   }));
   const idIndex = new Map(roomSpecs.map((s, i) => [s.id, i]));
   const corridors = [];
@@ -1137,6 +1138,18 @@ function _generateDungeonOnce(opts) {
     else if (isMidRoom && roll < 0.975)      r.feature = 'ziggurat';
     else if (isMidRoom && roll < 0.99)       r.feature = 'lift';
     else                                     r.feature = 'none';
+    // User-designed CUSTOM room — applies a saved customSpec (palette /
+    // heights / light / pillars / terrains) over a 'none' base. The
+    // customSpec.pillars and customSpec.terrains are pushed in the
+    // pillar / terrain allocation blocks below.
+    if (r.feature === 'custom' && r._customSpec) {
+      const cs = r._customSpec;
+      if (cs.palette) r.palette = { ...r.palette, ...cs.palette };
+      if (typeof cs.floorH === 'number') r.floorH = cs.floorH;
+      if (typeof cs.ceilH === 'number') r.ceilH = cs.ceilH;
+      if (typeof cs.light === 'number') r.light = cs.light;
+      if (cs.hasSky) { r.hasSky = true; r.palette = { ...r.palette, ceil: 'F_SKY1' }; }
+    }
     // Per-feature room-level overrides — ceiling height, palette swaps and
     // ambient lighting set the mood before sector allocation.
     if (r.feature === 'cathedral') r.ceilH = r.floorH + 256 + Math.floor(rand() * 3) * 32;
@@ -1349,7 +1362,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock' || r.feature === 'custom';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Terrain rooms pack many tightly-spaced rings for the rolling-hills look.
@@ -1820,6 +1833,27 @@ function _generateDungeonOnce(opts) {
     // sub-sectors; the resolve pass textures the risers, and the sky ceiling
     // continues unbroken above them. Stored for the emit pass + clearance.
     r.terrains = [];
+    // Custom-designed rooms push their saved terrains (pits / raised
+    // platforms placed by the Room Designer) before any feature-specific
+    // terrain block runs.
+    if (r.feature === 'custom' && r._customSpec && r._customSpec.terrains) {
+      const sn = v => Math.round(v / 32) * 32;
+      for (const t of r._customSpec.terrains) {
+        const cx = sn(r.cx + (t.dx || 0));
+        const cy = sn(r.cy + (t.dy || 0));
+        const hw = Math.max(32, sn(t.hw | 0));
+        const hh = Math.max(32, sn(t.hh | 0));
+        const dh = t.dh | 0;  // floor delta (negative = pit, positive = raised platform)
+        r.terrains.push({ cx, cy, hw, hh, kind: t.kind || 'custom',
+          secId: allocSec({
+            floorH: r.floorH + dh, ceilH: r.ceilH,
+            floorTex: t.floorTex || (dh < 0 ? 'BLOOD1' : r.palette.accent),
+            ceilTex: r.palette.ceil,
+            light: Math.max(96, r.light + (dh < 0 ? -32 : 16)),
+            special: t.special | 0,
+          }) });
+      }
+    }
     if (r.feature === 'canal') {
       // Sunken liquid channel across the room (E–W), split by a central land
       // crossing. Two sunken segments left/right of the crossing; the player
@@ -1911,6 +1945,18 @@ function _generateDungeonOnce(opts) {
     // tiny octagon with ceil == floor at room ceiling height so it
     // reads as a solid floor-to-ceiling column.
     r.pillars = [];
+    // Custom-designed rooms push their saved pillars first (placed by the
+    // Room Designer in absolute room-local coords) — translated to world.
+    if (r.feature === 'custom' && r._customSpec && r._customSpec.pillars) {
+      for (const p of r._customSpec.pillars) {
+        const px = Math.round((r.cx + (p.dx || 0)) / 32) * 32;
+        const py = Math.round((r.cy + (p.dy || 0)) / 32) * 32;
+        const pillar = { cx: px, cy: py, radius: p.radius | 0 };
+        if (p.top != null) pillar.top = r.floorH + (p.top | 0);
+        if (p.tex) pillar.tex = p.tex;
+        r.pillars.push(pillar);
+      }
+    }
     if (r.feature === 'bunker') {
       // Central support column + a ring of low sandbag cover blocks.
       r.pillars.push({ cx: Math.round(r.cx / 32) * 32, cy: Math.round(r.cy / 32) * 32, radius: 40 });
@@ -5427,6 +5473,163 @@ function findShapeShifterSeams(rooms) {
   return seams;
 }
 
+// Room Designer modal. Form-based editor for a custom room preset — shape,
+// dimensions, floor / ceil heights, palette, light, plus a list of placeable
+// structures (PILLAR, PIT, PLATFORM). Saves to localStorage via the parent's
+// onSave callback and re-appears in the PLACE chip strip.
+const TEX_OPTIONS = {
+  floor: ['FLAT5_4', 'FLOOR0_1', 'FLOOR0_3', 'FLOOR4_8', 'FLAT1', 'FLAT5_5', 'MFLR8_1', 'GRNROCK', 'RROCK16', 'CEIL5_2', 'NUKAGE1', 'BLOOD1', 'FWATER1', 'LAVA1', 'SLIME09'],
+  ceil:  ['CEIL5_1', 'CEIL5_2', 'TLITE6_4', 'TLITE6_1', 'FLAT5_4', 'FLAT1', 'F_SKY1', 'CEIL3_5', 'TLITE6_5'],
+  wall:  ['STARTAN2', 'STARTAN3', 'BROWN1', 'BROWN96', 'STONE', 'STONE2', 'STONE3', 'METAL', 'METAL2', 'SUPPORT2', 'SUPPORT3', 'GRAY7', 'MARBLE1', 'MARBLE2', 'SP_HOT1'],
+};
+function RoomDesignerModal({ preset, onCancel, onSave, onDelete }) {
+  const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(preset)));
+  const cs = draft.customSpec || (draft.customSpec = {});
+  if (!cs.palette) cs.palette = {};
+  if (!cs.pillars) cs.pillars = [];
+  if (!cs.terrains) cs.terrains = [];
+  const update = (patch) => setDraft(d => ({ ...d, ...patch }));
+  const updateCS = (patch) => setDraft(d => ({ ...d, customSpec: { ...d.customSpec, ...patch } }));
+  const updatePalette = (key, val) => setDraft(d => ({ ...d, customSpec: {
+    ...d.customSpec, palette: { ...(d.customSpec && d.customSpec.palette || {}), [key]: val } } }));
+  const addPillar = () => updateCS({ pillars: [...cs.pillars,
+    { dx: 0, dy: 0, radius: 32, top: 0, tex: 'SUPPORT2' }] });
+  const updPillar = (i, patch) => updateCS({ pillars: cs.pillars.map((p, k) => k === i ? { ...p, ...patch } : p) });
+  const rmPillar = (i) => updateCS({ pillars: cs.pillars.filter((_, k) => k !== i) });
+  const addPit = () => updateCS({ terrains: [...cs.terrains,
+    { dx: 0, dy: -96, hw: 96, hh: 64, dh: -24, kind: 'pit', floorTex: 'BLOOD1', special: 7 }] });
+  const addPlat = () => updateCS({ terrains: [...cs.terrains,
+    { dx: 0, dy: 96, hw: 96, hh: 64, dh: 16, kind: 'platform', floorTex: 'FLOOR0_3' }] });
+  const updTerr = (i, patch) => updateCS({ terrains: cs.terrains.map((t, k) => k === i ? { ...t, ...patch } : t) });
+  const rmTerr = (i) => updateCS({ terrains: cs.terrains.filter((_, k) => k !== i) });
+  const labelStyle = { fontSize: 10, color: COLORS.textDim, fontFamily: monoStack, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 2, display: 'block' };
+  const inputStyle = { background: COLORS.bg, color: COLORS.text, border: '1px solid ' + COLORS.border,
+    borderRadius: 3, padding: '4px 6px', fontFamily: monoStack, fontSize: 11, width: 80 };
+  const selStyle = { ...inputStyle, width: 110 };
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 10001, background: 'rgba(0,0,0,0.7)',
+        display: 'flex', alignItems: 'stretch', justifyContent: 'center', padding: 16,
+        paddingTop: 'calc(env(safe-area-inset-top) + 16px)',
+        paddingBottom: 'calc(env(safe-area-inset-bottom) + 16px)' }}>
+      <div style={{ background: COLORS.bgPanel, border: '1px solid ' + COLORS.amber,
+          borderRadius: 6, color: COLORS.text, fontFamily: fontStack, padding: 14,
+          maxWidth: 520, width: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            marginBottom: 10, paddingBottom: 8, borderBottom: '1px solid ' + COLORS.border }}>
+          <span style={{ color: COLORS.amber, fontWeight: 700, letterSpacing: '0.18em', fontSize: 13 }}>ROOM DESIGNER</span>
+          <button onClick={onCancel} style={{ padding: '4px 10px', fontSize: 11, color: COLORS.cyan,
+            background: COLORS.bg, border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>CANCEL</button>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', paddingRight: 4 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+            <div><label style={labelStyle}>Name</label>
+              <input value={draft.label} onChange={e => update({ label: e.target.value })}
+                style={{ ...inputStyle, width: '100%' }} /></div>
+            <div><label style={labelStyle}>Shape</label>
+              <select value={draft.type} onChange={e => update({ type: e.target.value })} style={{ ...selStyle, width: '100%' }}>
+                <option value="square">Square</option><option value="octagon">Octagon</option><option value="hexagon">Hexagon</option>
+              </select></div>
+            {draft.type === 'square' ? (<>
+              <div><label style={labelStyle}>Width</label>
+                <input type="number" step="32" value={draft.w || 768} onChange={e => update({ w: +e.target.value })}
+                  style={{ ...inputStyle, width: '100%' }} /></div>
+              <div><label style={labelStyle}>Height</label>
+                <input type="number" step="32" value={draft.h || 768} onChange={e => update({ h: +e.target.value })}
+                  style={{ ...inputStyle, width: '100%' }} /></div>
+            </>) : (
+              <div><label style={labelStyle}>Radius</label>
+                <input type="number" step="32" value={draft.r || 384} onChange={e => update({ r: +e.target.value })}
+                  style={{ ...inputStyle, width: '100%' }} /></div>
+            )}
+            <div><label style={labelStyle}>Floor H</label>
+              <input type="number" step="8" value={cs.floorH | 0} onChange={e => updateCS({ floorH: +e.target.value })}
+                style={{ ...inputStyle, width: '100%' }} /></div>
+            <div><label style={labelStyle}>Ceil H</label>
+              <input type="number" step="8" value={cs.ceilH | 0} onChange={e => updateCS({ ceilH: +e.target.value })}
+                style={{ ...inputStyle, width: '100%' }} /></div>
+            <div><label style={labelStyle}>Light (0-255)</label>
+              <input type="number" min="0" max="255" step="8" value={cs.light | 0} onChange={e => updateCS({ light: Math.max(0, Math.min(255, +e.target.value)) })}
+                style={{ ...inputStyle, width: '100%' }} /></div>
+            <div><label style={labelStyle}>Open sky</label>
+              <select value={cs.hasSky ? '1' : '0'} onChange={e => updateCS({ hasSky: e.target.value === '1' })}
+                style={{ ...selStyle, width: '100%' }}>
+                <option value="0">No</option><option value="1">Yes (sky ceiling)</option>
+              </select></div>
+            <div><label style={labelStyle}>Floor tex</label>
+              <select value={cs.palette.floor || 'FLAT5_4'} onChange={e => updatePalette('floor', e.target.value)} style={{ ...selStyle, width: '100%' }}>
+                {TEX_OPTIONS.floor.map(t => <option key={t} value={t}>{t}</option>)}
+              </select></div>
+            <div><label style={labelStyle}>Ceil tex</label>
+              <select value={cs.palette.ceil || 'CEIL5_1'} onChange={e => updatePalette('ceil', e.target.value)} style={{ ...selStyle, width: '100%' }}>
+                {TEX_OPTIONS.ceil.map(t => <option key={t} value={t}>{t}</option>)}
+              </select></div>
+            <div><label style={labelStyle}>Wall tex</label>
+              <select value={cs.palette.wall || 'STARTAN2'} onChange={e => updatePalette('wall', e.target.value)} style={{ ...selStyle, width: '100%' }}>
+                {TEX_OPTIONS.wall.map(t => <option key={t} value={t}>{t}</option>)}
+              </select></div>
+            <div><label style={labelStyle}>Accent tex</label>
+              <select value={cs.palette.accent || 'FLOOR0_3'} onChange={e => updatePalette('accent', e.target.value)} style={{ ...selStyle, width: '100%' }}>
+                {TEX_OPTIONS.floor.map(t => <option key={t} value={t}>{t}</option>)}
+              </select></div>
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span style={{ ...labelStyle, marginBottom: 0, flex: 1 }}>Pillars ({cs.pillars.length})</span>
+              <button onClick={addPillar} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: 90 }}>+ PILLAR</button>
+            </div>
+            {cs.pillars.map((p, i) => (
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr auto', gap: 4, marginBottom: 4, alignItems: 'end' }}>
+                <div><span style={labelStyle}>dx</span><input type="number" step="32" value={p.dx} onChange={e => updPillar(i, { dx: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>dy</span><input type="number" step="32" value={p.dy} onChange={e => updPillar(i, { dy: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>r</span><input type="number" step="8" value={p.radius} onChange={e => updPillar(i, { radius: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>top (0 = full)</span><input type="number" step="8" value={p.top | 0} onChange={e => updPillar(i, { top: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>tex</span>
+                  <select value={p.tex || 'SUPPORT2'} onChange={e => updPillar(i, { tex: e.target.value })} style={{ ...selStyle, width: '100%' }}>
+                    {TEX_OPTIONS.wall.map(t => <option key={t} value={t}>{t}</option>)}
+                  </select></div>
+                <button onClick={() => rmPillar(i)} style={{ ...inputStyle, color: COLORS.danger, cursor: 'pointer', width: 30 }}>×</button>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span style={{ ...labelStyle, marginBottom: 0, flex: 1 }}>Pits / Platforms ({cs.terrains.length})</span>
+              <button onClick={addPit} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: 70 }}>+ PIT</button>
+              <button onClick={addPlat} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: 90 }}>+ PLATFORM</button>
+            </div>
+            {cs.terrains.map((t, i) => (
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 1fr 1fr auto', gap: 4, marginBottom: 4, alignItems: 'end' }}>
+                <div><span style={labelStyle}>dx</span><input type="number" step="32" value={t.dx} onChange={e => updTerr(i, { dx: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>dy</span><input type="number" step="32" value={t.dy} onChange={e => updTerr(i, { dy: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>hw</span><input type="number" step="32" value={t.hw} onChange={e => updTerr(i, { hw: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>hh</span><input type="number" step="32" value={t.hh} onChange={e => updTerr(i, { hh: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>floor Δ</span><input type="number" step="8" value={t.dh} onChange={e => updTerr(i, { dh: +e.target.value })} style={{ ...inputStyle, width: '100%' }} /></div>
+                <div><span style={labelStyle}>tex</span>
+                  <select value={t.floorTex || 'BLOOD1'} onChange={e => updTerr(i, { floorTex: e.target.value })} style={{ ...selStyle, width: '100%' }}>
+                    {TEX_OPTIONS.floor.map(tx => <option key={tx} value={tx}>{tx}</option>)}
+                  </select></div>
+                <button onClick={() => rmTerr(i)} style={{ ...inputStyle, color: COLORS.danger, cursor: 'pointer', width: 30 }}>×</button>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 6, paddingTop: 10, borderTop: '1px solid ' + COLORS.border, marginTop: 10 }}>
+          <button onClick={() => onSave(draft)}
+            style={{ flex: 1, padding: '8px 12px', fontSize: 12, fontWeight: 700, letterSpacing: '0.1em',
+              background: COLORS.amber, color: COLORS.bg, border: '1px solid ' + COLORS.amber, borderRadius: 4 }}>
+            SAVE PRESET
+          </button>
+          <button onClick={() => onDelete(draft.id)} title="delete"
+            style={{ padding: '8px 12px', fontSize: 12, fontWeight: 700, letterSpacing: '0.1em',
+              background: COLORS.bg, color: COLORS.danger, border: '1px solid ' + COLORS.danger, borderRadius: 4 }}>
+            DELETE
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ShapeShifter() {
   const [rooms, setRooms] = useState([]);
   const [connections, setConnections] = useState([]); // [{ id, fromId, toId, valid }]
@@ -5439,6 +5642,32 @@ function ShapeShifter() {
   const [thingCat, setThingCat] = useState('PLAYER');
   const [pickedThingType, setPickedThingType] = useState(1);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 0.15 });
+  // Custom user-designed room presets, persisted to localStorage. Each is in
+  // the same shape as a SHAPESHIFTER_PRESETS entry plus a customSpec field
+  // that the generator applies on feature='custom'.
+  const [customPresets, setCustomPresets] = useState(() => {
+    try {
+      const raw = typeof localStorage !== 'undefined' && localStorage.getItem('ssCustomPresets');
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) { return []; }
+  });
+  const saveCustomPreset = (preset) => {
+    setCustomPresets(prev => {
+      const next = [...prev.filter(p => p.id !== preset.id), preset];
+      try { localStorage.setItem('ssCustomPresets', JSON.stringify(next)); } catch (e) {}
+      return next;
+    });
+  };
+  const deleteCustomPreset = (id) => {
+    setCustomPresets(prev => {
+      const next = prev.filter(p => p.id !== id);
+      try { localStorage.setItem('ssCustomPresets', JSON.stringify(next)); } catch (e) {}
+      return next;
+    });
+  };
+  // Room Designer modal — open / null. When opening to edit, pre-fill with
+  // the existing preset; otherwise start blank.
+  const [designerPreset, setDesignerPreset] = useState(null);
   const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
   const [needP1Confirm, setNeedP1Confirm] = useState(false);
@@ -5484,7 +5713,8 @@ function ShapeShifter() {
       target.cx = Math.round((view.x + Math.cos(ang) * dist) / 32) * 32;
       target.cy = Math.round((view.y + Math.sin(ang) * dist) / 32) * 32;
     }
-    const r = { ...target, id: nextId('ssr'), label: preset.label, feature: preset.feature };
+    const r = { ...target, id: nextId('ssr'), label: preset.label, feature: preset.feature,
+      customSpec: preset.customSpec || null };
     setRooms(rs => [...rs, r]);
     setSelectedId(r.id);
     setHint(preset.label + ' placed — drag rooms over each other to fuse them.');
@@ -5509,6 +5739,7 @@ function ShapeShifter() {
     // Validate against current placement by building a one-connection probe.
     const specs = rooms.map(r => ({
       type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
+      customSpec: r.customSpec || null,
     }));
     const test = generateShapeShifterMap(specs, [{ fromId, toId, kind: connKind }]);
     if (connKind === 'teleporter') {
@@ -6014,12 +6245,20 @@ function ShapeShifter() {
           </div>
         </div>
       ) : null}
+      {designerPreset ? (
+        <RoomDesignerModal preset={designerPreset} customPresets={customPresets}
+          onCancel={() => setDesignerPreset(null)}
+          onSave={(p) => { saveCustomPreset(p); setDesignerPreset(null);
+            setHint('Saved "' + p.label + '" — tap the chip in PLACE to drop it.'); }}
+          onDelete={(id) => { deleteCustomPreset(id); setDesignerPreset(null);
+            setHint('Custom preset deleted.'); }} />
+      ) : null}
       <div className="flex items-center justify-between px-2 py-1.5 border-b"
         style={{ borderColor: COLORS.border, background: COLORS.bgPanel,
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.48</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.49</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (
@@ -6097,6 +6336,31 @@ function ShapeShifter() {
       {!previewMap && mode === 'place' && (
         <div style={{ background: COLORS.bgPanel, borderBottom: '1px solid ' + COLORS.border,
                       overflowX: 'auto', whiteSpace: 'nowrap', padding: '6px 8px' }}>
+          <button onClick={() => setDesignerPreset({ id: 'cstm_' + Date.now().toString(36),
+              label: 'My Room', type: 'square', w: 768, h: 768, feature: 'custom',
+              customSpec: { palette: {}, floorH: 0, ceilH: 192, light: 176, pillars: [], terrains: [] } })}
+            style={{ display: 'inline-block', padding: '6px 10px', marginRight: 6,
+                     fontSize: 11, fontFamily: monoStack, color: COLORS.amber, fontWeight: 700,
+                     border: '1px solid ' + COLORS.amber, borderRadius: 4,
+                     background: COLORS.bg }}>
+            + DESIGNER
+          </button>
+          {customPresets.map(p => (
+            <span key={p.id} style={{ display: 'inline-block', marginRight: 6 }}>
+              <button onClick={() => addPreset(p)}
+                style={{ padding: '6px 10px', fontSize: 11, fontFamily: monoStack, color: COLORS.amber,
+                         border: '1px solid ' + COLORS.amber, borderRadius: '4px 0 0 4px',
+                         borderRight: 'none', background: COLORS.bg }}>
+                + {p.label}
+              </button>
+              <button onClick={() => setDesignerPreset(p)} title="edit"
+                style={{ padding: '6px 6px', fontSize: 11, fontFamily: monoStack, color: COLORS.amber,
+                         border: '1px solid ' + COLORS.amber, borderRadius: '0 4px 4px 0',
+                         background: COLORS.bg }}>
+                ✎
+              </button>
+            </span>
+          ))}
           {SHAPESHIFTER_PRESETS.map(p => (
             <button key={p.id} onClick={() => addPreset(p)}
               style={{ display: 'inline-block', padding: '6px 10px', marginRight: 6,

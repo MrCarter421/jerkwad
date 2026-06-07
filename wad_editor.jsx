@@ -2569,14 +2569,17 @@ function _generateDungeonOnce(opts) {
       const myPoly = roomPoly(room);
       const laterPolys = later.map(j => roomPoly(rooms[j]));
       for (const b of room.buildings) {
-        const hx = (b.enterable ? b.halfX : b.halfX + b.plinthW) + 8;
-        const hy = (b.enterable ? b.halfY : b.halfY + b.plinthW) + 8;
-        const NS = 5;
+        // Sample at exactly the 32-grid cell centers the rasterizer would
+        // test — anything coarser misses thin overlap strips and lets a
+        // building flip to PRECISE even when some of its cells will
+        // actually belong to another fused room, which strands the
+        // precise emit's outer walls referencing the wrong neighbour and
+        // leaves slab fragments after node-build.
+        const Hx = (b.enterable ? b.halfX : b.halfX + b.plinthW);
+        const Hy = (b.enterable ? b.halfY : b.halfY + b.plinthW);
         let clear = true;
-        for (let sx = 0; sx <= NS && clear; sx++) {
-          for (let sy = 0; sy <= NS && clear; sy++) {
-            const px = b.cx - hx + (2 * hx) * sx / NS;
-            const py = b.cy - hy + (2 * hy) * sy / NS;
+        for (let py = b.cy - Hy + 16; py < b.cy + Hy && clear; py += 32) {
+          for (let px = b.cx - Hx + 16; px < b.cx + Hx && clear; px += 32) {
             if (!pointInPolygon(px, py, myPoly)) clear = false;
             else if (laterPolys.some(p => pointInPolygon(px, py, p))) clear = false;
           }
@@ -3819,13 +3822,59 @@ function _generateDungeonOnce(opts) {
     }
   }
 
-  // Prune orphan sectors: any sector allocated but never referenced by a
-  // sidedef (e.g. an island whose grid cells were all claimed by a later
-  // overlapping room) would have no walls and break sector-loop validation.
-  const usedSectorIds = new Set(sidedefs.map(sd => sd.sector));
-  const prunedSectors = sectors.filter(s => usedSectorIds.has(s.id));
+  // Fragment cleanup safety net. Even after V0.47's "skip rasterization if
+  // the footprint isn't fully owned" guard, deeply overlapping fused mixed-
+  // feature layouts can still drop a slab fragment (e.g. a building from
+  // room A whose footprint cells get partly claimed mid-pass by another
+  // room's pillar rasterization, leaving 2-5 disjoint slab walls that
+  // don't form a closed loop). Run buildSectorLoops here, find any sector
+  // with empty / missing loops, and CONVERT its walls to one-sided walls
+  // of the surviving neighbour — the fragment becomes a plain solid wall
+  // segment and the broken sector itself gets dropped by the orphan
+  // prune below.
+  {
+    const probe = buildSectorLoops({ vertices: verts, linedefs, sidedefs, sectors, things: [] });
+    const broken = new Set();
+    for (const s of sectors) {
+      const loops = probe.get(s.id);
+      if (!loops || loops.length === 0) broken.add(s.id);
+    }
+    if (broken.size) {
+      for (const l of linedefs) {
+        const fs = sdById(l.front);
+        const bs = l.back !== -1 ? sdById(l.back) : null;
+        const fBad = fs && broken.has(fs.sector);
+        const bBad = bs && broken.has(bs.sector);
+        if (bBad && !fBad) {
+          l.back = -1;
+          l.flags = (l.flags & ~4) | 1;
+          if (fs && (!fs.middle || fs.middle === '-')) fs.middle = 'STARTAN2';
+        } else if (fBad && !bBad && l.back !== -1) {
+          l.front = l.back;
+          l.back = -1;
+          l.flags = (l.flags & ~4) | 1;
+          const nfs = sdById(l.front);
+          if (nfs && (!nfs.middle || nfs.middle === '-')) nfs.middle = 'STARTAN2';
+        } else if (fBad && bBad) {
+          // Both broken — drop the wall (mark degenerate, filtered below).
+          l.v1 = l.v2;
+        }
+      }
+    }
+  }
 
-  return { vertices: verts, linedefs, sidedefs, sectors: prunedSectors, things };
+  // Prune orphan sectors and degenerate (v1==v2) linedefs left by the
+  // cleanup pass above.
+  const aliveSecRefs = new Set();
+  for (const l of linedefs) {
+    if (l.v1 === l.v2) continue;
+    if (l.front !== -1) { const sd = sdById(l.front); if (sd) aliveSecRefs.add(sd.sector); }
+    if (l.back !== -1)  { const sd = sdById(l.back);  if (sd) aliveSecRefs.add(sd.sector); }
+  }
+  const prunedSectors = sectors.filter(s => aliveSecRefs.has(s.id));
+  const prunedLinedefs = linedefs.filter(l => l.v1 !== l.v2);
+
+  return { vertices: verts, linedefs: prunedLinedefs, sidedefs, sectors: prunedSectors, things };
 }
 
 // ============================================================================
@@ -5970,7 +6019,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.47</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.48</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

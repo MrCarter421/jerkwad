@@ -1241,7 +1241,11 @@ function _generateDungeonOnce(opts) {
     // narrow streets the player threads through (DOOMCITY vibe).
     if (r.feature === 'cityblock') {
       r.hasSky = true;
-      r.ceilH = r.floorH + 256;
+      // Sky plane at +512 — skyscrapers reach +384 and their setback tiers
+      // must be OPEN sectors (floor < ceil). At the old +256 the skyscraper
+      // roof sectors were floor-above-ceiling (invalid data that only
+      // looked right because sky-clipping hid it).
+      r.ceilH = r.floorH + 512;
       r.light = 208;
       r.palette = { ...r.palette, ceil: 'F_SKY1', floor: pick(['FLAT5_4', 'FLOOR0_1', 'FLAT1']) };
     }
@@ -1735,8 +1739,36 @@ function _generateDungeonOnce(opts) {
         // housing; houses get a single varied AC/tank centerpiece. The roof
         // centre must be big enough to hold them.
         b.roofUnits = [];
+        b.tiers = [];
         const innerHalf = Math.min(pos.halfX, pos.halfY) - parapetW;
-        if (innerHalf >= 64) {
+        // SKYSCRAPER — wedding-cake setback tiers instead of a tank: two
+        // concentric open-sky steps rising from the roof centre, capped by
+        // a thin spire on the top tier. The classic 1920s-zoning-law
+        // silhouette, and it reads beautifully against the Doom sky.
+        if (isSkyscraper && innerHalf >= 96) {
+          const sn32u = v => Math.round(v / 32) * 32;
+          const t1Half = Math.min(sn32u(innerHalf * 0.62), innerHalf - 32);
+          const t1H = roofTop + 64;
+          b.tiers.push({ half: t1Half, sec: allocSec({
+            floorH: t1H, ceilH: r.ceilH, floorTex: pick(BUILDING_ROOFS),
+            ceilTex: 'F_SKY1', light: Math.min(255, r.light + 8), special: 0 }) });
+          const t2Half = sn32u(innerHalf * 0.34);
+          if (t2Half >= 64 && t1Half - t2Half >= 32) {
+            const t2H = t1H + 64;
+            b.tiers.push({ half: t2Half, sec: allocSec({
+              floorH: t2H, ceilH: r.ceilH, floorTex: pick(BUILDING_ROOFS),
+              ceilTex: 'F_SKY1', light: Math.min(255, r.light + 12), special: 0 }) });
+            // Spire — a thin solid mast on the top tier.
+            const spH = t2H + 96 + Math.floor(rand() * 4) * 32;
+            b.roofUnits.push({
+              cx: b.cx, cy: b.cy, half: 16, enc: 'topTier',
+              tex: pick(['METAL', 'SUPPORT2', 'SHAWN2']),
+              sec: allocSec({ floorH: spH, ceilH: spH,
+                floorTex: pick(BUILDING_ROOFS), ceilTex: pick(BUILDING_ROOFS),
+                light: Math.min(255, r.light + 16), special: 0 }),
+            });
+          }
+        } else if (innerHalf >= 64) {
           const sn32u = v => Math.round(v / 32) * 32;
           const mainHalf = Math.min(sn32u(innerHalf * 0.55), innerHalf - 16);
           const mainH = roofTop + (isTower ? 56 + Math.floor(rand() * 4) * 16 : 40);
@@ -1952,8 +1984,19 @@ function _generateDungeonOnce(opts) {
         const px = Math.round((r.cx + (p.dx || 0)) / 32) * 32;
         const py = Math.round((r.cy + (p.dy || 0)) / 32) * 32;
         const pillar = { cx: px, cy: py, radius: p.radius | 0 };
-        if (p.top != null) pillar.top = r.floorH + (p.top | 0);
+        // top is relative to the room floor; 0 / empty = full column.
+        if (p.top) pillar.top = r.floorH + (p.top | 0);
         if (p.tex) pillar.tex = p.tex;
+        // A pillar standing inside a custom terrain (pit / platform tier)
+        // is enclosed by the smallest containing terrain, not the room
+        // floor — same fix as the lake temple columns.
+        let encArea = Infinity;
+        for (const t of r.terrains || []) {
+          if (px - pillar.radius < t.cx - t.hw || px + pillar.radius > t.cx + t.hw ||
+              py - pillar.radius < t.cy - t.hh || py + pillar.radius > t.cy + t.hh) continue;
+          const area = t.hw * t.hh;
+          if (area < encArea) { pillar.enclosingId = t.secId; encArea = area; }
+        }
         r.pillars.push(pillar);
       }
     }
@@ -2705,12 +2748,28 @@ function _generateDungeonOnce(opts) {
     }
     // Terrain — sunken basins / raised terraces stamped into a flat yard.
     // Two-sided flush borders; the resolve pass paints STEP risers on the
-    // lower side, and the (sky) ceiling carries over unchanged.
-    for (const t of (!room._fused && room.terrains ? room.terrains : [])) {
+    // lower side, and the (sky) ceiling carries over unchanged. A terrain
+    // NESTED inside another terrain (e.g. Designer ziggurat tiers) is
+    // enclosed by the smallest containing terrain's sector, not the room
+    // floor — otherwise its border would claim the wrong outside sector
+    // and break the loop topology.
+    const roomTerrains = !room._fused && room.terrains ? room.terrains : [];
+    for (const t of roomTerrains) {
+      let enclosing = room.outerId, enclosingArea = Infinity;
+      for (const o of roomTerrains) {
+        if (o === t) continue;
+        const contains = (t.cx - t.hw) >= (o.cx - o.hw) && (t.cx + t.hw) <= (o.cx + o.hw) &&
+                         (t.cy - t.hh) >= (o.cy - o.hh) && (t.cy + t.hh) <= (o.cy + o.hh);
+        const area = o.hw * o.hh;
+        // Strictly larger only — identical twins are user error, not nesting.
+        if (contains && area > t.hw * t.hh && area < enclosingArea) {
+          enclosing = o.secId; enclosingArea = area;
+        }
+      }
       const poly = squarePoly(t.cx, t.cy, t.hw * 2, t.hh * 2);
       for (let j = 0; j < poly.length; j++) {
         const q1 = poly[j], q2 = poly[(j + 1) % poly.length];
-        emitWall(q1.x, q1.y, q2.x, q2.y, room.outerId, t.secId);
+        emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, t.secId);
       }
     }
     // Courtyard compound — each building is a SOLID skyline structure built
@@ -2876,13 +2935,27 @@ function _generateDungeonOnce(opts) {
           emitWall(q1.x, q1.y, q2.x, q2.y, cap, roof, { backSide: { lower: b.capTex } });
         }
       }
+      // SKYSCRAPER TIERS — concentric wedding-cake setbacks rising from the
+      // roof centre. Each ring sits between the previous tier (outside) and
+      // the next (inside); the facade texture continues up the risers.
+      let topTierSec = roof;
+      for (const tr of (b.tiers || [])) {
+        const tp = squarePoly(bx, by, tr.half * 2, tr.half * 2);
+        for (let j = 0; j < tp.length; j++) {
+          const q1 = tp[j], q2 = tp[(j + 1) % tp.length];
+          emitWall(q1.x, q1.y, q2.x, q2.y, topTierSec, tr.sec, { frontSide: { lower: b.wall } });
+        }
+        topTierSec = tr.sec;
+      }
       // ROOFTOP UNITS — solid tank / AC / antenna blocks standing on the roof
-      // centre. Towers get a tall thin antenna alongside the main housing.
+      // centre. Towers get a tall thin antenna alongside the main housing; a
+      // skyscraper spire stands on the TOP TIER instead of the roof band.
       for (const u of (b.roofUnits || [])) {
+        const enclosing = u.enc === 'topTier' ? topTierSec : roof;
         const up = squarePoly(u.cx, u.cy, u.half * 2, u.half * 2);
         for (let j = 0; j < up.length; j++) {
           const q1 = up[j], q2 = up[(j + 1) % up.length];
-          emitWall(q1.x, q1.y, q2.x, q2.y, roof, u.sec, { frontSide: { lower: u.tex } });
+          emitWall(q1.x, q1.y, q2.x, q2.y, enclosing, u.sec, { frontSide: { lower: u.tex } });
         }
       }
     }
@@ -5502,6 +5575,55 @@ function RoomDesignerModal({ preset, onCancel, onSave, onDelete }) {
     { dx: 0, dy: 96, hw: 96, hh: 64, dh: 16, kind: 'platform', floorTex: 'FLOOR0_3' }] });
   const updTerr = (i, patch) => updateCS({ terrains: cs.terrains.map((t, k) => k === i ? { ...t, ...patch } : t) });
   const rmTerr = (i) => updateCS({ terrains: cs.terrains.filter((_, k) => k !== i) });
+  // ---- ARCHITECT: parametric pattern generators -------------------------
+  // Mathematically even placements derived from the current room size, all
+  // snapped to the 32 grid so they ride the same fusion / rasterize paths.
+  const minDim = draft.type === 'square'
+    ? Math.min(draft.w || 768, draft.h || 768) : 2 * (draft.r || 384);
+  const sn32 = v => Math.round(v / 32) * 32;
+  const genRing = (n) => {
+    // Even ring at 55% radius — the classic colonnade. Starts at "12
+    // o'clock" so even counts read symmetric across both axes.
+    const R = sn32(minDim / 2 * 0.55);
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = (Math.PI * 2 * i) / n - Math.PI / 2;
+      pts.push({ dx: sn32(Math.cos(a) * R), dy: sn32(Math.sin(a) * R),
+        radius: 24, top: 0, tex: 'SUPPORT2' });
+    }
+    updateCS({ pillars: [...cs.pillars, ...pts] });
+  };
+  const genGrid = (n) => {
+    // n x n even grid spanning the middle 60% of the room.
+    const span = sn32(minDim * 0.6 / Math.max(1, n - 1));
+    const mid = (n - 1) / 2;
+    const pts = [];
+    for (let gy = 0; gy < n; gy++) for (let gx = 0; gx < n; gx++) {
+      pts.push({ dx: sn32((gx - mid) * span), dy: sn32((gy - mid) * span),
+        radius: 24, top: 0, tex: 'SUPPORT2' });
+    }
+    updateCS({ pillars: [...cs.pillars, ...pts] });
+  };
+  const genQuadPits = () => {
+    // Four mirrored pits on the diagonals — 4-fold symmetry.
+    const off = sn32(minDim * 0.27);
+    const ts = [[-1, -1], [1, -1], [-1, 1], [1, 1]].map(([sx, sy]) => (
+      { dx: sx * off, dy: sy * off, hw: 64, hh: 64, dh: -24, kind: 'pit',
+        floorTex: 'FWATER1', special: 0 }));
+    updateCS({ terrains: [...cs.terrains, ...ts] });
+  };
+  const genTiers = () => {
+    // Concentric stepped platforms — a central ziggurat-like rise.
+    const ts = [];
+    let half = sn32(minDim * 0.3), dh = 16;
+    while (half >= 96) {
+      ts.push({ dx: 0, dy: 0, hw: half, hh: half, dh, kind: 'platform',
+        floorTex: 'FLOOR0_3' });
+      half = sn32(half - 96); dh += 16;
+    }
+    updateCS({ terrains: [...cs.terrains, ...ts] });
+  };
+  const clearAll = () => updateCS({ pillars: [], terrains: [] });
   const labelStyle = { fontSize: 10, color: COLORS.textDim, fontFamily: monoStack, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 2, display: 'block' };
   const inputStyle = { background: COLORS.bg, color: COLORS.text, border: '1px solid ' + COLORS.border,
     borderRadius: 3, padding: '4px 6px', fontFamily: monoStack, fontSize: 11, width: 80 };
@@ -5521,6 +5643,57 @@ function RoomDesignerModal({ preset, onCancel, onSave, onDelete }) {
             background: COLORS.bg, border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>CANCEL</button>
         </div>
         <div style={{ flex: 1, overflowY: 'auto', paddingRight: 4 }}>
+          {(() => {
+            // ---- Live top-down preview -------------------------------
+            // Room outline + pillars (circles) + pits/platforms (rects),
+            // scaled to fit. SVG y points down, Doom y points up — flip.
+            const pw = draft.type === 'square' ? (draft.w || 768) : 2 * (draft.r || 384);
+            const ph = draft.type === 'square' ? (draft.h || 768) : 2 * (draft.r || 384);
+            const PV = 200;
+            const sc = (PV - 16) / Math.max(pw, ph);
+            let outline;
+            if (draft.type === 'square') {
+              outline = `M ${-pw / 2 * sc} ${-ph / 2 * sc} h ${pw * sc} v ${ph * sc} h ${-pw * sc} Z`;
+            } else {
+              const nS = draft.type === 'octagon' ? 8 : 6;
+              const rr = (draft.r || 384) * sc;
+              const pts = [];
+              for (let i = 0; i < nS; i++) {
+                const a = (draft.type === 'octagon' ? Math.PI / 8 : 0) + i * 2 * Math.PI / nS;
+                pts.push((Math.cos(a) * rr).toFixed(1) + ',' + (Math.sin(a) * rr).toFixed(1));
+              }
+              outline = 'M ' + pts.join(' L ') + ' Z';
+            }
+            return (
+              <div style={{ display: 'flex', gap: 10, marginBottom: 12, alignItems: 'flex-start' }}>
+                <svg width={PV} height={PV} viewBox={`${-PV / 2} ${-PV / 2} ${PV} ${PV}`}
+                  style={{ background: COLORS.bg, border: '1px solid ' + COLORS.border, borderRadius: 4, flexShrink: 0 }}>
+                  <path d={outline} fill="rgba(127,255,212,0.05)" stroke={COLORS.cyan} strokeWidth="1.2" />
+                  {cs.terrains.map((t, i) => (
+                    <rect key={'t' + i} x={(t.dx - t.hw) * sc} y={(-t.dy - t.hh) * sc}
+                      width={2 * t.hw * sc} height={2 * t.hh * sc}
+                      fill={t.dh < 0 ? 'rgba(255,92,92,0.3)' : 'rgba(255,157,61,0.3)'}
+                      stroke={t.dh < 0 ? COLORS.danger : COLORS.amber} strokeWidth="1" />
+                  ))}
+                  {cs.pillars.map((p, i) => (
+                    <circle key={'p' + i} cx={p.dx * sc} cy={-p.dy * sc} r={Math.max(2, p.radius * sc)}
+                      fill={p.top ? 'rgba(255,157,61,0.5)' : 'rgba(197,212,232,0.55)'}
+                      stroke={COLORS.text} strokeWidth="1" />
+                  ))}
+                </svg>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5, flex: 1 }}>
+                  <span style={labelStyle}>Architect</span>
+                  <button onClick={() => genRing(6)} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: '100%' }}>◯ RING ×6</button>
+                  <button onClick={() => genRing(8)} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: '100%' }}>◯ RING ×8</button>
+                  <button onClick={() => genGrid(2)} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: '100%' }}>▦ GRID 2×2</button>
+                  <button onClick={() => genGrid(3)} style={{ ...inputStyle, color: COLORS.cyan, cursor: 'pointer', width: '100%' }}>▦ GRID 3×3</button>
+                  <button onClick={genQuadPits} style={{ ...inputStyle, color: COLORS.amber, cursor: 'pointer', width: '100%' }}>◧ QUAD PITS</button>
+                  <button onClick={genTiers} style={{ ...inputStyle, color: COLORS.amber, cursor: 'pointer', width: '100%' }}>▲ ZIGGURAT</button>
+                  <button onClick={clearAll} style={{ ...inputStyle, color: COLORS.danger, cursor: 'pointer', width: '100%' }}>✕ CLEAR ALL</button>
+                </div>
+              </div>
+            );
+          })()}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
             <div><label style={labelStyle}>Name</label>
               <input value={draft.label} onChange={e => update({ label: e.target.value })}
@@ -6258,7 +6431,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.49</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.50</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -5962,6 +5962,7 @@ function ShapeShifter() {
     try {
       const specs = rooms.map(r => ({
         type: r.type, cx: r.cx, cy: r.cy, w: r.w, h: r.h, r: r.r, feature: r.feature, id: r.id,
+        customSpec: r.customSpec || null,
       }));
       const thingSpecs = thingsList.map(t => ({
         type: t.type, x: t.x, y: t.y, angle: t.angle | 0, flags: t.flags | 7,
@@ -6431,7 +6432,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.50</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.51</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

@@ -1327,7 +1327,7 @@ function _generateDungeonOnce(opts) {
     // basin, a fused depot its crates, etc. Concentric/shell features
     // (centre daises, oculus shafts, trim rings, buildings) still need a
     // clean convex room, so those are stripped to 'none'.
-    const ISLAND_FUSE = new Set(['canal', 'plaza', 'depot', 'bunker', 'courtyard', 'cityblock']);
+    const ISLAND_FUSE = new Set(['canal', 'plaza', 'depot', 'bunker', 'courtyard', 'cityblock', 'custom']);
     for (const g of fusedGroups) {
       // Equalize FLOOR only — so the player walks between fused rooms with
       // no step. Preserve each room's own height (so kept island features
@@ -3712,15 +3712,18 @@ function _generateDungeonOnce(opts) {
   // -------- 9. Place things --------
   // ShapeShifter override: when the caller supplies userThings (placed by
   // the user before BUILD), use those verbatim instead of auto-generating
-  // monsters, items, and decorations. The exit-post block below still runs
-  // so the user always gets a working exit, even if they didn't place a
-  // P1 start manually we'll insert one at the first room.
+  // monsters, items, and decorations. EXIT_PILLAR_TYPE (32000) markers are
+  // stripped here — the geometry block above already carved an exit post
+  // at each one, so the marker must not survive to the WAD.
   const userThings = opts && opts.userThings;
+  const EXIT_MARK_T = 32000;
   const things = userThings
-    ? userThings.map((t, i) => ({
-        id: 't' + i, x: t.x | 0, y: t.y | 0,
-        angle: t.angle | 0, type: t.type, flags: t.flags == null ? 7 : t.flags,
-      }))
+    ? userThings
+        .filter(t => t.type !== EXIT_MARK_T)
+        .map((t, i) => ({
+          id: 't' + i, x: t.x | 0, y: t.y | 0,
+          angle: t.angle | 0, type: t.type, flags: t.flags == null ? 7 : t.flags,
+        }))
     : [{ id: 't0', x: rooms[0].cx | 0, y: rooms[0].cy | 0, angle: 90, type: 1, flags: 7 }];
   if (userThings && !things.some(t => t.type === 1)) {
     things.unshift({ id: 'tps', x: rooms[0].cx | 0, y: rooms[0].cy | 0,
@@ -3819,126 +3822,65 @@ function _generateDungeonOnce(opts) {
       }
     }
   });
-  // Exit switch in the room furthest by Manhattan distance from start
-  let exitIdx = 0, exitDist = -1;
-  for (let i = 1; i < rooms.length; i++) {
-    const d = Math.abs(rooms[i].cx - rooms[0].cx) + Math.abs(rooms[i].cy - rooms[0].cy);
-    if (d > exitDist) { exitDist = d; exitIdx = i; }
-  }
-  // Exit switch is a dedicated post — a closed sub-sector inside the exit
-  // room with SW1EXIT painted on its forward face. Player walks up and
-  // presses USE; special 11 ends the level. The post is a slim 64×32 box
-  // (matching SW1EXIT's 64-wide texture) placed near the exit room's centre.
-  // Falls back to wall-painted SW1EXIT if no host sector can accept it.
-  {
-    const exRoom = rooms[exitIdx];
+  // Exit pillars from user-placed EXIT_PILLAR_TYPE markers (32000). Each
+  // marker thing on the canvas turns into a closed 64x32 post with SW1EXIT
+  // painted on its south face and linedef special 11 (S1 End Level) wired
+  // in. Markers themselves are stripped from the things list at the end
+  // of generation so they never reach the WAD. There is no auto-exit and
+  // no auto-secret tagging — the user must place an Exit Pillar to ship
+  // the level, and may opt sectors into "secret" via the Designer if they
+  // want them.
+  const EXIT_MARK = 32000;
+  const exitMarkers = (opts && opts.userThings ? opts.userThings : []).filter(t => t.type === EXIT_MARK);
+  for (const mk of exitMarkers) {
+    // Find the room whose polygon contains this marker. Skip if none.
+    let hostRoomIdx = -1;
+    for (let ri = 0; ri < rooms.length; ri++) {
+      const rr = rooms[ri];
+      const poly = roomPoly(rr);
+      if (pointInPolygon(mk.x, mk.y, poly)) { hostRoomIdx = ri; break; }
+    }
+    if (hostRoomIdx === -1) continue;
+    const exRoom = rooms[hostRoomIdx];
+    // Host sector = innermost trim layer if any (for stepped rooms the post
+    // sits on the centre dais), otherwise the outer floor.
     const hostSecId = (exRoom.trimIds && exRoom.trimIds.length > 0)
-      ? exRoom.trimIds[exRoom.trimIds.length - 1]
-      : exRoom.outerId;
+      ? exRoom.trimIds[exRoom.trimIds.length - 1] : exRoom.outerId;
     const hostSec = sectors.find(s => s.id === hostSecId);
+    if (!hostSec) continue;
     const POST_W = 64, POST_D = 32, POST_H = 64;
-    // Innermost-trim radius defines a safe centre region.
-    const innerHalfW = exRoom.type === 'octagon'
-      ? exRoom.r * 0.383 - TRIM_W * exRoom.trimLayers - 32
-      : exRoom.type === 'hexagon'
-        ? exRoom.r * 0.5 - TRIM_W * exRoom.trimLayers - 32
-        : Math.min(exRoom.w, exRoom.h) / 2 - TRIM_W * exRoom.trimLayers - 32;
-    let posted = false;
-    if (hostSec && innerHalfW >= POST_W / 2 + 16) {
-      // Offset the post off-centre so it doesn't collide with the centre
-      // feature if one exists. Slide along the room's longer axis.
-      const offset = exRoom.feature !== 'none' ? Math.max(0, innerHalfW - POST_W / 2 - 8) : 0;
-      const offX = exRoom.type === 'square' && exRoom.w >= exRoom.h ? offset : 0;
-      const offY = exRoom.type === 'square' && exRoom.w < exRoom.h  ? offset : (exRoom.type !== 'square' ? offset : 0);
-      const pcx = Math.round((exRoom.cx + offX) / 8) * 8;
-      const pcy = Math.round((exRoom.cy + offY) / 8) * 8;
-      const FL = { x: pcx - POST_W / 2, y: pcy - POST_D / 2 };
-      const FR = { x: pcx + POST_W / 2, y: pcy - POST_D / 2 };
-      const BR = { x: pcx + POST_W / 2, y: pcy + POST_D / 2 };
-      const BL = { x: pcx - POST_W / 2, y: pcy + POST_D / 2 };
-      // Allocate the closed post sector. Floor and ceiling both at host's
-      // floor + POST_H so the player can't enter — reads as a solid post.
-      const postSecId = allocSec({
-        floorH: hostSec.floorH + POST_H, ceilH: hostSec.floorH + POST_H,
-        floorTex: exRoom.palette.accent, ceilTex: exRoom.palette.accent,
-        light: Math.min(255, exRoom.light + 32), special: 0,
-      });
-      // Walk CW around the post so host is on the right (front) of each line.
-      // Front (south) face carries SW1EXIT + special 11 — the activator.
-      // The resolve pass already ran, so we paint lower/upper textures
-      // explicitly on all four sides (host has lower floor + higher ceiling
-      // than the closed post sub-sector).
-      const postLines = [
-        emitWall(FL.x, FL.y, FR.x, FR.y, hostSecId, postSecId),
-        emitWall(FR.x, FR.y, BR.x, BR.y, hostSecId, postSecId),
-        emitWall(BR.x, BR.y, BL.x, BL.y, hostSecId, postSecId),
-        emitWall(BL.x, BL.y, FL.x, FL.y, hostSecId, postSecId),
-      ];
-      const postWall = exRoom.palette.wall;
-      const postFloor = hostSec.floorH + POST_H;
-      const hostCeil = hostSec.ceilH;
-      postLines.forEach((pl, idx) => {
-        if (!pl) return;
-        const pfs = sdById(pl.front);
-        if (!pfs) return;
-        pfs.lower = (idx === 0) ? 'SW1EXIT' : postWall;
-        if (hostCeil > postFloor) pfs.upper = postWall;
-        if (idx === 0) pl.special = 11;
-      });
-      posted = true;
-    }
-    if (!posted) {
-      // Fallback: paint SW1EXIT on a wall as before.
-      const candidates = [
-        ...(rooms[exitIdx].trimIds || []).slice().reverse(),
-        rooms[exitIdx].outerId,
-      ];
-      outerLoop: for (const secId of candidates) {
-        for (const l of linedefs) {
-          if (l.back !== -1) continue;
-          const fs = sdMap.get(l.front);
-          if (!fs || fs.sector !== secId) continue;
-          l.special = 11;
-          fs.middle = 'SW1EXIT';
-          break outerLoop;
-        }
-      }
-    }
-  }
-
-  // Secrets — mark 1–2 non-start non-exit rooms with sector special 9 on
-  // their innermost trim layer (or outer if no trim). Doom counts entry
-  // into a secret-marked sector as a "secret found" stat. We avoid the
-  // start room (player would auto-find on spawn) and the exit room
-  // (player's already there for the exit, no surprise).
-  if (rooms.length >= 4) {
-    const candidates = rooms
-      .map((r, i) => ({ r, i }))
-      .filter(({ i }) => i !== 0 && i !== exitIdx);
-    // Shuffle deterministically using the local RNG.
-    for (let i = candidates.length - 1; i > 0; i--) {
-      const j = Math.floor(rand() * (i + 1));
-      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
-    }
-    const numSecrets = 1 + Math.floor(rand() * 2); // 1 or 2
-    for (let k = 0; k < Math.min(numSecrets, candidates.length); k++) {
-      const room = candidates[k].r;
-      const secretSecId = (room.trimIds && room.trimIds.length)
-        ? room.trimIds[room.trimIds.length - 1]
-        : room.outerId;
-      const sec = sectors.find(s => s.id === secretSecId);
-      // Don't clobber an existing special (e.g. flicker/glow) — fall back
-      // to the next layer outward.
-      if (sec && !sec.special) {
-        sec.special = 9; // Doom "secret" sector special
-      } else {
-        const allCandidates = [...(room.trimIds || []), room.outerId];
-        for (const sid of allCandidates) {
-          const s = sectors.find(x => x.id === sid);
-          if (s && !s.special) { s.special = 9; break; }
-        }
-      }
-    }
+    // Snap the post's centre to the 8-grid (SW1EXIT alignment), and offset
+    // so the marker thing sits on the SOUTH face the player will press.
+    const pcx = Math.round(mk.x / 8) * 8;
+    const pcy = Math.round((mk.y + POST_D / 2) / 8) * 8;
+    const FL = { x: pcx - POST_W / 2, y: pcy - POST_D / 2 };
+    const FR = { x: pcx + POST_W / 2, y: pcy - POST_D / 2 };
+    const BR = { x: pcx + POST_W / 2, y: pcy + POST_D / 2 };
+    const BL = { x: pcx - POST_W / 2, y: pcy + POST_D / 2 };
+    const postSecId = allocSec({
+      floorH: hostSec.floorH + POST_H, ceilH: hostSec.floorH + POST_H,
+      floorTex: exRoom.palette.accent, ceilTex: exRoom.palette.accent,
+      light: Math.min(255, exRoom.light + 32), special: 0,
+    });
+    // CW walk so the host (lower / open) is on the right of each line.
+    // South face (index 0) carries SW1EXIT + linedef special 11.
+    const postLines = [
+      emitWall(FL.x, FL.y, FR.x, FR.y, hostSecId, postSecId),
+      emitWall(FR.x, FR.y, BR.x, BR.y, hostSecId, postSecId),
+      emitWall(BR.x, BR.y, BL.x, BL.y, hostSecId, postSecId),
+      emitWall(BL.x, BL.y, FL.x, FL.y, hostSecId, postSecId),
+    ];
+    const postWall = exRoom.palette.wall;
+    const postFloor = hostSec.floorH + POST_H;
+    const hostCeil = hostSec.ceilH;
+    postLines.forEach((pl, idx) => {
+      if (!pl) return;
+      const pfs = sdById(pl.front);
+      if (!pfs) return;
+      pfs.lower = (idx === 0) ? 'SW1EXIT' : postWall;
+      if (hostCeil > postFloor) pfs.upper = postWall;
+      if (idx === 0) pl.special = 11;
+    });
   }
 
   // Fragment cleanup safety net. Even after V0.47's "skip rasterization if
@@ -5321,11 +5263,17 @@ function shapeShifterRoomPolygon(r) {
 // Touch-friendly thing palette for ShapeShifter's THINGS stage. Each
 // entry: type (Doom thing ID), label, and a marker colour. Categories are
 // the top-level tabs.
+// Internal marker thing type for the user-placed Exit Pillar. Outside
+// Doom's normal range so it can't collide with any real thing; the build
+// generator carves an SW1EXIT-faced exit post at each marker position
+// and strips the markers before WAD export.
+const EXIT_PILLAR_TYPE = 32000;
 const SHAPESHIFTER_THINGS = {
   PLAYER: [
     { type: 1,  label: 'P1 Start',  color: '#7fffd4' },
     { type: 11, label: 'DM Start',  color: '#7fff7f' },
     { type: 14, label: 'Teleport',  color: '#9966ff' },
+    { type: EXIT_PILLAR_TYPE, label: 'Exit Pillar', color: '#ff9d3d' },
   ],
   MONSTER: [
     { type: 3004, label: 'Zombie',     color: '#a08070' },
@@ -5844,6 +5792,7 @@ function ShapeShifter() {
   const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
   const [needP1Confirm, setNeedP1Confirm] = useState(false);
+  const [needExitConfirm, setNeedExitConfirm] = useState(false);
   // Modal "Working…" overlay shown during long-running synchronous work
   // (BUILD) so the app doesn't look frozen while JS blocks the main thread.
   const [busy, setBusy] = useState(null);
@@ -5943,15 +5892,24 @@ function ShapeShifter() {
 
   const build = async () => {
     if (rooms.length < 1) { setHint('Place at least one room first.'); return; }
-    // Warn (once) if no Player 1 start was placed. Tap BUILD again to
-    // auto-place one at the first room.
+    // Warn ONCE per missing-essentials category before the real build.
+    // Both confirms are cleared together at the bottom, so the user
+    // never gets two warnings then a build that re-warns about the
+    // first thing.
     const hasP1 = thingsList.some(t => t.type === 1);
     if (!hasP1 && !needP1Confirm) {
       setNeedP1Confirm(true);
       setHint('⚠ No Player 1 start placed. Add one in THINGS, or tap BUILD again to auto-place it at the first room.');
       return;
     }
+    const hasExit = thingsList.some(t => t.type === EXIT_PILLAR_TYPE);
+    if (!hasExit && !needExitConfirm) {
+      setNeedExitConfirm(true);
+      setHint('⚠ No Exit Pillar placed. Add one in THINGS (player category) for a working exit, or tap BUILD again to ship without one.');
+      return;
+    }
     setNeedP1Confirm(false);
+    setNeedExitConfirm(false);
     // Show the "Working…" overlay and wait two frames so React commits the
     // overlay into the DOM before the synchronous generator blocks the main
     // thread — otherwise the dim/spinner never paints and the app reads as
@@ -6432,7 +6390,7 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.51</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.52</span>
         </div>
         <div className="flex gap-1.5">
           {!previewMap && (

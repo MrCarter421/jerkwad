@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo, useReducer } from 'react';
 
 // ============================================================================
 // CONSTANTS
@@ -5751,7 +5751,7 @@ function RoomDesignerModal({ preset, onCancel, onSave, onDelete }) {
   );
 }
 
-function ShapeShifter() {
+function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
   const [rooms, setRooms] = useState([]);
   const [connections, setConnections] = useState([]); // [{ id, fromId, toId, valid }]
   const [thingsList, setThingsList] = useState([]);   // user-placed things (pre-build)
@@ -5789,6 +5789,21 @@ function ShapeShifter() {
   // Room Designer modal — open / null. When opening to edit, pre-fill with
   // the existing preset; otherwise start blank.
   const [designerPreset, setDesignerPreset] = useState(null);
+
+  // Handoff from EtherWad: accept the generated rooms / connections / things
+  // verbatim, then clear the handoff so a return-trip to EtherWad followed by
+  // a switch back to ShapeShifter doesn't re-stamp the stale set.
+  useEffect(() => {
+    if (!handoff) return;
+    setRooms(handoff.rooms || []);
+    setConnections(handoff.connections || []);
+    setThingsList(handoff.things || []);
+    setPreviewMap(null);
+    setSelectedId(null);
+    setSelectedThingId(null);
+    setHint('Loaded EtherWad level — tap BUILD to compile, or keep editing.');
+    if (onClearHandoff) onClearHandoff();
+  }, [handoff]);
   const [hint, setHint] = useState('PLACE rooms, then CONNECT them, then drop THINGS, then BUILD.');
   const [previewMap, setPreviewMap] = useState(null);
   const [needP1Confirm, setNeedP1Confirm] = useState(false);
@@ -6390,9 +6405,17 @@ function ShapeShifter() {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.52</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.53</span>
         </div>
         <div className="flex gap-1.5">
+          {onOpenEther && !previewMap && (
+            <button onClick={onOpenEther}
+              style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
+                       background: COLORS.bgPanel, color: '#9966ff',
+                       border: '1px solid #9966ff', borderRadius: 4 }}>
+              ETHER
+            </button>
+          )}
           {!previewMap && (
             <button onClick={build} disabled={rooms.length < 1}
               style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
@@ -6576,12 +6599,359 @@ function ShapeShifter() {
 }
 
 // ============================================================================
-// APP ROOT — ShapeShifter is the whole app now. WadEditor exists for the
-// JerkWad fork on its own branch; here it's only referenced so the build
-// pipeline regex can still find an export-default.
+// ETHERWAD — automated quantum-random level generator on top of the
+// ShapeShifter engine. Pulls entropy from a free online QRNG (random.org's
+// atmospheric-noise generator), picks rooms from the SHAPESHIFTER_PRESETS
+// pool + the user's Designer-saved customs, places them in overlapping
+// fused arrangements, drops the Player 1 start and the Exit Pillar at
+// opposite extremes of the map, and scatters monsters whose mix depends
+// on the chosen difficulty. The "Edit in ShapeShifter" button hands the
+// generated rooms / connections / things off to the editor verbatim.
+// ============================================================================
+
+// Free QRNG — random.org plain integers (atmospheric noise, public). CORS
+// allowed. We fetch a bucket of bytes and feed them into a Mulberry32 PRNG
+// seed so a single generator pass uses a deterministic stream from the
+// quantum-seeded root. Network failures silently fall back to Math.random.
+const ETHER_ENDPOINT = 'https://www.random.org/integers/?num=1000&min=0&max=255&col=1&base=10&format=plain&rnd=new';
+function makeEtherSource() {
+  let bucket = [];
+  let cursor = 0;
+  let status = 'idle'; // 'idle' | 'fetching' | 'ok' | 'error'
+  let lastErr = '';
+  let lastSize = 0;
+  const listeners = new Set();
+  const notify = () => listeners.forEach(fn => fn());
+  async function refill() {
+    status = 'fetching'; notify();
+    try {
+      const res = await fetch(ETHER_ENDPOINT, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const txt = await res.text();
+      const nums = txt.trim().split(/\s+/).map(Number).filter(n => Number.isFinite(n) && n >= 0 && n <= 255);
+      if (nums.length < 100) throw new Error('too few bytes (' + nums.length + ')');
+      bucket = nums; cursor = 0; lastSize = nums.length; status = 'ok'; lastErr = '';
+    } catch (e) { status = 'error'; lastErr = String(e.message || e).slice(0, 80); }
+    notify();
+  }
+  function rand() {
+    if (cursor + 4 > bucket.length) return Math.random();
+    const a = bucket[cursor++], b = bucket[cursor++], c = bucket[cursor++], d = bucket[cursor++];
+    const v = (a << 24) | (b << 16) | (c << 8) | d;
+    return (v >>> 0) / 0xFFFFFFFF;
+  }
+  function makeRng() {
+    let s = ((rand() * 0xFFFFFFFF) | 0) || 0xDEADBEEF;
+    return function () {
+      s = (s + 0x6D2B79F5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = t + Math.imul(t ^ (t >>> 7), 61 | t) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function info() { return { status, lastErr, remaining: Math.max(0, bucket.length - cursor), lastSize }; }
+  function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
+  return { refill, rand, makeRng, info, subscribe };
+}
+
+// Difficulty -> monster pool. Realistic + playable: easy is mostly hitscanner
+// fodder + imps, medium adds chaingunners + pinkies + cacos, hard layers in
+// hell knights + revenants + mancubi + arachnotrons, nightmare unleashes the
+// barons / archviles / pain elementals / cyber for the boss-tier maps.
+const ETHER_MONSTERS = {
+  easy:      [3004, 3004, 3004, 9, 9, 3001, 3001],
+  medium:    [3004, 9, 3001, 3001, 3002, 65, 3005, 3006],
+  hard:      [3001, 3002, 3005, 3006, 65, 69, 3003, 71, 67, 68, 66],
+  nightmare: [3005, 3006, 3003, 64, 71, 67, 68, 16, 69, 66, 3003],
+};
+// Sprinkle of light ammo/health so easy/medium aren't a death march.
+const ETHER_GOODIES = [2007, 2008, 2008, 2011, 2011, 2012, 2014, 2015, 8];
+
+// Place N rooms in an organic, overlapping arrangement growing out from an
+// anchor. ~45% of new rooms fuse with the anchor (close placement, no
+// corridor) for the ShapeShifter wedding-cake compositions; the rest are
+// connected by corridors. Rooms are picked from the preset + custom pool.
+function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, existing }) {
+  const sn32 = v => Math.round(v / 32) * 32;
+  const sizeOf = r => r.type === 'square' ? Math.max(r.w | 0, r.h | 0) : 2 * (r.r | 0);
+  const rooms = existing && existing.rooms ? existing.rooms.map(r => ({ ...r })) : [];
+  const connections = existing && existing.connections ? [...existing.connections] : [];
+  let nextN = 1 + rooms.length;
+  for (let i = 0; i < roomCount; i++) {
+    const p = presets[Math.floor(rng() * presets.length)];
+    const id = 'ew' + (nextN++);
+    const room = { ...p, id, cx: 0, cy: 0 };
+    if (rooms.length === 0) {
+      room.cx = 0; room.cy = 0;
+    } else {
+      // Pick an anchor — bias toward the most-recently-placed half so the
+      // level grows outward instead of clustering on the origin.
+      const pool = rooms.slice(Math.max(0, rooms.length - 6));
+      const anchor = pool[Math.floor(rng() * pool.length)];
+      const angle = rng() * Math.PI * 2;
+      const fuse = rng() < 0.45;
+      const span = (sizeOf(anchor) + sizeOf(room)) / 2;
+      const d = sn32(span * (fuse ? 0.65 + rng() * 0.2 : 1.15 + rng() * 0.25));
+      room.cx = sn32(anchor.cx + Math.cos(angle) * d);
+      room.cy = sn32(anchor.cy + Math.sin(angle) * d);
+      if (!fuse) connections.push({ id: 'ewc' + i + '_' + nextN, fromId: anchor.id, toId: id, kind: 'corridor' });
+    }
+    rooms.push(room);
+  }
+  // Smart things: P1 in the NW-most room, Exit Pillar in the SE-most room
+  // (opposite extremes by anti-diagonal score). Then scatter monsters across
+  // every other room proportional to area; sprinkle in a few goodies.
+  const things = existing && existing.things
+    ? existing.things.filter(t => t.type !== 1 && t.type !== 32000) : [];
+  let nw = rooms[0], se = rooms[0];
+  for (const r of rooms) {
+    if (r.cx - r.cy < nw.cx - nw.cy) nw = r;
+    if (r.cx - r.cy > se.cx - se.cy) se = r;
+  }
+  if (nw === se && rooms.length > 1) se = rooms[rooms.length - 1];
+  things.push({ type: 1, x: nw.cx, y: nw.cy, angle: 0, flags: 7 });
+  things.push({ type: 32000, x: se.cx, y: se.cy, angle: 0, flags: 7 });
+  const mPool = ETHER_MONSTERS[difficulty] || ETHER_MONSTERS.medium;
+  const totalArea = rooms.reduce((s, r) => s + sizeOf(r) * sizeOf(r), 0) || 1;
+  for (const r of rooms) {
+    if (r === nw) continue; // spawn room stays safe
+    const ratio = (sizeOf(r) * sizeOf(r)) / totalArea;
+    const n = Math.max(0, Math.round(enemyCount * ratio));
+    const sz = sizeOf(r);
+    for (let k = 0; k < n; k++) {
+      const ox = (rng() - 0.5) * sz * 0.55;
+      const oy = (rng() - 0.5) * sz * 0.55;
+      things.push({ type: mPool[Math.floor(rng() * mPool.length)],
+        x: sn32(r.cx + ox), y: sn32(r.cy + oy), angle: 0, flags: 7 });
+    }
+    // ~1 goodie per 6 monsters, biased to ammo + small health.
+    const goodies = Math.max(0, Math.round(n / 6));
+    for (let k = 0; k < goodies; k++) {
+      const ox = (rng() - 0.5) * sz * 0.5;
+      const oy = (rng() - 0.5) * sz * 0.5;
+      things.push({ type: ETHER_GOODIES[Math.floor(rng() * ETHER_GOODIES.length)],
+        x: sn32(r.cx + ox), y: sn32(r.cy + oy), angle: 0, flags: 7 });
+    }
+  }
+  return { rooms, connections, things };
+}
+
+function EtherWad({ onEditInShapeShifter, onBack, customPresets }) {
+  const [roomCount, setRoomCount] = useState(6);
+  const [enemyCount, setEnemyCount] = useState(40);
+  const [difficulty, setDifficulty] = useState('medium');
+  const [busy, setBusy] = useState(null);
+  const [generated, setGenerated] = useState(null);
+  const etherRef = useRef(null);
+  if (!etherRef.current) etherRef.current = makeEtherSource();
+  const ether = etherRef.current;
+  const [, force] = useReducer(x => x + 1, 0);
+  useEffect(() => {
+    const unsub = ether.subscribe(force);
+    ether.refill();
+    return unsub;
+  }, []);
+  const generate = async (mode) => {
+    setBusy(mode === 'add' ? 'Drawing more entropy…' : 'Drawing quantum entropy…');
+    await new Promise(r => requestAnimationFrame(r));
+    await new Promise(r => requestAnimationFrame(r));
+    try {
+      if (ether.info().remaining < 200) await ether.refill();
+      const rng = ether.makeRng();
+      const presets = [...SHAPESHIFTER_PRESETS, ...customPresets];
+      const out = etherGenerateLevel({
+        rng, presets, roomCount, enemyCount, difficulty,
+        existing: mode === 'add' ? generated : null,
+      });
+      setGenerated(out);
+    } finally { setBusy(null); }
+  };
+  const info = ether.info();
+  const labelStyle = { fontSize: 10, color: COLORS.textDim, fontFamily: monoStack,
+    textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 2, display: 'block' };
+  const inputStyle = { background: COLORS.bg, color: COLORS.text, border: '1px solid ' + COLORS.border,
+    borderRadius: 3, padding: '4px 6px', fontFamily: monoStack, fontSize: 12, width: '100%' };
+  // Preview: render every room outline + thing dot in a centred SVG, scaled
+  // to fit. Player = cyan, Exit = amber, monsters = red, goodies = green.
+  const preview = (() => {
+    if (!generated) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const r of generated.rooms) {
+      const half = (r.type === 'square' ? Math.max(r.w, r.h) : 2 * r.r) / 2;
+      minX = Math.min(minX, r.cx - half); maxX = Math.max(maxX, r.cx + half);
+      minY = Math.min(minY, r.cy - half); maxY = Math.max(maxY, r.cy + half);
+    }
+    const w = maxX - minX, h = maxY - minY;
+    const PV = 380, PAD = 12;
+    const sc = (PV - PAD * 2) / Math.max(w, h);
+    return { sc, minX, minY, w, h, PV, PAD };
+  })();
+  return (
+    <div className="w-full h-screen flex flex-col overflow-hidden select-none"
+      style={{ background: COLORS.bg, color: COLORS.text, fontFamily: fontStack, touchAction: 'none' }}>
+      {busy ? (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,0.55)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}>
+          <div style={{ padding: '18px 28px', background: COLORS.bgPanel,
+            border: '1px solid ' + COLORS.border, borderRadius: 4, textAlign: 'center', minWidth: 220 }}>
+            <div style={{ fontSize: 22, marginBottom: 6 }}>{busy}</div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>QRNG entropy + ShapeShifter engine.</div>
+          </div>
+        </div>
+      ) : null}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '6px 8px', borderBottom: '1px solid ' + COLORS.border, background: COLORS.bgPanel,
+        paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
+        <div style={{ color: '#9966ff', fontWeight: 700, letterSpacing: '0.18em', fontSize: 13 }}>
+          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.53</span>
+        </div>
+        <button onClick={onBack}
+          style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
+            background: COLORS.bgPanel, color: COLORS.cyan, border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>
+          SHAPESHIFTER
+        </button>
+      </div>
+      <div style={{ overflowY: 'auto', padding: 16, flex: 1 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, maxWidth: 640, marginBottom: 14 }}>
+          <div><label style={labelStyle}>Rooms: {roomCount}</label>
+            <input type="range" min="3" max="14" step="1" value={roomCount}
+              onChange={e => setRoomCount(+e.target.value)} style={{ width: '100%' }} /></div>
+          <div><label style={labelStyle}>Enemies: {enemyCount}</label>
+            <input type="range" min="0" max="200" step="2" value={enemyCount}
+              onChange={e => setEnemyCount(+e.target.value)} style={{ width: '100%' }} /></div>
+          <div><label style={labelStyle}>Difficulty</label>
+            <select value={difficulty} onChange={e => setDifficulty(e.target.value)} style={inputStyle}>
+              <option value="easy">Easy (zombies + imps)</option>
+              <option value="medium">Medium (+ chaingunners, pinkies, cacos)</option>
+              <option value="hard">Hard (+ knights, revenants, mancubi)</option>
+              <option value="nightmare">Nightmare (barons, archviles, cyber)</option>
+            </select></div>
+          <div><label style={labelStyle}>Quantum entropy</label>
+            <div style={{ ...inputStyle, color: info.status === 'ok' ? COLORS.cyan : info.status === 'error' ? COLORS.danger : COLORS.amber }}>
+              {info.status === 'ok' ? '✓ ' + info.remaining + '/' + info.lastSize + ' bytes'
+                : info.status === 'fetching' ? '⋯ fetching from random.org'
+                : info.status === 'error' ? '⚠ ' + info.lastErr + ' (Math.random fallback)'
+                : 'idle'}
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 14, flexWrap: 'wrap' }}>
+          <button onClick={() => generate('fresh')}
+            style={{ padding: '10px 16px', fontSize: 12, fontWeight: 700, letterSpacing: '0.12em',
+              background: '#9966ff', color: COLORS.bg, border: '1px solid #9966ff', borderRadius: 4 }}>
+            ⚛ GENERATE LEVEL
+          </button>
+          <button onClick={() => generate('add')} disabled={!generated}
+            style={{ padding: '10px 16px', fontSize: 12, fontWeight: 700, letterSpacing: '0.12em',
+              background: generated ? COLORS.bgPanel : COLORS.bgPanel,
+              color: generated ? COLORS.amber : COLORS.textDim,
+              border: '1px solid ' + (generated ? COLORS.amber : COLORS.border), borderRadius: 4 }}>
+            + ADD AREAS
+          </button>
+          <button onClick={() => ether.refill()} disabled={info.status === 'fetching'}
+            style={{ padding: '10px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
+              background: COLORS.bgPanel, color: COLORS.cyan, border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>
+            ⤴ REFILL ENTROPY
+          </button>
+          <button onClick={() => generated && onEditInShapeShifter(generated)} disabled={!generated}
+            style={{ padding: '10px 16px', fontSize: 12, fontWeight: 700, letterSpacing: '0.12em', marginLeft: 'auto',
+              background: generated ? COLORS.amber : COLORS.bgPanel,
+              color: generated ? COLORS.bg : COLORS.textDim,
+              border: '1px solid ' + (generated ? COLORS.amber : COLORS.border), borderRadius: 4 }}>
+            EDIT IN SHAPESHIFTER →
+          </button>
+        </div>
+        {generated && preview ? (
+          <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+            <svg width={preview.PV} height={preview.PV}
+              viewBox={`${preview.minX - preview.PAD / preview.sc} ${-preview.minY - preview.h - preview.PAD / preview.sc} ${preview.w + 2 * preview.PAD / preview.sc} ${preview.h + 2 * preview.PAD / preview.sc}`}
+              style={{ background: COLORS.bg, border: '1px solid ' + COLORS.border, borderRadius: 4 }}>
+              {generated.rooms.map((r) => {
+                const half = (r.type === 'square' ? Math.max(r.w, r.h) : 2 * r.r) / 2;
+                if (r.type === 'square') {
+                  return <rect key={r.id} x={r.cx - r.w / 2} y={-(r.cy + r.h / 2)} width={r.w} height={r.h}
+                    fill="rgba(127,255,212,0.08)" stroke={COLORS.cyan} strokeWidth={32 / preview.sc} />;
+                }
+                const pts = [];
+                const sides = r.type === 'octagon' ? 8 : 6;
+                for (let i = 0; i < sides; i++) {
+                  const a = (r.type === 'octagon' ? Math.PI / 8 : 0) + i * 2 * Math.PI / sides;
+                  pts.push((r.cx + Math.cos(a) * r.r).toFixed(0) + ',' + (-(r.cy + Math.sin(a) * r.r)).toFixed(0));
+                }
+                return <polygon key={r.id} points={pts.join(' ')} fill="rgba(127,255,212,0.08)"
+                  stroke={COLORS.cyan} strokeWidth={32 / preview.sc} />;
+              })}
+              {generated.connections.map((c, i) => {
+                const a = generated.rooms.find(r => r.id === c.fromId);
+                const b = generated.rooms.find(r => r.id === c.toId);
+                if (!a || !b) return null;
+                return <line key={'c' + i} x1={a.cx} y1={-a.cy} x2={b.cx} y2={-b.cy}
+                  stroke={COLORS.amber} strokeWidth={48 / preview.sc} strokeDasharray={`${128 / preview.sc} ${64 / preview.sc}`} opacity="0.5" />;
+              })}
+              {generated.things.map((t, i) => {
+                const isP1 = t.type === 1, isExit = t.type === 32000;
+                const isGood = ETHER_GOODIES.includes(t.type);
+                const r = (isP1 || isExit) ? 120 / preview.sc * 32 / 32 : 60 / preview.sc * 32 / 32;
+                const fill = isP1 ? COLORS.cyan : isExit ? COLORS.amber : isGood ? '#7fff7f' : COLORS.danger;
+                return <circle key={'t' + i} cx={t.x} cy={-t.y} r={r * 2} fill={fill} opacity={isP1 || isExit ? 1 : 0.7} />;
+              })}
+            </svg>
+            <div style={{ fontFamily: monoStack, fontSize: 12, lineHeight: 1.7, minWidth: 200 }}>
+              <div><span style={{ color: COLORS.textDim }}>rooms:</span> {generated.rooms.length}</div>
+              <div><span style={{ color: COLORS.textDim }}>corridors:</span> {generated.connections.length}</div>
+              <div><span style={{ color: COLORS.textDim }}>monsters:</span> {generated.things.filter(t => t.type !== 1 && t.type !== 32000 && !ETHER_GOODIES.includes(t.type)).length}</div>
+              <div><span style={{ color: COLORS.textDim }}>goodies:</span> {generated.things.filter(t => ETHER_GOODIES.includes(t.type)).length}</div>
+              <div><span style={{ color: COLORS.cyan }}>● P1</span> <span style={{ color: COLORS.textDim }}>spawn (NW)</span></div>
+              <div><span style={{ color: COLORS.amber }}>● Exit</span> <span style={{ color: COLORS.textDim }}>pillar (SE)</span></div>
+              <div style={{ marginTop: 8, color: COLORS.textDim, fontSize: 10 }}>
+                Tap <span style={{ color: COLORS.amber }}>EDIT IN SHAPESHIFTER</span> to refine the layout and BUILD a WAD.
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ color: COLORS.textDim, fontSize: 13, marginTop: 24 }}>
+            Adjust the dials, then tap <span style={{ color: '#9966ff' }}>GENERATE LEVEL</span> to draw fresh
+            quantum entropy and build an overlapping multi-room composition. Tap <span style={{ color: COLORS.amber }}>+ ADD AREAS</span>
+            to extend the current map; tap <span style={{ color: COLORS.amber }}>EDIT IN SHAPESHIFTER</span> to hand off to the editor.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function JerkwadRoot() {
+  const [view, setView] = useState('shapeshifter');
+  const [handoff, setHandoff] = useState(null);
+  const [customPresets, setCustomPresets] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('ssCustomPresets') || '[]'); }
+    catch (e) { return []; }
+  });
+  useEffect(() => {
+    const sync = () => {
+      try { setCustomPresets(JSON.parse(localStorage.getItem('ssCustomPresets') || '[]')); }
+      catch (e) {}
+    };
+    window.addEventListener('storage', sync);
+    return () => window.removeEventListener('storage', sync);
+  }, []);
+  if (view === 'ether') {
+    return <EtherWad customPresets={customPresets}
+      onBack={() => setView('shapeshifter')}
+      onEditInShapeShifter={(data) => { setHandoff(data); setView('shapeshifter'); }} />;
+  }
+  return <ShapeShifter handoff={handoff}
+    onClearHandoff={() => setHandoff(null)}
+    onOpenEther={() => { setHandoff(null); setView('ether'); }} />;
+}
+
+// ============================================================================
+// APP ROOT — JerkwadRoot routes between the ShapeShifter editor and the new
+// EtherWad generator. WadEditor exists for legacy compatibility — referenced
+// here so the build-pipeline regex can still find an export-default.
 // ============================================================================
 export default function ShapeShifterApp() {
-  return <ShapeShifter/>;
+  return <JerkwadRoot/>;
 }
 
 // ============================================================================

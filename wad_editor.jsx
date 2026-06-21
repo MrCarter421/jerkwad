@@ -748,6 +748,9 @@ const SHAPESHIFTER_PRESETS = [
   { id: 'bunker',      label: 'Bunker',       type: 'square',  w: 512, h: 512,   feature: 'bunker' },
   { id: 'cityblock',   label: 'City Block',   type: 'square',  w: 1408, h: 1408, feature: 'cityblock' },
   { id: 'terrain',     label: 'Terrain',      type: 'octagon', r: 768,          feature: 'terrain' },
+  { id: 'catacombs',   label: 'Catacombs',    type: 'square',  w: 768, h: 768,   feature: 'catacombs' },
+  { id: 'library',     label: 'Library',      type: 'square',  w: 896, h: 512,   feature: 'library' },
+  { id: 'chasm',       label: 'Chasm',        type: 'square',  w: 1024, h: 1024, feature: 'chasm' },
 ];
 function _generateDungeonOnce(opts) {
   // ShapeShifter passes opts.rooms with user-placed rooms (type/cx/cy/size/
@@ -1237,6 +1240,35 @@ function _generateDungeonOnce(opts) {
     if (r.feature === 'lift') {
       r.ceilH = Math.max(r.ceilH, r.floorH + 192);
     }
+    // Catacombs — dim low-ceiling tomb chamber with a regular grid of
+    // burial columns. Marble + stone palette, no sky.
+    if (r.feature === 'catacombs') {
+      r.ceilH = r.floorH + 128;
+      r.light = pick([96, 112, 128]);
+      r.palette = { ...r.palette, ceil: 'CEIL3_3', floor: pick(['FLAT5_4', 'FLOOR0_1', 'FLAT1']),
+        wall: pick(['MARBLE2', 'MARBLE3', 'STONE2', 'GSTONE1']),
+        trim: 'MARBFAC2', accent: 'GSTGARG' };
+    }
+    // Library — long rectangular hall with parallel rows of tall pillars
+    // ("bookshelves"). Wood-stone palette, intermediate ceiling.
+    if (r.feature === 'library') {
+      r.ceilH = r.floorH + 168;
+      r.light = pick([144, 160, 176]);
+      r.palette = { ...r.palette, ceil: pick(['FLAT5_4', 'CEIL5_1']),
+        floor: pick(['FLAT5_4', 'FLOOR0_3', 'FLAT1']),
+        wall: pick(['BROWN1', 'BROWN96', 'WOODMET1', 'PANEL3']),
+        trim: 'WOOD1', accent: 'WOOD3' };
+    }
+    // Chasm — large square room with a deep central pit and two narrow
+    // bridges crossing it (N-S / E-W). Dark stone palette, no sky.
+    if (r.feature === 'chasm') {
+      r.ceilH = r.floorH + 224;
+      r.light = pick([112, 128, 144]);
+      r.palette = { ...r.palette, ceil: pick(['CEIL3_3', 'CEIL5_2']),
+        floor: pick(['FLOOR0_3', 'FLAT5_4', 'GRAY7']),
+        wall: pick(['STONE3', 'STONE2', 'GRAY7', 'BROWN1']),
+        trim: 'STONE', accent: 'METAL' };
+    }
     // City Block — an open-sky urban grid of solid buildings separated by
     // narrow streets the player threads through (DOOMCITY vibe).
     if (r.feature === 'cityblock') {
@@ -1366,7 +1398,7 @@ function _generateDungeonOnce(opts) {
                  : r.type === 'hexagon' ? r.r * 2 * 0.866
                  : Math.min(r.w, r.h);
     const maxTrim = Math.max(0, Math.floor((minDim - 128) / (2 * TRIM_W)));
-    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock' || r.feature === 'custom';
+    const flatYard = r.feature === 'courtyard' || r.feature === 'plaza' || r.feature === 'ziggurat' || r.feature === 'lift' || r.feature === 'depot' || r.feature === 'canal' || r.feature === 'bunker' || r.feature === 'cityblock' || r.feature === 'custom' || r.feature === 'catacombs' || r.feature === 'library' || r.feature === 'chasm';
     if (!r._fused && !flatYard) r.trimLayers = Math.min(1 + Math.floor(rand() * 3), maxTrim);
     else if (flatYard) r.trimLayers = 0;
     // Terrain rooms pack many tightly-spaced rings for the rolling-hills look.
@@ -1732,6 +1764,16 @@ function _generateDungeonOnce(opts) {
           plinthSec: allocSec({ floorH: plinthH, ceilH: r.ceilH,
             floorTex: r.palette.floor, ceilTex: 'F_SKY1',
             light: r.light, special: 0 }),
+          // Bay shelter — a small porch sub-sector occupying the recessed
+          // entrance bay, with a LOW textured ceiling (a "lintel" at exactly
+          // door height + a small head clearance). Carving the bay out of
+          // the plinth caps the door panel to its real 128 texture height
+          // (instead of stretching it to capH) and produces a properly
+          // proportioned overhang above the porch when seen from the court.
+          bayShelterSec: allocSec({ floorH: plinthH, ceilH: plinthH + 128,
+            floorTex: r.palette.floor,
+            ceilTex: pick(['CEIL5_1', 'FLAT5_4', 'TLITE6_4', 'FLAT1']),
+            light: Math.max(96, r.light - 32), special: 0 }),
         };
         // Rooftop units — solid tank/AC/antenna blocks on the recessed roof
         // that rise above the parapet, giving the skyline a stepped urban
@@ -1913,6 +1955,30 @@ function _generateDungeonOnce(opts) {
           floorTex: pick(['CEIL5_2', 'METAL', 'SHAWN2', 'SUPPORT3', 'FLOOR0_3']),
           ceilTex: r.palette.ceil,
           light: Math.min(255, r.light + 16), special: 0 }) });
+    }
+    if (r.feature === 'chasm' && minDim >= 768) {
+      // Chasm — a deep central pit (liquid floor, damaging) crossed by a
+      // single grated walkway on the long axis. The bridge is a non-sunken
+      // strip emitted ON TOP via the V0.50 nested-terrain enclosing logic.
+      const sn = v => Math.round(v / 32) * 32;
+      const pitHalf = sn(minDim * 0.32);
+      const bridgeHalf = 48;
+      const liquid = pick(['LAVA1', 'NUKAGE1', 'BLOOD1']);
+      r.terrains.push({ cx: sn(r.cx), cy: sn(r.cy), hw: pitHalf, hh: pitHalf, kind: 'pit',
+        secId: allocSec({ floorH: r.floorH - 48, ceilH: r.ceilH,
+          floorTex: liquid, ceilTex: r.palette.ceil,
+          light: Math.max(64, r.light - 48), special: liquid === 'LAVA1' ? 5 : 7 }) });
+      // Walkway on the room's longer axis — straddles the pit so the player
+      // crosses it instead of dropping in.
+      const longX = (r.w || 0) >= (r.h || 0);
+      r.terrains.push({
+        cx: sn(r.cx), cy: sn(r.cy),
+        hw: longX ? pitHalf - 16 : bridgeHalf,
+        hh: longX ? bridgeHalf : pitHalf - 16,
+        kind: 'bridge',
+        secId: allocSec({ floorH: r.floorH, ceilH: r.ceilH,
+          floorTex: pick(['CEIL5_2', 'METAL', 'FLOOR0_3', 'SUPPORT3']),
+          ceilTex: r.palette.ceil, light: r.light, special: 0 }) });
     }
     if (r.feature === 'plaza' && minDim >= 640) {
       const sn = v => Math.round(v / 32) * 32;
@@ -2124,6 +2190,37 @@ function _generateDungeonOnce(opts) {
         const dx = longAxisX ? p : 0;
         const dy = longAxisX ? 0 : p;
         r.pillars.push({ cx: r.cx + dx, cy: r.cy + dy, radius: 40 });
+      }
+    } else if (r.feature === 'catacombs') {
+      // Catacombs — a regular GRID of small marble tomb pillars on a 192-step
+      // lattice (3x3 or 5x5 depending on room size). Tight, dim, oppressive.
+      const sn = v => Math.round(v / 32) * 32;
+      const step = sn(minDim / 4);
+      const n = minDim >= 1024 ? 2 : minDim >= 640 ? 2 : 1;
+      for (let gx = -n; gx <= n; gx++) for (let gy = -n; gy <= n; gy++) {
+        r.pillars.push({ cx: sn(r.cx + gx * step), cy: sn(r.cy + gy * step), radius: 28,
+          tex: pick(['MARBFAC2', 'MARBFAC3', 'GSTGARG', 'GSTONE1']) });
+      }
+    } else if (r.feature === 'library' && minDim >= 384) {
+      // Library — TWO parallel rows of tall thin "bookshelf" columns on the
+      // longer axis of the rectangle, leaving a central aisle for the player.
+      const longX = (r.w || 0) >= (r.h || 0);
+      const W = longX ? r.w : r.h;
+      const H = longX ? r.h : r.w;
+      const sn = v => Math.round(v / 32) * 32;
+      const aisle = sn(H * 0.18);   // half-width of the central aisle gap
+      const off = aisle + 24;        // pillar center is just outside the aisle
+      const slots = Math.max(2, Math.floor((W - 192) / 192));
+      const step = sn((W - 256) / slots);
+      const start = -((slots * step) / 2);
+      for (let i = 0; i <= slots; i++) {
+        const along = sn(start + i * step);
+        const dx = longX ? along : off, dy = longX ? off : along;
+        const dx2 = longX ? along : -off, dy2 = longX ? -off : along;
+        r.pillars.push({ cx: sn(r.cx + dx), cy: sn(r.cy + dy), radius: 20,
+          tex: pick(['WOOD1', 'WOOD3', 'PANEL3', 'BROWN1']) });
+        r.pillars.push({ cx: sn(r.cx + dx2), cy: sn(r.cy + dy2), radius: 20,
+          tex: pick(['WOOD1', 'WOOD3', 'PANEL3', 'BROWN1']) });
       }
     } else if (r.feature === 'cathedral' && minDim >= 512) {
       // Four-corner colonnade — pillars supporting the vaulted ceiling.
@@ -2912,14 +3009,23 @@ function _generateDungeonOnce(opts) {
       emitWall(pE, pS, pE, pN, court, plinth, lo(wallTex)); // E
       emitWall(pE, pN, pW, pN, court, plinth, lo(wallTex)); // N
       emitWall(pW, pN, pW, pS, court, plinth, lo(wallTex)); // W
-      // WALL ring (plinth → cap). South face leaves an entrance gap that the
-      // plinth flows through into the recessed bay; the bay's door panel sits
-      // at its back. E/W walls split around window strips.
-      emitWall(oW, oS, bx - hd, oS, plinth, cap, lo(wallTex));   // S left of entrance
-      emitWall(bx + hd, oS, oE, oS, plinth, cap, lo(wallTex));   // S right of entrance
-      emitWall(bx - hd, oS, bx - hd, rN, plinth, cap, lo(wallTex)); // bay W jamb
-      emitWall(bx - hd, rN, bx + hd, rN, plinth, cap, lo(b.doorTex)); // bay back (door)
-      emitWall(bx + hd, rN, bx + hd, oS, plinth, cap, lo(wallTex)); // bay E jamb
+      // WALL ring (plinth → cap). South face is continuous now — the bay
+      // is its OWN low-ceilinged sub-sector carved out of the building's
+      // wall ring (not a gap in plinth as before), bordered by plinth on
+      // its south face (passable, same floor) and by cap on E / W / back.
+      // The lintel above the porch shows on the plinth side of the seam.
+      const bay = b.bayShelterSec;
+      emitWall(oW, oS, bx - hd, oS, plinth, cap, lo(wallTex));   // S left of bay
+      emitWall(bx + hd, oS, oE, oS, plinth, cap, lo(wallTex));   // S right of bay
+      // Porch entry — plinth → bay (passable seam, same floor). The upper
+      // above the bay's 128-tall ceiling shows the wall texture on the
+      // plinth side, reading as the porch overhang from the court.
+      emitWall(bx - hd, oS, bx + hd, oS, plinth, bay, { frontSide: { upper: wallTex } });
+      // Bay E/W jambs + back panel — bay shelter ↔ cap. Door image stops
+      // cleanly at the 128-tall bay ceiling instead of stretching to capH.
+      emitWall(bx - hd, oS, bx - hd, rN, bay, cap, lo(wallTex)); // bay W jamb
+      emitWall(bx - hd, rN, bx + hd, rN, bay, cap, lo(b.doorTex)); // bay back (door)
+      emitWall(bx + hd, rN, bx + hd, oS, bay, cap, lo(wallTex)); // bay E jamb
       emitWall(oE, oS, oE, by - hw, plinth, cap, lo(wallTex));   // E below window
       emitWall(oE, by - hw, oE, by + hw, plinth, cap, lo(b.winTex)); // E window
       emitWall(oE, by + hw, oE, oN, plinth, cap, lo(wallTex));   // E above window
@@ -6405,7 +6511,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.53</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.54</span>
         </div>
         <div className="flex gap-1.5">
           {onOpenEther && !previewMap && (
@@ -6699,9 +6805,12 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
     rooms.push(room);
   }
   // Smart things: P1 in the NW-most room, Exit Pillar in the SE-most room
-  // (opposite extremes by anti-diagonal score). Then scatter monsters across
-  // every other room proportional to area; sprinkle in a few goodies.
-  const things = existing && existing.things
+  // (opposite extremes by anti-diagonal score). When EXTENDING an existing
+  // level (ADD AREAS), keep the existing monsters and only re-stamp the
+  // P1 / Exit markers — the user said they didn't want every press to keep
+  // adding more enemies to the same map.
+  const extending = !!(existing && existing.things);
+  const things = extending
     ? existing.things.filter(t => t.type !== 1 && t.type !== 32000) : [];
   let nw = rooms[0], se = rooms[0];
   for (const r of rooms) {
@@ -6711,6 +6820,7 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
   if (nw === se && rooms.length > 1) se = rooms[rooms.length - 1];
   things.push({ type: 1, x: nw.cx, y: nw.cy, angle: 0, flags: 7 });
   things.push({ type: 32000, x: se.cx, y: se.cy, angle: 0, flags: 7 });
+  if (extending) return { rooms, connections, things };
   const mPool = ETHER_MONSTERS[difficulty] || ETHER_MONSTERS.medium;
   const totalArea = rooms.reduce((s, r) => s + sizeOf(r) * sizeOf(r), 0) || 1;
   for (const r of rooms) {
@@ -6803,7 +6913,7 @@ function EtherWad({ onEditInShapeShifter, onBack, customPresets }) {
         padding: '6px 8px', borderBottom: '1px solid ' + COLORS.border, background: COLORS.bgPanel,
         paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div style={{ color: '#9966ff', fontWeight: 700, letterSpacing: '0.18em', fontSize: 13 }}>
-          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.53</span>
+          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.54</span>
         </div>
         <button onClick={onBack}
           style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',

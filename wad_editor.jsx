@@ -6109,10 +6109,15 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
     if (!previewMap) return;
     try {
       // Substitute the edited thing list (with stable IDs) into the map.
-      const finalThings = thingsList.map((t, i) => ({
-        id: 't' + i, x: t.x | 0, y: t.y | 0,
-        angle: t.angle | 0, type: t.type, flags: t.flags | 7,
-      }));
+      // Exit Pillar MARKERS (type 32000) must never reach a real engine —
+      // vanilla/chocolate error out with "P_SpawnMapThing: Unknown type".
+      // The generated exit-post geometry is already baked into previewMap.
+      const finalThings = thingsList
+        .filter(t => t.type !== EXIT_PILLAR_TYPE)
+        .map((t, i) => ({
+          id: 't' + i, x: t.x | 0, y: t.y | 0,
+          angle: t.angle | 0, type: t.type, flags: t.flags | 7,
+        }));
       const finalMap = { ...previewMap, things: finalThings };
       const buf = buildWad({ MAP01: finalMap });
       const file = new File([buf], 'shapeshifter.wad', { type: 'application/octet-stream' });
@@ -6126,6 +6131,39 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (e) { setHint('Save failed: ' + e.message); }
+  };
+
+  // DOOM — play the built level in the browser. Writes the WAD bytes to
+  // IndexedDB (db 'jerkwad' / store 'wads' / key 'current') and opens the
+  // /play page, which boots Chocolate Doom WASM with freedoom2.wad as the
+  // IWAD and merges this PWAD on top (see play/index.html).
+  const doomPlay = async () => {
+    if (!previewMap) return;
+    try {
+      const finalThings = thingsList
+        .filter(t => t.type !== EXIT_PILLAR_TYPE)
+        .map((t, i) => ({
+          id: 't' + i, x: t.x | 0, y: t.y | 0,
+          angle: t.angle | 0, type: t.type, flags: t.flags | 7,
+        }));
+      const finalMap = { ...previewMap, things: finalThings };
+      const buf = buildWad({ MAP01: finalMap });
+      await new Promise((resolve, reject) => {
+        const req = indexedDB.open('jerkwad', 1);
+        req.onupgradeneeded = () => { req.result.createObjectStore('wads'); };
+        req.onsuccess = () => {
+          try {
+            const tx = req.result.transaction('wads', 'readwrite');
+            tx.objectStore('wads').put(buf, 'current');
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+          } catch (e) { reject(e); }
+        };
+        req.onerror = () => reject(req.error);
+      });
+      window.open('play/', '_blank');
+      setHint('Launching Chocolate Doom — the level is MAP01.');
+    } catch (e) { setHint('DOOM launch failed: ' + e.message); }
   };
 
   function hitRoom(sx, sy) {
@@ -6539,6 +6577,10 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
               style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
                        background: COLORS.bgPanel, color: COLORS.cyan,
                        border: '1px solid ' + COLORS.cyan, borderRadius: 4 }}>BACK</button>
+            <button onClick={doomPlay}
+              style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
+                       background: '#ff5c5c', color: COLORS.bg,
+                       border: '1px solid #ff5c5c', borderRadius: 4 }}>DOOM</button>
             <button onClick={playWad}
               style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
                        background: COLORS.amber, color: COLORS.bg,

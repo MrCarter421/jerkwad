@@ -1,0 +1,27 @@
+# Wasm Doom message router (WebSocket relay) — vendored from
+# github.com/cloudflare/doom-workers (BSD-3), configured for yuccabucca.com.
+#
+# Deploy:
+#   cd workers/doom-relay
+#   npx wrangler login
+#   npx wrangler deploy
+#
+# Then players connect with:
+#   https://yuccabucca.com/play/?ws=wss://doom.yuccabucca.com&server=1   (host)
+#   https://yuccabucca.com/play/?ws=wss://doom.yuccabucca.com&join=1     (join)
+name = "doom-relay"
+main = "index.mjs"
+compatibility_date = "2024-01-01"
+
+routes = [
+  { pattern = "doom.yuccabucca.com/*", zone_name = "yuccabucca.com" }
+]
+
+[durable_objects]
+bindings = [
+  { name = "router", class_name = "Router" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["Router"]

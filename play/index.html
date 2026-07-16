@@ -59,6 +59,7 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
+  <div class="msg" style="opacity:0.5">player build P2</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
@@ -99,6 +100,12 @@
 //   ?solo=1           -solo-net (test netgame alone)
 // ---------------------------------------------------------------------------
 const qs = new URLSearchParams(location.search);
+window.addEventListener('error', (e) => {
+  try { setBoot(100, 'ERROR: ' + (e.message || e.type) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '')); } catch (x) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { setBoot(100, 'ERROR: ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason))); } catch (x) {}
+});
 const bootEl = document.getElementById('boot');
 const bootBar = document.getElementById('bootbar');
 const bootMsg = document.getElementById('bootmsg');
@@ -183,6 +190,14 @@ const bootHider = setInterval(() => {
 (async function boot() {
   setBoot(5, 'reading saved WAD…');
   userWadBytes = await readUserWad();
+  // Opened by the editor's DOOM button? The WAD write races our load —
+  // poll for up to 6 s before concluding there's no user level.
+  if ((qs.get('wait') || window.opener) && (!userWadBytes || userWadBytes.byteLength <= 16)) {
+    for (let i = 0; i < 20 && (!userWadBytes || userWadBytes.byteLength <= 16); i++) {
+      await new Promise(r => setTimeout(r, 300));
+      userWadBytes = await readUserWad();
+    }
+  }
   if (userWadBytes && userWadBytes.byteLength <= 16) userWadBytes = null;
   const args = ['-iwad', 'freedoom2.wad', '-nomusic'];
   let haveUserWad = !!userWadBytes;

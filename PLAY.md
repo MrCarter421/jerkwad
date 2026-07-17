@@ -91,5 +91,11 @@ page depends on).
   as intended.
 - The Exit Pillar marker (editor type 32000) is stripped before export;
   real engines would refuse the unknown thing type.
+- buildWad runs a JS BSP node builder (SEGS/SSECTORS/NODES + BLOCKMAP +
+  zero REJECT) — required by vanilla engines; GZDoom rebuilds nodes
+  itself but Chocolate Doom renders NOTHING without them. Rare sliver
+  subsectors from integer split-rounding can cause small floor-height
+  visual glitches in complex fused maps (refinement tracked in
+  CLAUDE.md known issues).
 
 [1]: https://github.com/cloudflare/doom-wasm

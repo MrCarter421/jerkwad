@@ -335,12 +335,272 @@ function parseMap(view, lumps, markerIdx) {
   }
   return map;
 }
+// ---------------------------------------------------------------------------
+// Vanilla BSP node builder. Strict vanilla engines (Chocolate Doom — the
+// browser player) do NOT rebuild missing SEGS / SSECTORS / NODES / BLOCKMAP
+// the way GZDoom does; with empty node lumps they render nothing, forever.
+// This produces all of them, plus a zero-filled (valid) REJECT.
+//
+// Conventions (must match vanilla R_PointOnSide):
+//   side 0 = front/right of the partition  ⇔  (x-px)*pdy - (y-py)*pdx > 0
+//   NODES children[0] = front subtree; subsector refs have bit 0x8000.
+// Split vertices are appended to the vertex array (int-rounded, deduped).
+// ---------------------------------------------------------------------------
+function buildBsp(m, vIdx, sdIdx) {
+  const pts = m.vertices.map(v => ({ x: v.x, y: v.y }));
+  const vertKey = new Map(pts.map((p, i) => [p.x + ',' + p.y, i]));
+  const lines = m.linedefs.map((ld) => ({
+    v1: resolveIdx(ld.v1, vIdx), v2: resolveIdx(ld.v2, vIdx),
+    front: resolveIdxOrNeg(ld.front, sdIdx), back: resolveIdxOrNeg(ld.back, sdIdx),
+  }));
+  const EPS = 0.4;
+  let initialSegs = [];
+  lines.forEach((ld, li) => {
+    if (ld.v1 === ld.v2 || ld.v1 < 0 || ld.v2 < 0) return;
+    if (ld.front !== -1) initialSegs.push({ v1: ld.v1, v2: ld.v2, line: li, dir: 0, offset: 0 });
+    if (ld.back !== -1) initialSegs.push({ v1: ld.v2, v2: ld.v1, line: li, dir: 1, offset: 0 });
+  });
+  const segsOut = [];       // final segs, grouped by subsector
+  const ssectors = [];      // { count, first }
+  const nodes = [];         // { x,y,dx,dy, bb0, bb1, c0, c1 }
+
+  const partOf = (s) => ({
+    x: pts[s.v1].x, y: pts[s.v1].y,
+    dx: pts[s.v2].x - pts[s.v1].x, dy: pts[s.v2].y - pts[s.v1].y,
+  });
+  const distTo = (part, x, y) => {
+    const cross = (x - part.x) * part.dy - (y - part.y) * part.dx;
+    return cross / Math.hypot(part.dx, part.dy);
+  };
+  const addVert = (x, y) => {
+    const k = x + ',' + y;
+    if (vertKey.has(k)) return vertKey.get(k);
+    const i = pts.length;
+    pts.push({ x, y });
+    vertKey.set(k, i);
+    return i;
+  };
+  // Classify a seg against a partition: 0 front, 1 back, 2 split, 3 colinear.
+  function classify(s, part) {
+    const d1 = distTo(part, pts[s.v1].x, pts[s.v1].y);
+    const d2 = distTo(part, pts[s.v2].x, pts[s.v2].y);
+    const on1 = Math.abs(d1) <= EPS, on2 = Math.abs(d2) <= EPS;
+    if (on1 && on2) return 3;
+    if (d1 >= -EPS && d2 >= -EPS) return 0;
+    if (d1 <= EPS && d2 <= EPS) return 1;
+    return 2;
+  }
+  function splitSeg(s, part) {
+    const x1 = pts[s.v1].x, y1 = pts[s.v1].y, x2 = pts[s.v2].x, y2 = pts[s.v2].y;
+    const d1 = distTo(part, x1, y1), d2 = distTo(part, x2, y2);
+    const t = d1 / (d1 - d2);
+    const ix = Math.round(x1 + t * (x2 - x1)), iy = Math.round(y1 + t * (y2 - y1));
+    const vi = addVert(ix, iy);
+    if (vi === s.v1 || vi === s.v2) {
+      // Rounded onto an endpoint — not a real split; classify by the far end.
+      return null;
+    }
+    const segA = { v1: s.v1, v2: vi, line: s.line, dir: s.dir, offset: s.offset };
+    const segB = { v1: vi, v2: s.v2, line: s.line, dir: s.dir,
+      offset: s.offset + Math.hypot(ix - x1, iy - y1) };
+    return d1 > 0 ? { front: segA, back: segB } : { front: segB, back: segA };
+  }
+  function scoreSplitter(segs, cand) {
+    const part = partOf(cand);
+    if (!part.dx && !part.dy) return null;
+    let nf = 0, nb = 0, ns = 0;
+    for (const s of segs) {
+      const c = classify(s, part);
+      if (c === 0) nf++;
+      else if (c === 1) nb++;
+      else if (c === 2) ns++;
+      else {
+        const dot = (pts[s.v2].x - pts[s.v1].x) * part.dx + (pts[s.v2].y - pts[s.v1].y) * part.dy;
+        if (dot >= 0) nf++; else nb++;
+      }
+    }
+    if (nf + ns === 0 || nb + ns === 0) return null;  // doesn't divide
+    return Math.abs(nf - nb) + 8 * ns;
+  }
+  function pickSplitter(segs) {
+    // Sampled scan first (speed), then an EXHAUSTIVE scan before giving up —
+    // declaring a leaf while a divider still exists produces subsectors that
+    // span multiple sectors, which corrupts vanilla rendering.
+    let best = null, bestCost = Infinity;
+    const step = Math.max(1, Math.floor(segs.length / 60));
+    for (let ci = 0; ci < segs.length; ci += step) {
+      const cost = scoreSplitter(segs, segs[ci]);
+      if (cost !== null && cost < bestCost) { bestCost = cost; best = segs[ci]; }
+    }
+    if (best) return best;
+    if (step > 1) {
+      for (let ci = 0; ci < segs.length; ci++) {
+        const cost = scoreSplitter(segs, segs[ci]);
+        if (cost !== null && cost < bestCost) { bestCost = cost; best = segs[ci]; }
+      }
+    }
+    return best;
+  }
+  const segAngleBAM = (s) => {
+    const a = Math.atan2(pts[s.v2].y - pts[s.v1].y, pts[s.v2].x - pts[s.v1].x);
+    return Math.round(a * 32768 / Math.PI) & 0xffff;
+  };
+  const bboxOf = (segs) => {
+    let t = -Infinity, b = Infinity, l = Infinity, r = -Infinity;
+    for (const s of segs) {
+      for (const vi of [s.v1, s.v2]) {
+        const p = pts[vi];
+        if (p.y > t) t = p.y; if (p.y < b) b = p.y;
+        if (p.x < l) l = p.x; if (p.x > r) r = p.x;
+      }
+    }
+    return [t, b, l, r].map(v => Math.max(-32768, Math.min(32767, Math.round(v))));
+  };
+  function emitSubsector(segs) {
+    const first = segsOut.length;
+    for (const s of segs) segsOut.push(s);
+    ssectors.push({ count: segs.length, first });
+    return 0x8000 | (ssectors.length - 1);
+  }
+  function recurse(segs, depth) {
+    if (segs.length === 0) return { ref: emitSubsector(segs), bbox: [0, 0, 0, 0] };
+    const bbox = bboxOf(segs);
+    if (depth > 200) return { ref: emitSubsector(segs), bbox };
+    const splitter = pickSplitter(segs);
+    if (!splitter) return { ref: emitSubsector(segs), bbox };
+    const part = partOf(splitter);
+    const front = [], back = [];
+    for (const s of segs) {
+      const c = classify(s, part);
+      if (c === 0) front.push(s);
+      else if (c === 1) back.push(s);
+      else if (c === 3) {
+        const dot = (pts[s.v2].x - pts[s.v1].x) * part.dx + (pts[s.v2].y - pts[s.v1].y) * part.dy;
+        (dot >= 0 ? front : back).push(s);
+      } else {
+        const sp = splitSeg(s, part);
+        if (!sp) {
+          // Degenerate split — put the whole seg on the side of its midpoint.
+          const mx = (pts[s.v1].x + pts[s.v2].x) / 2, my = (pts[s.v1].y + pts[s.v2].y) / 2;
+          (distTo(part, mx, my) >= 0 ? front : back).push(s);
+        } else { front.push(sp.front); back.push(sp.back); }
+      }
+    }
+    if (front.length === 0 || back.length === 0) {
+      // Picker promised a divide but rounding disagreed — emit as leaf.
+      return { ref: emitSubsector(segs), bbox };
+    }
+    const f = recurse(front, depth + 1);
+    const b = recurse(back, depth + 1);
+    nodes.push({
+      x: Math.round(part.x), y: Math.round(part.y),
+      dx: Math.round(part.dx), dy: Math.round(part.dy),
+      bb0: f.bbox, bb1: b.bbox, c0: f.ref, c1: b.ref,
+    });
+    return { ref: nodes.length - 1, bbox };
+  }
+  recurse(initialSegs, 0);
+
+  // ---- serialize ----
+  const segsBuf = new ArrayBuffer(segsOut.length * 12);
+  const sgv = new DataView(segsBuf);
+  segsOut.forEach((s, i) => {
+    const ld = lines[s.line];
+    const sideStart = s.dir === 0 ? ld.v1 : ld.v2;
+    sgv.setInt16(i * 12, s.v1, true);
+    sgv.setInt16(i * 12 + 2, s.v2, true);
+    sgv.setUint16(i * 12 + 4, segAngleBAM(s), true);
+    sgv.setInt16(i * 12 + 6, s.line, true);
+    sgv.setInt16(i * 12 + 8, s.dir, true);
+    const baseOff = s.offset || Math.hypot(pts[s.v1].x - pts[sideStart].x, pts[s.v1].y - pts[sideStart].y);
+    sgv.setInt16(i * 12 + 10, Math.round(baseOff), true);
+  });
+  const ssBuf = new ArrayBuffer(ssectors.length * 4);
+  const ssv = new DataView(ssBuf);
+  ssectors.forEach((ss, i) => {
+    ssv.setUint16(i * 4, ss.count, true);
+    ssv.setUint16(i * 4 + 2, ss.first, true);
+  });
+  const ndBuf = new ArrayBuffer(nodes.length * 28);
+  const ndv = new DataView(ndBuf);
+  nodes.forEach((n, i) => {
+    const o = i * 28;
+    ndv.setInt16(o, n.x, true); ndv.setInt16(o + 2, n.y, true);
+    ndv.setInt16(o + 4, n.dx, true); ndv.setInt16(o + 6, n.dy, true);
+    for (let k = 0; k < 4; k++) ndv.setInt16(o + 8 + k * 2, n.bb0[k], true);
+    for (let k = 0; k < 4; k++) ndv.setInt16(o + 16 + k * 2, n.bb1[k], true);
+    ndv.setUint16(o + 24, n.c0, true);
+    ndv.setUint16(o + 26, n.c1, true);
+  });
+
+  // ---- BLOCKMAP (128-unit grid; conservative per-block line lists) ----
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  if (!isFinite(minX)) { minX = minY = 0; maxX = maxY = 128; }
+  minX = Math.floor(minX) - 8; minY = Math.floor(minY) - 8;
+  const cols = ((Math.ceil(maxX) - minX) >> 7) + 1;
+  const rows = ((Math.ceil(maxY) - minY) >> 7) + 1;
+  const blockLists = Array.from({ length: cols * rows }, () => []);
+  const segRect = (x1, y1, x2, y2, rx, ry) => {
+    const rw = 128, rh = 128;
+    if (Math.max(x1, x2) < rx || Math.min(x1, x2) > rx + rw ||
+        Math.max(y1, y2) < ry || Math.min(y1, y2) > ry + rh) return false;
+    const f = (x, y) => (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
+    const s1 = f(rx, ry), s2 = f(rx + rw, ry), s3 = f(rx, ry + rh), s4 = f(rx + rw, ry + rh);
+    if (s1 > 0 && s2 > 0 && s3 > 0 && s4 > 0) return false;
+    if (s1 < 0 && s2 < 0 && s3 < 0 && s4 < 0) return false;
+    return true;
+  };
+  lines.forEach((ld, li) => {
+    if (ld.v1 < 0 || ld.v2 < 0) return;
+    const x1 = pts[ld.v1].x, y1 = pts[ld.v1].y, x2 = pts[ld.v2].x, y2 = pts[ld.v2].y;
+    const c0 = Math.max(0, ((Math.min(x1, x2) - minX) | 0) >> 7);
+    const c1 = Math.min(cols - 1, ((Math.max(x1, x2) - minX) | 0) >> 7);
+    const r0 = Math.max(0, ((Math.min(y1, y2) - minY) | 0) >> 7);
+    const r1 = Math.min(rows - 1, ((Math.max(y1, y2) - minY) | 0) >> 7);
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        if (segRect(x1, y1, x2, y2, minX + c * 128, minY + r * 128)) {
+          blockLists[r * cols + c].push(li);
+        }
+      }
+    }
+  });
+  let bmWords = 4 + cols * rows;   // header + offsets
+  for (const bl of blockLists) bmWords += bl.length + 2;  // 0x0000 ... 0xFFFF
+  const bmBuf = new ArrayBuffer(bmWords * 2);
+  const bmv = new DataView(bmBuf);
+  bmv.setInt16(0, minX, true); bmv.setInt16(2, minY, true);
+  bmv.setInt16(4, cols, true); bmv.setInt16(6, rows, true);
+  let w = 4 + cols * rows;
+  blockLists.forEach((bl, i) => {
+    bmv.setUint16((4 + i) * 2, w, true);
+    bmv.setUint16(w * 2, 0, true); w++;
+    for (const li of bl) { bmv.setUint16(w * 2, li, true); w++; }
+    bmv.setUint16(w * 2, 0xffff, true); w++;
+  });
+
+  const rejectBytes = Math.ceil((m.sectors.length * m.sectors.length) / 8);
+  return {
+    allVerts: pts,
+    segs: new Uint8Array(segsBuf),
+    ssectors: new Uint8Array(ssBuf),
+    nodes: new Uint8Array(ndBuf),
+    blockmap: new Uint8Array(bmBuf),
+    reject: new Uint8Array(rejectBytes),
+  };
+}
+
 function buildWad(maps) {
   const lumpsToWrite = [];
   for (const [mapName, m] of Object.entries(maps)) {
     const vIdx = new Map(m.vertices.map((v, i) => [v.id, i]));
     const sdIdx = new Map(m.sidedefs.map((s, i) => [s.id, i]));
     const secIdx = new Map(m.sectors.map((s, i) => [s.id, i]));
+    const bsp = buildBsp(m, vIdx, sdIdx);
     lumpsToWrite.push({ name: mapName, data: new Uint8Array(0) });
 
     const thingsBuf = new ArrayBuffer(m.things.length * 10);
@@ -376,14 +636,15 @@ function buildWad(maps) {
     });
     lumpsToWrite.push({ name: 'SIDEDEFS', data: new Uint8Array(sdsBuf) });
 
-    const vBuf = new ArrayBuffer(m.vertices.length * 4);
+    // VERTEXES includes the split vertices the node builder appended.
+    const vBuf = new ArrayBuffer(bsp.allVerts.length * 4);
     const vv = new DataView(vBuf);
-    m.vertices.forEach((v, i) => { vv.setInt16(i * 4, v.x | 0, true); vv.setInt16(i * 4 + 2, v.y | 0, true); });
+    bsp.allVerts.forEach((v, i) => { vv.setInt16(i * 4, v.x | 0, true); vv.setInt16(i * 4 + 2, v.y | 0, true); });
     lumpsToWrite.push({ name: 'VERTEXES', data: new Uint8Array(vBuf) });
 
-    lumpsToWrite.push({ name: 'SEGS', data: new Uint8Array(0) });
-    lumpsToWrite.push({ name: 'SSECTORS', data: new Uint8Array(0) });
-    lumpsToWrite.push({ name: 'NODES', data: new Uint8Array(0) });
+    lumpsToWrite.push({ name: 'SEGS', data: bsp.segs });
+    lumpsToWrite.push({ name: 'SSECTORS', data: bsp.ssectors });
+    lumpsToWrite.push({ name: 'NODES', data: bsp.nodes });
 
     const secBuf = new ArrayBuffer(m.sectors.length * 26);
     const sv = new DataView(secBuf);
@@ -396,8 +657,8 @@ function buildWad(maps) {
       sv.setInt16(i * 26 + 24, s.tag | 0, true);
     });
     lumpsToWrite.push({ name: 'SECTORS', data: new Uint8Array(secBuf) });
-    lumpsToWrite.push({ name: 'REJECT', data: new Uint8Array(0) });
-    lumpsToWrite.push({ name: 'BLOCKMAP', data: new Uint8Array(0) });
+    lumpsToWrite.push({ name: 'REJECT', data: bsp.reject });
+    lumpsToWrite.push({ name: 'BLOCKMAP', data: bsp.blockmap });
   }
   let dataSize = 0;
   lumpsToWrite.forEach(l => dataSize += l.data.length);

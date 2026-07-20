@@ -19,9 +19,17 @@ routes = [
 
 [durable_objects]
 bindings = [
-  { name = "router", class_name = "Router" }
+  { name = "router", class_name = "Router" },
+  { name = "lobby", class_name = "Lobby" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["Router"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["Lobby"]
+
+# REQUIRED SECRET (room-id signing key — any long random string):
+#   npx wrangler secret put DOOM_KEY

@@ -953,7 +953,7 @@ function generateDungeon() {
 // ShapeShifter: drive the dungeon generator from user-placed rooms +
 // user-drawn corridor pairs + (optional) user-placed things. Returns a
 // full map in the same shape as generateDungeon().
-function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
+function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs, genOpts) {
   const rooms = roomSpecs.map((s) => ({
     type: s.type,
     cx: s.cx | 0, cy: s.cy | 0,
@@ -973,7 +973,8 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
     }
   }
   const userThings = thingSpecs && thingSpecs.length ? thingSpecs : null;
-  return _generateDungeonOnce({ rooms, corridors, teleporters, userThings });
+  return _generateDungeonOnce({ rooms, corridors, teleporters, userThings,
+    seed: genOpts && genOpts.seed });
 }
 
 // Room presets — the predefined "library" the user picks from in
@@ -1018,7 +1019,12 @@ function _generateDungeonOnce(opts) {
   // feature preselected). When present, skip the random placement section
   // and respect each room's chosen feature/palette downstream.
   const userRooms = opts && opts.rooms;
-  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
+  // Optional explicit seed: identical seed + specs reproduce the map
+  // byte-for-byte on every client — the arena multiplayer JOIN flow
+  // rebuilds the host's WAD locally from just {seed, sliders}.
+  let seed = (opts && opts.seed)
+    ? ((opts.seed | 0) & 0x7fffffff) || 1
+    : (((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1);
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
   const sn = v => Math.round(v / 32) * 32;

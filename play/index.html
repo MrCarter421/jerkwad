@@ -203,14 +203,25 @@ const bootHider = setInterval(() => {
   let haveUserWad = !!userWadBytes;
   if (haveUserWad) args.push('-merge', 'shapeshifter.wad');
   if (qs.get('wad')) { args.push('-merge', 'extra.wad'); haveUserWad = true; }
-  const warp = qs.get('warp') || (haveUserWad ? '1' : null);
-  if (warp) args.push('-warp', warp);
-  args.push('-skill', qs.get('skill') || '3');
+  const joiningEarly = qs.get('ws') && qs.get('join');
+  if (!joiningEarly) {
+    const warp = qs.get('warp') || (haveUserWad ? '1' : null);
+    if (warp) args.push('-warp', warp);
+    args.push('-skill', qs.get('skill') || '3');
+  }
   const ws = qs.get('ws');
+  const joining = ws && qs.get('join');
   if (ws) {
     args.push('-wss', ws);
-    if (qs.get('server')) { args.push('-server'); args.push('-nodes', qs.get('nodes') || '2'); }
-    else if (qs.get('join')) { args.push('-connect', 'relay'); }
+    if (qs.get('server')) {
+      args.push('-server');
+      args.push('-nodes', qs.get('nodes') || '2');
+      if (qs.get('dm')) args.push('-deathmatch');
+    } else if (joining) {
+      // The doom server peer is always uid 1 on the relay; the websocket
+      // transport resolves -connect via atoi(), so the address is "1".
+      args.push('-connect', '1');
+    }
     if (qs.get('solo')) args.push('-solo-net');
     hintEl.textContent = 'net: ' + ws;
   }

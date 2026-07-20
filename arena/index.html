@@ -55,7 +55,7 @@
     <div class="grid">
       <div>
         <label class="lbl">Rooms: <span id="roomsv">12</span></label>
-        <input type="range" id="rooms" min="3" max="100" value="12">
+        <input type="range" id="rooms" min="3" max="60" value="12">
       </div>
       <div>
         <label class="lbl">Enemies: <span id="enemiesv">30</span></label>
@@ -111,6 +111,11 @@
 // level is rebuilt locally, byte-identical, from {seed, rooms, enemies}.
 // ---------------------------------------------------------------------------
 const E = window.JerkwadEngine;
+// Arena preset pool: everything except 'terrain', whose tightly-packed
+// concentric height rings are the worst per-room visplane pressure in the
+// library. Corridor-only layout (fuseChance 0) covers the rest — doors
+// close off cross-room sightlines so vanilla's 128-visplane budget holds.
+
 const $ = (id) => document.getElementById(id);
 const qs = new URLSearchParams(location.search);
 // Relay origin (https for API, wss for game traffic). Override: ?relay=host
@@ -118,6 +123,7 @@ const RELAY_HOST = qs.get('relay') || 'doom.yuccabucca.com';
 const API = 'https://' + RELAY_HOST;
 const WSS = 'wss://' + RELAY_HOST;
 
+const ARENA_PRESETS = E.SHAPESHIFTER_PRESETS.filter(p => p.feature !== 'terrain');
 $('rooms').oninput = () => $('roomsv').textContent = $('rooms').value;
 $('enemies').oninput = () => $('enemiesv').textContent = $('enemies').value;
 
@@ -192,7 +198,8 @@ function generate(seed) {
   const rng = mulberry32(seed);
   const difficulty = enemyCount > 60 ? 'hard' : enemyCount > 25 ? 'medium' : 'easy';
   const lvl = E.etherGenerateLevel({
-    rng, presets: E.SHAPESHIFTER_PRESETS, roomCount, enemyCount, difficulty,
+    rng, presets: ARENA_PRESETS, roomCount, enemyCount, difficulty,
+    fuseChance: 0,   // corridor-only: doors gate sightlines = no visplane overflow
   });
   const things = arenaThings(lvl, rng, +$('players').value);
   const map = E.generateShapeShifterMap(lvl.rooms, lvl.connections, things, { seed });
@@ -371,8 +378,9 @@ function joinLevel(lv, btn) {
       const rng = mulberry32(lv.seed);
       const difficulty = lv.enemies > 60 ? 'hard' : lv.enemies > 25 ? 'medium' : 'easy';
       const gen = E.etherGenerateLevel({
-        rng, presets: E.SHAPESHIFTER_PRESETS,
+        rng, presets: ARENA_PRESETS,
         roomCount: lv.rooms, enemyCount: lv.enemies, difficulty,
+        fuseChance: 0,
       });
       const things = arenaThings(gen, rng, lv.maxPlayers);
       const map = E.generateShapeShifterMap(gen.rooms, gen.connections, things, { seed: lv.seed });

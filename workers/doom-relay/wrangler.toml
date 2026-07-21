@@ -23,13 +23,18 @@ bindings = [
   { name = "lobby", class_name = "Lobby" }
 ]
 
+# Durable Objects. Use new_sqlite_classes (NOT new_classes): the free
+# Workers plan only permits SQLite-backed Durable Objects, and our
+# storage.put/get/list/delete calls work identically on that backend.
 [[migrations]]
 tag = "v1"
-new_classes = ["Router"]
+new_sqlite_classes = ["Router"]
 
 [[migrations]]
 tag = "v2"
-new_classes = ["Lobby"]
+new_sqlite_classes = ["Lobby"]
 
-# REQUIRED SECRET (room-id signing key — any long random string):
+# REQUIRED SECRET (room-id signing key — any long random string).
+# Sets the value INTERACTIVELY (it prompts; don't put it on the CLI):
 #   npx wrangler secret put DOOM_KEY
+# Generate one with:  openssl rand -hex 32

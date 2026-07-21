@@ -42,17 +42,30 @@ workers/doom-relay — relay + lobby Worker (deploy once, see below)
 
 ## Deploying the relay + lobby (one time)
 
+Run these on your OWN computer (Mac/Windows/Linux) with Node.js
+installed — NOT on the web host. Wrangler only uploads the Worker to
+Cloudflare's edge; the Worker never runs on your cPanel/shared host.
+
 ```
 cd workers/doom-relay
-npx wrangler login
-npx wrangler secret put DOOM_KEY     # any long random string
+npx wrangler login                   # opens a browser to authorize
+npx wrangler secret put DOOM_KEY     # PROMPTS for the value — paste it, don't
+                                     # put it on the command line.
+                                     # generate one: openssl rand -hex 32
 npx wrangler deploy                  # routes doom.yuccabucca.com/* (see wrangler.toml)
 ```
 
-DNS: add a `doom` subdomain record in Cloudflare (proxied, any target —
-the Worker route intercepts). The arena page defaults to
-`doom.yuccabucca.com`; override with `arena/?relay=other.host` for
-testing.
+Free plan note: `wrangler.toml` uses `new_sqlite_classes` for the two
+Durable Objects — the free Workers plan requires SQLite-backed DOs.
+(`new_classes` errors with `code: 10097`.) No code change needed; the
+storage API is identical.
+
+DNS: add a `doom` subdomain record in Cloudflare — Type `A`, Name
+`doom`, IPv4 `192.0.2.1` (a reserved placeholder; the Worker route
+intercepts before any origin), **Proxied** (orange cloud). Requires
+yuccabucca.com's DNS to be on Cloudflare's nameservers. The arena page
+defaults to `doom.yuccabucca.com`; override with `arena/?relay=other.host`
+for testing.
 
 ## API summary (worker)
 

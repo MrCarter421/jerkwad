@@ -66,7 +66,7 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P3</div>
+  <div class="msg" style="opacity:0.5">player build P4</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
@@ -156,18 +156,23 @@ var Module = {
         setBoot(30, 'fetching freedoom2.wad…');
         const iwadRes = await fetch('freedoom2.wad');
         if (!iwadRes.ok) throw new Error('freedoom2.wad HTTP ' + iwadRes.status);
-        const iwad = new Uint8Array(await iwadRes.arrayBuffer());
-        FS.createDataFile('/', 'freedoom2.wad', iwad, true, true);
+        let iwad = new Uint8Array(await iwadRes.arrayBuffer());
+        // canOwn=true (6th arg): MEMFS takes the typed array instead of
+        // copying it — halves peak memory for the 28 MB IWAD, which matters
+        // a lot on memory-constrained mobile browsers.
+        FS.createDataFile('/', 'freedoom2.wad', iwad, true, true, true);
         setBoot(60, 'IWAD staged (' + (iwad.length >> 20) + ' MB)');
+        iwad = null;   // drop our reference; MEMFS owns it now
         if (userWadBytes) {
-          FS.createDataFile('/', 'shapeshifter.wad', new Uint8Array(userWadBytes), true, true);
+          FS.createDataFile('/', 'shapeshifter.wad', new Uint8Array(userWadBytes), true, true, true);
           setBoot(70, 'ShapeShifter WAD staged (' + userWadBytes.byteLength + ' bytes)');
+          userWadBytes = null;   // free the level bytes after staging
         }
         const wadUrl = qs.get('wad');
         if (wadUrl) {
           setBoot(75, 'fetching ' + wadUrl + '…');
           const r = await fetch(wadUrl);
-          if (r.ok) FS.createDataFile('/', 'extra.wad', new Uint8Array(await r.arrayBuffer()), true, true);
+          if (r.ok) FS.createDataFile('/', 'extra.wad', new Uint8Array(await r.arrayBuffer()), true, true, true);
         }
         setBoot(90, 'starting: ' + Module.arguments.join(' '));
       } catch (e) {
@@ -183,6 +188,13 @@ var Module = {
     // Engine protocol lines: "doom: N, message"
     if (/^doom: /.test(t)) hintEl.textContent = t.replace(/^doom: \d+,\s*/, '');
     if (/^doom: 10/.test(t)) hintEl.textContent = 'net game started';
+    // A fatal engine error (visplane overflow, etc.) prints here right before
+    // the runtime exits — surface it on the (re-shown) boot screen instead of
+    // leaving a silent black canvas, so crashes are diagnosable.
+    if (/I_Error|R_Error|overflow|Error:/i.test(t)) {
+      bootEl.classList.remove('hidden');
+      setBoot(100, 'ENGINE: ' + t.slice(0, 120));
+    }
   },
   printErr: (t) => console.warn(t),
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),

@@ -84,8 +84,13 @@ page depends on).
 ## Notes / limits
 
 - Music is off (`-nomusic`): no GUS patches shipped. Sound effects work.
-- Chocolate Doom is vanilla-accurate: vanilla limits apply (visplanes,
-  savegame size). ShapeShifter maps are built to fit them.
+- The engine is Chocolate Doom with the vanilla STATIC RENDER LIMITS
+  RAISED (the crash fix): MAXVISPLANES 128->2048, MAXDRAWSEGS 256->4096,
+  MAXVISSPRITES 128->2048, MAXOPENINGS x4, MAXPLATS 30->256. Stock
+  Chocolate Doom I_Error-exits (blank screen) the instant a detailed
+  ShapeShifter view exceeds 128 visplanes; the raised limits give ~16x
+  headroom so dense levels render and don't "cut out mid-game". Rebuild
+  via scripts/build-doom-wasm.sh (the limit edits live in that script).
 - Freedoom's MAP01 assets replace Doom II textures ShapeShifter names
   (STARTAN2 etc.) — all standard names exist in Freedoom, so maps look
   as intended.

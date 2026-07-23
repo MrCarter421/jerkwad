@@ -58,7 +58,23 @@ async function handleApiRequest(path, request, env) {
   let parts = path.slice(1).split('/')
   let room = false
 
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'content-type',
+      },
+    })
+  }
+
   switch (parts[1]) {
+    case 'lobby': {
+      // Single global lobby Durable Object.
+      const id = env.lobby.idFromName('global')
+      return env.lobby.get(id).fetch(request)
+    }
+
     case 'ws':
     case 'room':
       room = await checkRoom(parts[2], env)
@@ -103,6 +119,7 @@ export class Router {
             {
               room: room,
               gameStarted: this.gameStarted,
+              players: this.sessions.length,
             },
             200,
           )
@@ -168,5 +185,78 @@ export class Router {
     }
     webSocket.addEventListener('close', closeOrErrorHandler)
     webSocket.addEventListener('error', closeOrErrorHandler)
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Arena lobby — a single global Durable Object holding the public level
+// registry. Levels carry {seed, rooms, enemies} so joiners rebuild the WAD
+// locally (deterministic generator) — no level data is ever uploaded.
+// Entries expire after 4 hours, or after 10 minutes with zero players.
+// ---------------------------------------------------------------------------
+export class Lobby {
+  constructor(controller, env) {
+    this.storage = controller.storage
+    this.env = env
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url)
+    const parts = url.pathname.slice(1).split('/')
+    const action = parts[2]
+
+    if (action === 'register' && request.method === 'POST') {
+      let body
+      try {
+        body = await request.json()
+      } catch (e) {
+        return jsonReply({ reason: 'bad json' }, 400)
+      }
+      if (!body.room || typeof body.seed !== 'number') {
+        return jsonReply({ reason: 'room and seed required' }, 400)
+      }
+      const entry = {
+        room: String(body.room).slice(0, 80),
+        name: String(body.name || 'UNNAMED').slice(0, 24),
+        seed: body.seed | 0,
+        rooms: Math.max(1, Math.min(100, body.rooms | 0)),
+        enemies: Math.max(0, Math.min(100, body.enemies | 0)),
+        maxPlayers: Math.max(1, Math.min(4, body.maxPlayers | 0)),
+        dm: !!body.dm,
+        created: Date.now(),
+      }
+      await this.storage.put('lvl:' + entry.room, entry)
+      return jsonReply({ ok: true }, 200)
+    }
+
+    if (action === 'list') {
+      const all = await this.storage.list({ prefix: 'lvl:' })
+      const now = Date.now()
+      const levels = []
+      for (const [key, entry] of all) {
+        if (now - entry.created > 4 * 3600 * 1000) {
+          await this.storage.delete(key)
+          continue
+        }
+        // Live player count from the room's Router DO.
+        let players = 0
+        try {
+          const id = this.env.router.idFromString(entry.room.split('-')[0])
+          const res = await this.env.router.get(id).fetch('https://internal/api/room/' + entry.room)
+          if (res.ok) players = ((await res.json()).players | 0)
+        } catch (e) { /* room gone */ }
+        if (players === 0 && now - entry.created > 10 * 60 * 1000) {
+          await this.storage.delete(key)
+          continue
+        }
+        levels.push({ ...entry, players })
+        if (levels.length >= 25) break
+      }
+      levels.sort((a, b) => b.created - a.created)
+      return jsonReply({ levels }, 200)
+    }
+
+    return jsonReply({ reason: 'lobby api not found' }, 404)
   }
 }

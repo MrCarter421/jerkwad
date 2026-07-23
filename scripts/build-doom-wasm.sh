@@ -72,6 +72,21 @@ s = s.replace('int main(int argc, char **argv)',
 open('src/i_main.c', 'w').write(s)
 PYEOF
 
+# Raise vanilla static render limits — stock Chocolate Doom I_Error-exits
+# (blank screen / "cut out mid-game") the instant a dense ShapeShifter view
+# exceeds 128 visplanes. ~16x headroom fixes it; memory cost ~3 MB.
+python3 - <<'PYEOF'
+for fn, old, new in [
+    ('src/doom/r_plane.c',  '#define MAXVISPLANES\t128',         '#define MAXVISPLANES\t2048'),
+    ('src/doom/r_plane.c',  '#define MAXOPENINGS\tSCREENWIDTH*64','#define MAXOPENINGS\tSCREENWIDTH*256'),
+    ('src/doom/r_defs.h',   '#define MAXDRAWSEGS\t\t256',        '#define MAXDRAWSEGS\t\t4096'),
+    ('src/doom/r_things.h', '#define MAXVISSPRITES  \t128',       '#define MAXVISSPRITES  \t2048'),
+    ('src/doom/p_spec.h',   '#define MAXPLATS\t\t30',            '#define MAXPLATS\t\t256'),
+]:
+    s = open(fn).read()
+    if old in s: open(fn, 'w').write(s.replace(old, new))
+PYEOF
+
 # 6. Configure + compile objects --------------------------------------------
 emconfigure autoreconf -fiv
 ac_cv_exeext=".html" emconfigure ./configure --host=none-none-none

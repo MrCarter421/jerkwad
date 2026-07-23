@@ -953,7 +953,7 @@ function generateDungeon() {
 // ShapeShifter: drive the dungeon generator from user-placed rooms +
 // user-drawn corridor pairs + (optional) user-placed things. Returns a
 // full map in the same shape as generateDungeon().
-function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
+function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs, genOpts) {
   const rooms = roomSpecs.map((s) => ({
     type: s.type,
     cx: s.cx | 0, cy: s.cy | 0,
@@ -973,7 +973,8 @@ function generateShapeShifterMap(roomSpecs, connectionSpecs, thingSpecs) {
     }
   }
   const userThings = thingSpecs && thingSpecs.length ? thingSpecs : null;
-  return _generateDungeonOnce({ rooms, corridors, teleporters, userThings });
+  return _generateDungeonOnce({ rooms, corridors, teleporters, userThings,
+    seed: genOpts && genOpts.seed });
 }
 
 // Room presets — the predefined "library" the user picks from in
@@ -1018,7 +1019,12 @@ function _generateDungeonOnce(opts) {
   // feature preselected). When present, skip the random placement section
   // and respect each room's chosen feature/palette downstream.
   const userRooms = opts && opts.rooms;
-  let seed = ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1;
+  // Optional explicit seed: identical seed + specs reproduce the map
+  // byte-for-byte on every client — the arena multiplayer JOIN flow
+  // rebuilds the host's WAD locally from just {seed, sliders}.
+  let seed = (opts && opts.seed)
+    ? ((opts.seed | 0) & 0x7fffffff) || 1
+    : (((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) | 0) || 1);
   const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed >>> 8) / 0x800000; };
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
   const sn = v => Math.round(v / 32) * 32;
@@ -7107,11 +7113,16 @@ const ETHER_GOODIES = [2007, 2008, 2008, 2011, 2011, 2012, 2014, 2015, 8];
 // anchor. ~45% of new rooms fuse with the anchor (close placement, no
 // corridor) for the ShapeShifter wedding-cake compositions; the rest are
 // connected by corridors. Rooms are picked from the preset + custom pool.
-function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, existing }) {
+function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, existing, fuseChance }) {
   const sn32 = v => Math.round(v / 32) * 32;
   const sizeOf = r => r.type === 'square' ? Math.max(r.w | 0, r.h | 0) : 2 * (r.r | 0);
   const rooms = existing && existing.rooms ? existing.rooms.map(r => ({ ...r })) : [];
   const connections = existing && existing.connections ? [...existing.connections] : [];
+  // fuseChance 0 = corridor-only layout (every room separate, joined by a
+  // doored corridor). Doors break sightlines between rooms, which keeps the
+  // simultaneous visplane count inside vanilla's 128 limit — the arena page
+  // uses this for crash-proof Chocolate Doom multiplayer maps.
+  const fc = fuseChance == null ? 0.45 : fuseChance;
   let nextN = 1 + rooms.length;
   for (let i = 0; i < roomCount; i++) {
     const p = presets[Math.floor(rng() * presets.length)];
@@ -7123,14 +7134,47 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
       // Pick an anchor — bias toward the most-recently-placed half so the
       // level grows outward instead of clustering on the origin.
       const pool = rooms.slice(Math.max(0, rooms.length - 6));
-      const anchor = pool[Math.floor(rng() * pool.length)];
-      const angle = rng() * Math.PI * 2;
-      const fuse = rng() < 0.45;
-      const span = (sizeOf(anchor) + sizeOf(room)) / 2;
-      const d = sn32(span * (fuse ? 0.65 + rng() * 0.2 : 1.15 + rng() * 0.25));
-      room.cx = sn32(anchor.cx + Math.cos(angle) * d);
-      room.cy = sn32(anchor.cy + Math.sin(angle) * d);
-      if (!fuse) connections.push({ id: 'ewc' + i + '_' + nextN, fromId: anchor.id, toId: id, kind: 'corridor' });
+      const fuse = rng() < fc;
+      const half = r => (r.type === 'square' ? Math.max(r.w, r.h) : 2 * r.r) / 2;
+      if (fuse) {
+        const anchor = pool[Math.floor(rng() * pool.length)];
+        const angle = rng() * Math.PI * 2;
+        const span = (sizeOf(anchor) + sizeOf(room)) / 2;
+        const d = sn32(span * (0.65 + rng() * 0.2));
+        room.cx = sn32(anchor.cx + Math.cos(angle) * d);
+        room.cy = sn32(anchor.cy + Math.sin(angle) * d);
+      } else {
+        // Corridor mode: place on a CARDINAL axis from the anchor (corridors
+        // carve along axes, so cardinal neighbours always connect cleanly)
+        // and retry until the room doesn't collide with ANY existing room —
+        // separated rooms keep sightlines door-gated (visplane safety) and
+        // guarantee the corridor has clear ground to carve through.
+        const overlapsAny = (cx, cy) => {
+          const h = half(room) + 96;   // 96 = corridor clearance margin
+          return rooms.some(o => {
+            const oh = half(o);
+            return Math.abs(cx - o.cx) < h + oh && Math.abs(cy - o.cy) < h + oh;
+          });
+        };
+        let anchor = pool[Math.floor(rng() * pool.length)];
+        let placed = false;
+        for (let attempt = 0; attempt < 48 && !placed; attempt++) {
+          if (attempt % 12 === 11) anchor = rooms[Math.floor(rng() * rooms.length)];
+          const dir = Math.floor(rng() * 4);   // 0 E, 1 N, 2 W, 3 S
+          const span = half(anchor) + half(room);
+          const d = sn32(span + 192 + rng() * 256 + Math.floor(attempt / 8) * 256);
+          const cx = sn32(anchor.cx + (dir === 0 ? d : dir === 2 ? -d : 0));
+          const cy = sn32(anchor.cy + (dir === 1 ? d : dir === 3 ? -d : 0));
+          if (!overlapsAny(cx, cy)) { room.cx = cx; room.cy = cy; placed = true; }
+        }
+        if (!placed) {
+          // Dense cluster — push straight out past the current extent.
+          const ext = Math.max(...rooms.map(o => Math.abs(o.cx) + half(o), 0));
+          room.cx = sn32(ext + half(room) + 256);
+          room.cy = sn32(anchor.cy);
+        }
+        connections.push({ id: 'ewc' + i + '_' + nextN, fromId: anchor.id, toId: id, kind: 'corridor' });
+      }
     }
     rooms.push(room);
   }
@@ -7152,25 +7196,37 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
   things.push({ type: 32000, x: se.cx, y: se.cy, angle: 0, flags: 7 });
   if (extending) return { rooms, connections, things };
   const mPool = ETHER_MONSTERS[difficulty] || ETHER_MONSTERS.medium;
-  const totalArea = rooms.reduce((s, r) => s + sizeOf(r) * sizeOf(r), 0) || 1;
-  for (const r of rooms) {
-    if (r === nw) continue; // spawn room stays safe
-    const ratio = (sizeOf(r) * sizeOf(r)) / totalArea;
-    const n = Math.max(0, Math.round(enemyCount * ratio));
-    const sz = sizeOf(r);
-    for (let k = 0; k < n; k++) {
-      const ox = (rng() - 0.5) * sz * 0.55;
-      const oy = (rng() - 0.5) * sz * 0.55;
+  // Enemy spread: round-robin across ALL non-spawn rooms (each room gets a
+  // flat share before any room gets seconds) instead of area-proportional
+  // clumping in the biggest rooms. Within a room, placements walk a golden-
+  // angle spiral out to 80% of the room span with jitter — monsters cover
+  // the whole floor rather than piling at the centre.
+  const hostRooms = rooms.filter(r => r !== nw);
+  if (hostRooms.length && enemyCount > 0) {
+    const perRoomSeq = [];
+    for (let k = 0; k < enemyCount; k++) perRoomSeq.push(hostRooms[k % hostRooms.length]);
+    const roomPlaced = new Map();
+    for (const r of perRoomSeq) {
+      const sz = sizeOf(r);
+      const idx = (roomPlaced.get(r.id) || 0);
+      roomPlaced.set(r.id, idx + 1);
+      // Golden-angle spiral: even angular coverage, radius grows outward.
+      const ang = idx * 2.399963 + rng() * 0.9;
+      const rad = (0.15 + 0.65 * Math.sqrt((idx + rng()) / Math.max(3, idx + 1))) * sz * 0.5 * 0.8;
       things.push({ type: mPool[Math.floor(rng() * mPool.length)],
-        x: sn32(r.cx + ox), y: sn32(r.cy + oy), angle: 0, flags: 7 });
+        x: sn32(r.cx + Math.cos(ang) * rad), y: sn32(r.cy + Math.sin(ang) * rad),
+        angle: Math.floor(rng() * 8) * 45, flags: 7 });
     }
-    // ~1 goodie per 6 monsters, biased to ammo + small health.
-    const goodies = Math.max(0, Math.round(n / 6));
-    for (let k = 0; k < goodies; k++) {
-      const ox = (rng() - 0.5) * sz * 0.5;
-      const oy = (rng() - 0.5) * sz * 0.5;
+    // ~1 goodie per 6 monsters, spread over the rooms the same way.
+    const goodieCount = Math.round(enemyCount / 6);
+    for (let k = 0; k < goodieCount; k++) {
+      const r = hostRooms[Math.floor(rng() * hostRooms.length)];
+      const sz = sizeOf(r);
+      const ang = rng() * Math.PI * 2;
+      const rad = rng() * sz * 0.3;
       things.push({ type: ETHER_GOODIES[Math.floor(rng() * ETHER_GOODIES.length)],
-        x: sn32(r.cx + ox), y: sn32(r.cy + oy), angle: 0, flags: 7 });
+        x: sn32(r.cx + Math.cos(ang) * rad), y: sn32(r.cy + Math.sin(ang) * rad),
+        angle: 0, flags: 7 });
     }
   }
   return { rooms, connections, things };

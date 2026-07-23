@@ -66,11 +66,12 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P4</div>
+  <div class="msg" style="opacity:0.5">player build P5</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
 <div id="topbar">
+  <button id="btn-start" style="display:none; background:#7fff7f; color:#0a0e1a; font-weight:700">▶ START</button>
   <button id="btn-fs">FULLSCREEN</button>
   <button id="btn-esc">MENU</button>
   <button id="btn-yes">Y</button>
@@ -195,6 +196,27 @@ var Module = {
       bootEl.classList.remove('hidden');
       setBoot(100, 'ENGINE: ' + t.slice(0, 120));
     }
+    // Relay handshake failure ("doom: 1"). A netgame with a dead socket
+    // limps unplayably (the net loop stalls every tic) — stop and offer a
+    // clean solo restart instead.
+    if (/^doom: 1,/.test(t) && qs.get('ws')) {
+      bootEl.classList.remove('hidden');
+      setBoot(100, 'RELAY CONNECTION FAILED — the game socket could not reach ' +
+        (qs.get('ws') || '').replace(/^wss:\/\//, '').split('/')[0] +
+        '. Check the relay deploy / Cloudflare WebSockets setting, or:');
+      if (!document.getElementById('solo-esc')) {
+        const a = document.createElement('a');
+        a.id = 'solo-esc';
+        a.textContent = '▶ PLAY THIS LEVEL SOLO';
+        const solo = new URLSearchParams(location.search);
+        solo.delete('ws'); solo.delete('server'); solo.delete('join');
+        solo.delete('nodes'); solo.delete('dm');
+        a.href = location.pathname + '?' + solo.toString();
+        a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
+          'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
+        bootEl.appendChild(a);
+      }
+    }
   },
   printErr: (t) => console.warn(t),
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),
@@ -287,6 +309,14 @@ document.querySelectorAll('.pad button').forEach((b) => {
 document.getElementById('btn-esc').addEventListener('click', () => {
   sendKey('keydown', 27); setTimeout(() => sendKey('keyup', 27), 80);
 });
+// Netgame hosts see Chocolate Doom's waiting screen ("press SPACE to start").
+// Mobile has no space bar — give hosts an explicit START button.
+if (qs.get('server')) {
+  document.getElementById('btn-start').style.display = '';
+  document.getElementById('btn-start').addEventListener('click', () => {
+    sendKey('keydown', 32); setTimeout(() => sendKey('keyup', 32), 80);
+  });
+}
 document.getElementById('btn-enter').addEventListener('click', () => {
   sendKey('keydown', 13); setTimeout(() => sendKey('keyup', 13), 80);
 });

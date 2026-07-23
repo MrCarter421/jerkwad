@@ -82,7 +82,14 @@ async function handleApiRequest(path, request, env) {
         // in the future this will be our game id
         let id = env.router.idFromString(room)
         let routerObject = env.router.get(id)
-        return routerObject.fetch(path, request)
+        // Forward the ORIGINAL request. The upstream doom-workers code
+        // passed (path, request) — a relative URL string — which the
+        // modern module-workers runtime rejects (Request URLs must be
+        // absolute), 500-ing every game WebSocket while plain HTTPS
+        // routes kept working. Forwarding `request` untouched also
+        // keeps the WebSocket upgrade attached, which a copied Request
+        // would not.
+        return routerObject.fetch(request)
       } else {
         return jsonReply({ reason: 'invalid room' }, 404)
       }

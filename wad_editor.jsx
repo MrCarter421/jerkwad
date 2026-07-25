@@ -1090,6 +1090,12 @@ function _generateDungeonOnce(opts) {
   function cardinalSpan(room, side) {
     if (room.type === 'octagon') return room.r * 0.383;
     if (room.type === 'hexagon') {
+      // N/S are the flat sides (full 0.5r). E/W meet at a VERTEX — there is
+      // no flat wall to cut a doorway into, so refuse E/W corridors here.
+      // (Returning a non-zero span lets tryCorridor place a doorway where no
+      // wall exists: the door then opens into void and the room is sealed.)
+      // Rooms that lose a corridor this way are rescued by the connectivity
+      // guarantee below, which links them with a teleporter pair.
       return (side === 'N' || side === 'S') ? room.r * 0.5 : 0;
     }
     return (side === 'E' || side === 'W') ? room.h / 2 : room.w / 2;
@@ -1224,15 +1230,48 @@ function _generateDungeonOnce(opts) {
     // ShapeShifter explicit connections — try each pair the user drew. If
     // tryCorridor can't fit a corridor between them (walls don't overlap,
     // path blocked by another room) skip silently.
+    const unlinked = [];
     for (const pair of userCorridors) {
       const co = tryCorridor(pair.a, pair.b);
-      if (!co) continue;
+      if (!co) { unlinked.push(pair); continue; }
       const [a, b] = ends(co);
       const dup = corridors.some(t => {
         const [ta, tb] = ends(t);
         return (ta === a && tb === b) || (ta === b && tb === a);
       });
       if (!dup) corridors.push(co);
+    }
+    // A requested connection whose corridor geometry doesn't fit used to be
+    // dropped silently — that's what left whole wings of a level walled off
+    // (e.g. a hexagon room, whose E/W sides are vertices with no flat wall to
+    // cut a doorway into, loses BOTH its corridors and strands everything
+    // downstream). Rescue: for each unlinked pair, try to attach the room
+    // that would otherwise be stranded to ANY room a corridor can actually
+    // reach; if no geometry works at all, link it with a teleporter pair
+    // (needs no wall alignment). The connectivity guarantee further below is
+    // the final backstop that verifies the whole graph.
+    for (const pair of unlinked) {
+      let rescued = false;
+      for (const stranded of [pair.a, pair.b]) {
+        if (rescued) break;
+        // Prefer nearby rooms so the detour reads naturally.
+        const order = rooms.map((_, k) => k)
+          .filter(k => k !== stranded)
+          .sort((x, y) =>
+            Math.hypot(rooms[x].cx - rooms[stranded].cx, rooms[x].cy - rooms[stranded].cy) -
+            Math.hypot(rooms[y].cx - rooms[stranded].cx, rooms[y].cy - rooms[stranded].cy));
+        for (const k of order) {
+          const co2 = tryCorridor(stranded, k);
+          if (!co2) continue;
+          const [a2, b2] = ends(co2);
+          const dup2 = corridors.some(t => {
+            const [ta, tb] = ends(t);
+            return (ta === a2 && tb === b2) || (ta === b2 && tb === a2);
+          });
+          if (!dup2) { corridors.push(co2); rescued = true; break; }
+        }
+      }
+      if (!rescued) userTeleporters.push({ a: pair.a, b: pair.b });
     }
   } else {
   const connected = new Set([0]);
@@ -2680,14 +2719,15 @@ function _generateDungeonOnce(opts) {
   const padClear = (r, px, py, half) => {
     const m = 8;
     // fully inside the room (corners within an inset polygon clear of walls)
-    const ip = roomPoly(r, 40);
+    const ip = roomPoly(r, 40 + TRIM_W * (r.trimLayers || 0));
     if (ip.length < 3) return false;
     for (const [dx, dy] of [[-half, -half], [half, -half], [half, half], [-half, half], [0, 0]]) {
       if (!pointInPolygon(px + dx, py + dy, ip)) return false;
     }
     // clear of the centre feature ring (trimLayers===0 → ring radius = INNER_INSET)
     if (r.feature !== 'none' && r.featureId) {
-      if (Math.hypot(px - r.cx, py - r.cy) < INNER_INSET + half + m) return false;
+      const ringR = TRIM_W * (r.trimLayers || 0) + INNER_INSET;
+      if (Math.hypot(px - r.cx, py - r.cy) < ringR + half + m) return false;
     }
     // clear of pillars / planters
     for (const p of (r.pillars || [])) {
@@ -2715,9 +2755,18 @@ function _generateDungeonOnce(opts) {
   // Grid-scan the open floor for a clear pad spot, preferring the cell
   // nearest the partner room so the pad faces the connection.
   const placePad = (r, towardX, towardY) => {
-    if (r._fused || r.trimLayers !== 0 || r.feature === 'ziggurat') return null;
+    // Trimmed rooms used to be refused outright, which silently killed the
+    // teleporter fallback that rescues rooms no corridor can reach (a
+    // hexagon's E/W sides are vertices, so BOTH its corridors get refused —
+    // with no pad it stayed sealed and took its whole branch with it).
+    // Trim rings are flat walkable floor, so a pad is fine there; padClear()
+    // already keeps it off features, pillars and buildings. Only fused rooms
+    // (grid-rasterized, no clean floor to carve) and ziggurats (stepped all
+    // the way in) still refuse.
+    if (r._fused || r.feature === 'ziggurat') return null;
     const half = 40;
-    const bb = roomBBox(r, 48);
+    // Inset past any trim rings so the pad sits on the innermost flat floor.
+    const bb = roomBBox(r, 48 + TRIM_W * (r.trimLayers || 0));
     if (bb.maxX - bb.minX < 2 * half || bb.maxY - bb.minY < 2 * half) return null;
     let best = null, bestD = Infinity;
     for (let py = Math.ceil(bb.minY / 32) * 32; py <= bb.maxY; py += 32) {
@@ -2729,6 +2778,91 @@ function _generateDungeonOnce(opts) {
     }
     return best;
   };
+  // ---- CONNECTIVITY GUARANTEE -------------------------------------------
+  // Whatever the corridor/fusion outcome, every room must be reachable. Build
+  // the room graph from (a) corridors actually built, (b) fused/overlapping
+  // room pairs (shared open space), (c) teleporters already queued; find the
+  // connected components; then stitch components together with teleporter
+  // pairs, nearest-pair first. Without this, a corridor that failed to fit
+  // (or a room the placer stranded) walls off an entire wing of the level.
+  {
+    const parent = rooms.map((_, i) => i);
+    const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+    for (const co of corridors) { const [a, b] = ends(co); union(a, b); }
+    for (const tp of userTeleporters) union(tp.a, tp.b);
+    // Overlapping rooms share space -> connected, but ONLY when the overlap
+    // is a real doorway-sized region AND the floors are within a step of each
+    // other. A corner graze or a big floor delta is not walkable, and
+    // assuming it was left fused pairs stranded.
+    for (let i = 0; i < rooms.length; i++) {
+      for (let j = i + 1; j < rooms.length; j++) {
+        const bi = roomBBox(rooms[i]), bj = roomBBox(rooms[j]);
+        const ox = Math.min(bi.maxX, bj.maxX) - Math.max(bi.minX, bj.minX);
+        const oy = Math.min(bi.maxY, bj.maxY) - Math.max(bi.minY, bj.minY);
+        if (ox < 96 || oy < 96) continue;                       // graze, not a join
+        if (Math.abs(rooms[i].floorH - rooms[j].floorH) > MAX_STEP) continue;
+        union(i, j);
+      }
+    }
+    // Group rooms by component.
+    const comps = new Map();
+    for (let i = 0; i < rooms.length; i++) {
+      const r = find(i);
+      if (!comps.has(r)) comps.set(r, []);
+      comps.get(r).push(i);
+    }
+    // Merge components until one remains: pick the closest room pair across
+    // the two components and link them (corridor if one fits, else teleport).
+    let groups = [...comps.values()];
+    let guard = rooms.length + 4;
+    while (groups.length > 1 && guard-- > 0) {
+      const base = groups[0];
+      let bestI = -1, bestJ = -1, bestD = Infinity, bestG = 1;
+      for (let g = 1; g < groups.length; g++) {
+        for (const i of base) for (const j of groups[g]) {
+          const d = Math.hypot(rooms[i].cx - rooms[j].cx, rooms[i].cy - rooms[j].cy);
+          if (d < bestD) { bestD = d; bestI = i; bestJ = j; bestG = g; }
+        }
+      }
+      if (bestI < 0) break;
+      // Try EVERY cross-component pair (nearest first) until one yields a
+      // real link: a corridor if the geometry allows, else a teleporter whose
+      // pads can actually be placed. Committing to a teleporter whose pads
+      // later fail to materialize is what left levels split in two.
+      const cross = [];
+      for (const i of base) for (const j of groups[bestG]) {
+        cross.push({ i, j, d: Math.hypot(rooms[i].cx - rooms[j].cx, rooms[i].cy - rooms[j].cy) });
+      }
+      cross.sort((p, q) => p.d - q.d);
+      let linked = false;
+      for (const c of cross) {
+        const co = tryCorridor(c.i, c.j);
+        if (co) {
+          const [a, b] = ends(co);
+          const dup = corridors.some(t => {
+            const [ta, tb] = ends(t);
+            return (ta === a && tb === b) || (ta === b && tb === a);
+          });
+          if (!dup) { corridors.push(co); linked = true; break; }
+        }
+      }
+      if (!linked) {
+        for (const c of cross) {
+          // Only commit to a teleporter if BOTH pads can really be placed.
+          if (placePad(rooms[c.i], rooms[c.j].cx, rooms[c.j].cy) &&
+              placePad(rooms[c.j], rooms[c.i].cx, rooms[c.i].cy)) {
+            userTeleporters.push({ a: c.i, b: c.j });
+            linked = true;
+            break;
+          }
+        }
+      }
+      groups[0] = base.concat(groups[bestG]);
+      groups.splice(bestG, 1);
+    }
+  }
+
   for (const tp of userTeleporters) {
     const ra = rooms[tp.a], rb = rooms[tp.b];
     if (!ra || !rb) continue;
@@ -7137,12 +7271,17 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
       const fuse = rng() < fc;
       const half = r => (r.type === 'square' ? Math.max(r.w, r.h) : 2 * r.r) / 2;
       if (fuse) {
+        // Overlapping placement for spatial variety. Fusion's emitted seam is
+        // not a reliable walkable join (the 32-grid rasterizer can wall it),
+        // so we ALSO request a corridor for the pair — overlap supplies the
+        // interesting shared space, the corridor supplies the guarantee.
         const anchor = pool[Math.floor(rng() * pool.length)];
         const angle = rng() * Math.PI * 2;
         const span = (sizeOf(anchor) + sizeOf(room)) / 2;
-        const d = sn32(span * (0.65 + rng() * 0.2));
+        const d = sn32(span * (0.78 + rng() * 0.14));
         room.cx = sn32(anchor.cx + Math.cos(angle) * d);
         room.cy = sn32(anchor.cy + Math.sin(angle) * d);
+        connections.push({ id: 'ewf' + i + '_' + nextN, fromId: anchor.id, toId: id, kind: 'corridor' });
       } else {
         // Corridor mode: place on a CARDINAL axis from the anchor (corridors
         // carve along axes, so cardinal neighbours always connect cleanly)

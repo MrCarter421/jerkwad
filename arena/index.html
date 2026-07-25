@@ -199,7 +199,13 @@ function generate(seed) {
   const difficulty = enemyCount > 60 ? 'hard' : enemyCount > 25 ? 'medium' : 'easy';
   const lvl = E.etherGenerateLevel({
     rng, presets: ARENA_PRESETS, roomCount, enemyCount, difficulty,
-    fuseChance: 0,   // corridor-only: doors gate sightlines = no visplane overflow
+    // Corridor-only (fuseChance 0). Overlap was measured to break
+    // reachability — fusion's emitted seam is not reliably walkable, so
+    // fused pairs stranded rooms (100% -> 89-94% avg, worst seeds 50%).
+    // Corridor-only is provably 100% reachable at 8/20/40/60 rooms, and
+    // door-gated sightlines also keep visplanes safe. Room-shape variety
+    // comes from the preset mix instead.
+    fuseChance: 0,
   });
   const things = arenaThings(lvl, rng, +$('players').value);
   const map = E.generateShapeShifterMap(lvl.rooms, lvl.connections, things, { seed });
@@ -380,7 +386,7 @@ function joinLevel(lv, btn) {
       const gen = E.etherGenerateLevel({
         rng, presets: ARENA_PRESETS,
         roomCount: lv.rooms, enemyCount: lv.enemies, difficulty,
-        fuseChance: 0,
+        fuseChance: 0,   // must match the host's value — determinism
       });
       const things = arenaThings(gen, rng, lv.maxPlayers);
       const map = E.generateShapeShifterMap(gen.rooms, gen.connections, things, { seed: lv.seed });

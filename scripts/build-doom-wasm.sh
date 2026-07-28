@@ -106,6 +106,47 @@ emcc -I../textscreen -I../opl -I../pcsound -O3 \
   $OBJS doom/libdoom.a ../textscreen/libtextscreen.a \
   ../pcsound/libpcsound.a ../opl/libopl.a -lwebsocket.js -lm
 
+# 7b. SECOND LINK — the FAST engine (no ASYNCIFY) ---------------------------
+# -s ASYNCIFY rewrites every function into a resumable state machine so
+# emscripten_sleep() can block. That costs several times the runtime speed
+# and ~550 KB of code, and the only things needing it are the netgame
+# connect wait and screen-wipe pacing. The main loop is already driven by
+# emscripten_set_main_loop(D_RunFrame), so SOLO play doesn't need it at all.
+# Build a second engine with I_Sleep() as a no-op and the websocket connect
+# wait made non-blocking (JERKWAD_NO_ASYNCIFY); the player page loads this
+# one for solo and the ASYNCIFY one for netgames.
+python3 - <<'PYEOF2'
+s = open('i_timer.c').read()
+if 'JERKWAD_NO_ASYNCIFY' not in s:
+    s = s.replace('''void I_Sleep(int ms)
+{
+    // SDL_Delay(ms);
+    emscripten_sleep(ms);
+}''', '''void I_Sleep(int ms)
+{
+#ifdef JERKWAD_NO_ASYNCIFY
+    (void) ms;   /* main loop paces frames; blocking needs ASYNCIFY */
+#else
+    emscripten_sleep(ms);
+#endif
+}''')
+    open('i_timer.c', 'w').write(s)
+PYEOF2
+emcc -c -DJERKWAD_NO_ASYNCIFY -I.. -I. -I../textscreen -I../opl -I../pcsound -O3 \
+  -s USE_SDL=2 -s USE_SDL_MIXER=2 -s USE_SDL_NET=2 i_timer.c -o i_timer_fast.o
+emcc -c -DJERKWAD_NO_ASYNCIFY -I.. -I. -I../textscreen -I../opl -I../pcsound -O3 \
+  -s USE_SDL=2 -s USE_SDL_MIXER=2 -s USE_SDL_NET=2 net_websockets.c -o net_websockets_fast.o
+FAST_OBJS=$(echo "$OBJS" | sed 's/\bi_timer\.o\b/i_timer_fast.o/; s/\bnet_websockets\.o\b/net_websockets_fast.o/')
+emcc -I../textscreen -I../opl -I../pcsound -O3 \
+  -s INVOKE_RUN=1 -s USE_SDL=2 -s USE_SDL_MIXER=2 -s USE_SDL_NET=2 \
+  -s ASSERTIONS=0 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s TOTAL_STACK=8388608 -s FORCE_FILESYSTEM=1 \
+  -s "EXTRA_EXPORTED_RUNTIME_METHODS=['FS','ccall','callMain']" \
+  -s EXIT_RUNTIME=1 -s USE_PTHREADS=0 \
+  -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+  -o fast-doom.js \
+  $FAST_OBJS doom/libdoom.a ../textscreen/libtextscreen.a \
+  ../pcsound/libpcsound.a ../opl/libopl.a -lwebsocket.js -lm
+
 # 8. Install into the repo ----------------------------------------------------
-cp websockets-doom.js websockets-doom.wasm "$REPO_DIR/play/"
-echo "OK: $(ls -la "$REPO_DIR"/play/websockets-doom.*)"
+cp websockets-doom.js websockets-doom.wasm fast-doom.js fast-doom.wasm "$REPO_DIR/play/"
+echo "OK: $(ls -la "$REPO_DIR"/play/*doom*.wasm)"

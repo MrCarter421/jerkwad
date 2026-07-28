@@ -123,7 +123,14 @@ const RELAY_HOST = qs.get('relay') || 'doom.yuccabucca.com';
 const API = 'https://' + RELAY_HOST;
 const WSS = 'wss://' + RELAY_HOST;
 
-const ARENA_PRESETS = E.SHAPESHIFTER_PRESETS.filter(p => p.feature !== 'terrain');
+// Arena preset pool. Excludes:
+//  - 'terrain': tightly-packed concentric rings, worst visplane pressure.
+//  - hexagons: their E/W sides meet at a VERTEX with no flat wall, so a
+//    hexagon anchored east-west can take no corridor at all; when it also
+//    can't host a teleport pad it strands itself and everything past it.
+//    (Measured: the sole remaining unreachable-room case at 12 rooms.)
+const ARENA_PRESETS = E.SHAPESHIFTER_PRESETS.filter(
+  p => p.feature !== 'terrain' && p.type !== 'hexagon');
 $('rooms').oninput = () => $('roomsv').textContent = $('rooms').value;
 $('enemies').oninput = () => $('enemiesv').textContent = $('enemies').value;
 

@@ -84,6 +84,19 @@ page depends on).
 ## Notes / limits
 
 - Music is off (`-nomusic`): no GUS patches shipped. Sound effects work.
+- TWO engine builds ship. `fast-doom.wasm` (1.39 MB) has no ASYNCIFY and is
+  used for SOLO play; `websockets-doom.wasm` (1.92 MB) keeps ASYNCIFY and is
+  used for NETGAMES (the websocket connect handshake blocks, which needs it).
+  ASYNCIFY rewrites every function into a resumable state machine — that is
+  a large runtime tax for something only the net wait and screen wipes use,
+  since the game loop is already emscripten_set_main_loop driven. Force
+  either with `play/?engine=fast` or `?engine=websockets-doom`.
+- FLAT vs TEXTURE namespaces: Doom keeps floor/ceiling flats separate from
+  wall textures. Naming a wall texture as a sector floorTex makes vanilla
+  abort at load with `R_FlatNumForName: <NAME> not found` — which looks like
+  a level that simply never loads. `scripts/check-textures.js` validates every
+  emitted name against the real freedoom2.wad namespaces; run it after any
+  change to generator texture pools.
 - The engine is Chocolate Doom with the vanilla STATIC RENDER LIMITS
   RAISED (the crash fix): MAXVISPLANES 128->2048, MAXDRAWSEGS 256->4096,
   MAXVISSPRITES 128->2048, MAXOPENINGS x4, MAXPLATS 30->256. Stock

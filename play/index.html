@@ -66,7 +66,7 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P5</div>
+  <div class="msg" style="opacity:0.5">player build P6</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
@@ -270,9 +270,20 @@ const bootHider = setInterval(() => {
   const extra = qs.get('x');
   if (extra) args.push(...extra.split(',').filter(Boolean));
   Module.arguments = args;
-  setBoot(8, 'loading engine…');
+  // ENGINE SELECT. The default build carries -s ASYNCIFY, which rewrites
+  // every function into a resumable state machine so emscripten_sleep() can
+  // block — that instrumentation costs several times the runtime speed and
+  // ~550 KB of code. The only things that need it are the netgame connect
+  // wait and screen-wipe pacing, so SOLO play now uses a fast ASYNCIFY-free
+  // build (I_Sleep is a no-op there; emscripten_set_main_loop already paces
+  // frames). Netgames keep the ASYNCIFY build. ?engine= forces either.
+  const wantsNet = !!qs.get('ws');
+  const engineFile = (qs.get('engine') === 'fast') ? 'fast-doom.js'
+    : (qs.get('engine') === 'websockets-doom') ? 'websockets-doom.js'
+    : (wantsNet ? 'websockets-doom.js' : 'fast-doom.js');
+  setBoot(8, 'loading engine (' + (engineFile === 'fast-doom.js' ? 'fast' : 'netplay') + ')…');
   const sc = document.createElement('script');
-  sc.src = 'websockets-doom.js';
+  sc.src = engineFile;
   sc.onerror = () => setBoot(100, 'BOOT FAILED: engine script failed to load');
   document.body.appendChild(sc);
 })();

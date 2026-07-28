@@ -1215,6 +1215,43 @@ function _generateDungeonOnce(opts) {
     }
     return null;
   }
+  // Relaxed variant used only by the connectivity guarantee's last resort:
+  // same geometry as tryCorridor but without the 32-unit doorway margin and
+  // without the third-room blocking test. Used when a level would otherwise
+  // ship with unreachable rooms.
+  function tryCorridorRelaxed(ai, bi) {
+    const ra = rooms[ai], rb = rooms[bi];
+    const ba = roomBBox(ra), bb = roomBBox(rb);
+    if (ba.maxX + 64 < bb.minX || bb.maxX + 64 < ba.minX) {
+      const west = ba.maxX < bb.minX ? ra : rb;
+      const east = ba.maxX < bb.minX ? rb : ra;
+      const wbb = roomBBox(west), ebb = roomBBox(east);
+      const wSpan = Math.max(cardinalSpan(west, 'E'), CW / 2 + 16);
+      const eSpan = Math.max(cardinalSpan(east, 'W'), CW / 2 + 16);
+      const yLow = Math.max(west.cy - wSpan, east.cy - eSpan);
+      const yHigh = Math.min(west.cy + wSpan, east.cy + eSpan);
+      if (yHigh - yLow >= CW) {
+        const cy = sn((yLow + yHigh) / 2);
+        return { orient: 'H', wIdx: rooms.indexOf(west), eIdx: rooms.indexOf(east),
+          minX: wbb.maxX, maxX: ebb.minX, minY: cy - CW / 2, maxY: cy + CW / 2 };
+      }
+    }
+    if (ba.maxY + 64 < bb.minY || bb.maxY + 64 < ba.minY) {
+      const south = ba.maxY < bb.minY ? ra : rb;
+      const north = ba.maxY < bb.minY ? rb : ra;
+      const sbb = roomBBox(south), nbb = roomBBox(north);
+      const sSpan = Math.max(cardinalSpan(south, 'N'), CW / 2 + 16);
+      const nSpan = Math.max(cardinalSpan(north, 'S'), CW / 2 + 16);
+      const xLow = Math.max(south.cx - sSpan, north.cx - nSpan);
+      const xHigh = Math.min(south.cx + sSpan, north.cx + nSpan);
+      if (xHigh - xLow >= CW) {
+        const cx = sn((xLow + xHigh) / 2);
+        return { orient: 'V', sIdx: rooms.indexOf(south), nIdx: rooms.indexOf(north),
+          minX: cx - CW / 2, maxX: cx + CW / 2, minY: sbb.maxY, maxY: nbb.minY };
+      }
+    }
+    return null;
+  }
   const possible = [];
   for (let a = 0; a < rooms.length; a++) for (let b = a + 1; b < rooms.length; b++) {
     const co = tryCorridor(a, b);
@@ -1356,9 +1393,9 @@ function _generateDungeonOnce(opts) {
     { wall: 'WOOD1',    floor: 'FLOOR5_2', ceil: 'CEIL5_1', trim: 'FLOOR5_4', accent: 'TLITE6_4' },
     { wall: 'GRAY5',    floor: 'FLAT5_4',  ceil: 'CEIL3_1', trim: 'STEP1',    accent: 'TLITE6_6' },
     // Urban / industrial sets — for city blocks, tech bays and brick yards
-    { wall: 'STARTAN3', floor: 'FLOOR0_2', ceil: 'CEIL3_4', trim: 'FLAT1',    accent: 'COMPSPAN' },
-    { wall: 'BROWN144', floor: 'FLAT5_4',  ceil: 'CEIL5_2', trim: 'FLAT5',    accent: 'COMPBLUE' },
-    { wall: 'GRAY7',    floor: 'FLAT1',    ceil: 'CEIL3_4', trim: 'FLAT5_4',  accent: 'LITE5'    },
+    { wall: 'STARTAN3', floor: 'FLOOR0_2', ceil: 'CEIL3_4', trim: 'FLAT1',    accent: 'FLOOR4_8' },
+    { wall: 'BROWN144', floor: 'FLAT5_4',  ceil: 'CEIL5_2', trim: 'FLAT5',    accent: 'FLOOR4_8' },
+    { wall: 'GRAY7',    floor: 'FLAT1',    ceil: 'CEIL3_4', trim: 'FLAT5_4',  accent: 'TLITE6_1'    },
     { wall: 'STONE3',   floor: 'RROCK16',  ceil: 'CEIL3_3', trim: 'STEP2',    accent: 'FLAT5_5'  },
   ];
   // City-block building wall textures — used by the courtyard feature so
@@ -1488,7 +1525,7 @@ function _generateDungeonOnce(opts) {
     if (r.feature === 'foundry') {
       r.ceilH = r.floorH + 176;
       r.light = 160;
-      r.palette = { ...r.palette, wall: 'METAL', floor: 'CRATOP1', trim: 'SUPPORT2', ceil: 'CEIL3_2', accent: 'METAL2' };
+      r.palette = { ...r.palette, wall: 'METAL', floor: 'CRATOP1', trim: 'FLOOR3_3', ceil: 'CEIL3_2', accent: 'FLOOR4_8' };
     }
     if (r.feature === 'observatory') {
       r.hasSky = true;
@@ -1505,7 +1542,7 @@ function _generateDungeonOnce(opts) {
     if (r.feature === 'bunker') {
       r.ceilH = r.floorH + 104;
       r.light = pick([112, 128, 144]);
-      r.palette = { ...r.palette, wall: 'GRAY7', floor: 'FLOOR5_4', trim: 'GRAY5', ceil: 'CEIL5_2', accent: 'GRAYVINE' };
+      r.palette = { ...r.palette, wall: 'GRAY7', floor: 'FLOOR5_4', trim: 'FLAT1', ceil: 'CEIL5_2', accent: 'FLAT1' };
     }
     // Canal — an industrial channel hall: a sunken liquid waterway runs
     // across the room, split by a central land crossing the player walks
@@ -1513,15 +1550,15 @@ function _generateDungeonOnce(opts) {
     if (r.feature === 'canal') {
       r.ceilH = r.floorH + 192;
       r.light = pick([160, 176, 192]);
-      r.palette = { ...r.palette, wall: 'STONE2', floor: 'FLOOR0_1', trim: 'SUPPORT3', ceil: 'CEIL5_2' };
+      r.palette = { ...r.palette, wall: 'STONE2', floor: 'FLOOR0_1', trim: 'FLOOR3_3', ceil: 'CEIL5_2' };
     }
     // Depot — an enclosed industrial warehouse: a combat hall packed with
     // stacked-crate cover at varied heights under a metal-trussed ceiling.
     if (r.feature === 'depot') {
       r.ceilH = r.floorH + 160;
       r.light = pick([144, 160, 176]);
-      r.palette = { ...r.palette, wall: 'METAL', floor: 'FLAT5_4', trim: 'SUPPORT3',
-        ceil: 'CEIL5_1', accent: 'CRATELIT' };
+      r.palette = { ...r.palette, wall: 'METAL', floor: 'FLAT5_4', trim: 'FLOOR3_3',
+        ceil: 'CEIL5_1', accent: 'CRATOP2' };
     }
     // Terrain — a large open-sky field of rolling hills: many tightly-packed
     // concentric rings whose floors undulate up and down in small steps,
@@ -1553,7 +1590,7 @@ function _generateDungeonOnce(opts) {
       r.light = pick([96, 112, 128]);
       r.palette = { ...r.palette, ceil: 'CEIL3_3', floor: pick(['FLAT5_4', 'FLOOR0_1', 'FLAT1']),
         wall: pick(['MARBLE2', 'MARBLE3', 'STONE2', 'GSTONE1']),
-        trim: 'MARBFAC2', accent: 'GSTGARG' };
+        trim: 'FLAT5_4', accent: 'FLAT5_4' };
     }
     // Library — long rectangular hall with parallel rows of tall pillars
     // ("bookshelves"). Wood-stone palette, intermediate ceiling.
@@ -1563,7 +1600,7 @@ function _generateDungeonOnce(opts) {
       r.palette = { ...r.palette, ceil: pick(['FLAT5_4', 'CEIL5_1']),
         floor: pick(['FLAT5_4', 'FLOOR0_3', 'FLAT1']),
         wall: pick(['BROWN1', 'BROWN96', 'WOODMET1', 'PANEL3']),
-        trim: 'WOOD1', accent: 'WOOD3' };
+        trim: 'FLAT5_2', accent: 'FLAT5_2' };
     }
     // Chasm — large square room with a deep central pit and two narrow
     // bridges crossing it (N-S / E-W). Dark stone palette, no sky.
@@ -1571,9 +1608,9 @@ function _generateDungeonOnce(opts) {
       r.ceilH = r.floorH + 224;
       r.light = pick([112, 128, 144]);
       r.palette = { ...r.palette, ceil: pick(['CEIL3_3', 'CEIL5_2']),
-        floor: pick(['FLOOR0_3', 'FLAT5_4', 'GRAY7']),
+        floor: pick(['FLOOR0_3', 'FLAT5_4', 'FLAT1']),
         wall: pick(['STONE3', 'STONE2', 'GRAY7', 'BROWN1']),
-        trim: 'STONE', accent: 'METAL' };
+        trim: 'FLAT5_4', accent: 'FLOOR4_8' };
     }
     // City Block — an open-sky urban grid of solid buildings separated by
     // narrow streets the player threads through (DOOMCITY vibe).
@@ -2013,7 +2050,7 @@ function _generateDungeonOnce(opts) {
             // story to the mezzanine.
             b.liftSec = allocSec({
               floorH: r.floorH + 96, ceilH: intCeilH,
-              floorTex: pick(['FLOOR0_3', 'CEIL5_2', 'FLAT5_4', 'PLAT1']),
+              floorTex: pick(['FLOOR0_3', 'CEIL5_2', 'FLAT5_4', 'FLOOR4_8']),
               ceilTex: pick(['CEIL5_1', 'TLITE6_4']),
               light: Math.min(255, intLight + 24), special: 0, tag: liftTag,
             });
@@ -2258,7 +2295,7 @@ function _generateDungeonOnce(opts) {
       // player walks UP onto rather than a flush continuation of the floor.
       r.terrains.push({ cx: sn(r.cx), cy: sn(r.cy), hw: crossHalf - 16, hh: chHalfH - 16, kind: 'bridge',
         secId: allocSec({ floorH: r.floorH + 8, ceilH: r.ceilH,
-          floorTex: pick(['CEIL5_2', 'METAL', 'SHAWN2', 'SUPPORT3', 'FLOOR0_3']),
+          floorTex: pick(['CEIL5_2', 'FLOOR4_8', 'FLOOR0_3', 'FLOOR3_3', 'FLOOR0_3']),
           ceilTex: r.palette.ceil,
           light: Math.min(255, r.light + 16), special: 0 }) });
     }
@@ -2283,7 +2320,7 @@ function _generateDungeonOnce(opts) {
         hh: longX ? bridgeHalf : pitHalf - 16,
         kind: 'bridge',
         secId: allocSec({ floorH: r.floorH, ceilH: r.ceilH,
-          floorTex: pick(['CEIL5_2', 'METAL', 'FLOOR0_3', 'SUPPORT3']),
+          floorTex: pick(['CEIL5_2', 'FLOOR4_8', 'FLOOR0_3', 'FLOOR3_3']),
           ceilTex: r.palette.ceil, light: r.light, special: 0 }) });
     }
     if (r.feature === 'plaza' && minDim >= 640) {
@@ -2855,6 +2892,26 @@ function _generateDungeonOnce(opts) {
             userTeleporters.push({ a: c.i, b: c.j });
             linked = true;
             break;
+          }
+        }
+      }
+      if (!linked) {
+        // LAST RESORT: no corridor geometry fits and no room in either
+        // component can host a teleport pad (small/heavily-furnished rooms,
+        // or a hexagon whose only free sides are vertices). Rather than ship
+        // a split level, force a corridor between the closest pair by
+        // relaxing tryCorridor's wall-span requirement — connect via the
+        // pair's own room CENTRES, which always have a flat span to cut.
+        for (const c of cross) {
+          const ra = rooms[c.i], rb = rooms[c.j];
+          const co = tryCorridorRelaxed(c.i, c.j);
+          if (co) {
+            const [a, b] = ends(co);
+            const dup = corridors.some(t => {
+              const [ta, tb] = ends(t);
+              return (ta === a && tb === b) || (ta === b && tb === a);
+            });
+            if (!dup) { corridors.push(co); linked = true; break; }
           }
         }
       }

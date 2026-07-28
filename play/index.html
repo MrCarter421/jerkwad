@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>JerkWad Player — Chocolate Doom WASM</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0e1a">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden;
+    background: #0a0e1a; color: #c5d4e8;
+    font-family: system-ui, sans-serif; touch-action: none; }
+  #stage { position: fixed; inset: 0; display: flex;
+    align-items: center; justify-content: center; }
+  canvas { background: #000; max-width: 100vw; max-height: 100vh;
+    image-rendering: pixelated; }
+  /* Landscape touch devices: stretch the frame to FILL the screen (no
+     letterbox), touch controls float on top. */
+  @media (orientation: landscape) and (pointer: coarse) {
+    canvas { width: 100vw !important; height: 100vh !important;
+      max-width: none; max-height: none; }
+  }
+  #boot { position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; z-index: 50;
+    background: #0a0e1a; transition: opacity 0.5s; padding: 24px; text-align: center; }
+  #boot h1 { color: #ff9d3d; letter-spacing: 0.2em; font-size: 20px; }
+  #boot .bar { width: min(420px, 80vw); height: 10px; border: 1px solid #243759;
+    border-radius: 5px; overflow: hidden; }
+  #boot .bar > div { height: 100%; width: 0%; background: #7fffd4; transition: width 0.2s; }
+  #boot .msg { font-size: 12px; color: #6b7d99; min-height: 2em; }
+  #boot.hidden { opacity: 0; pointer-events: none; }
+  .pad { position: fixed; z-index: 40; user-select: none; -webkit-user-select: none; }
+  .pad button { position: absolute; display: flex; align-items: center; justify-content: center;
+    background: rgba(20,32,51,0.55); color: #7fffd4; border: 1px solid rgba(127,255,212,0.5);
+    border-radius: 50%; font-size: 15px; font-weight: 700;
+    width: 58px; height: 58px; touch-action: none; }
+  .pad button:active, .pad button.on { background: rgba(127,255,212,0.35); }
+  #dpad { left: calc(env(safe-area-inset-left) + 14px); bottom: calc(env(safe-area-inset-bottom) + 20px);
+    width: 180px; height: 180px; }
+  #dpad .u { left: 61px; top: 0; }  #dpad .d { left: 61px; bottom: 0; }
+  #dpad .l { left: 0; top: 61px; }  #dpad .r { right: 0; top: 61px; }
+  #dpad .sl { left: 0; top: 0; font-size: 11px; }
+  #dpad .sr { right: 0; top: 0; font-size: 11px; }
+  #acts { right: calc(env(safe-area-inset-right) + 14px); bottom: calc(env(safe-area-inset-bottom) + 20px);
+    width: 190px; height: 190px; }
+  #acts .fire { right: 0; bottom: 62px; width: 72px; height: 72px; color: #ff5c5c; border-color: rgba(255,92,92,0.55); }
+  #acts .use  { right: 84px; bottom: 8px; }
+  #acts .wpn  { right: 90px; bottom: 116px; font-size: 11px; color: #ffb74d; border-color: rgba(255,183,77,0.55); }
+  #topbar { position: fixed; top: calc(env(safe-area-inset-top) + 8px); right: 10px; z-index: 40;
+    display: flex; gap: 6px; }
+  #topbar button { background: rgba(20,32,51,0.55); color: #c5d4e8; border: 1px solid #243759;
+    border-radius: 4px; font-size: 11px; padding: 7px 10px; }
+  #hint { position: fixed; top: calc(env(safe-area-inset-top) + 8px); left: 10px;
+    font-size: 10px; color: #6b7d99; z-index: 40; max-width: 50vw; }
+  @media (hover: hover) and (pointer: fine) {
+    /* Desktop: hide touch pads (keyboard play) */
+    .pad { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="boot">
+  <h1>JERKWAD PLAYER</h1>
+  <div class="bar"><div id="bootbar"></div></div>
+  <div class="msg" id="bootmsg">loading engine…</div>
+  <div class="msg" style="opacity:0.5">player build P4</div>
+</div>
+<div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
+<div id="hint"></div>
+<div id="topbar">
+  <button id="btn-fs">FULLSCREEN</button>
+  <button id="btn-esc">MENU</button>
+  <button id="btn-yes">Y</button>
+  <button id="btn-enter">ENTER</button>
+</div>
+<div class="pad" id="dpad">
+  <button class="u" data-key="38">▲</button>
+  <button class="d" data-key="40">▼</button>
+  <button class="l" data-key="37">◀</button>
+  <button class="r" data-key="39">▶</button>
+  <button class="sl" data-key="188">⟨STR</button>
+  <button class="sr" data-key="190">STR⟩</button>
+</div>
+<div class="pad" id="acts">
+  <button class="fire" data-key="17">FIRE</button>
+  <button class="use"  data-key="32">USE</button>
+  <button class="wpn"  id="btn-wpn">WPN</button>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// JerkWad browser player. Boots Chocolate Doom (cloudflare/doom-wasm fork,
+// WebSockets netplay build) with freedoom2.wad as the IWAD and — when
+// present — the last WAD exported from ShapeShifter, read from IndexedDB
+// (db 'jerkwad', store 'wads', key 'current'; written by the DOOM button).
+//
+// Query params:
+//   ?wad=<url>        also merge a PWAD fetched from a URL
+//   ?warp=N           warp to MAPxx (default 1 when a user WAD is loaded)
+//   ?skill=N          1-5 (default 3)
+//   ?ws=wss://host    WebSocket relay (Cloudflare Worker) for multiplayer
+//   ?server=1         host a netgame (with ?ws)
+//   ?join=1           join a netgame (with ?ws)
+//   ?nodes=N          number of players expected when hosting (default 2)
+//   ?solo=1           -solo-net (test netgame alone)
+// ---------------------------------------------------------------------------
+const qs = new URLSearchParams(location.search);
+window.addEventListener('error', (e) => {
+  try { setBoot(100, 'ERROR: ' + (e.message || e.type) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '')); } catch (x) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { setBoot(100, 'ERROR: ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason))); } catch (x) {}
+});
+const bootEl = document.getElementById('boot');
+const bootBar = document.getElementById('bootbar');
+const bootMsg = document.getElementById('bootmsg');
+const hintEl = document.getElementById('hint');
+const setBoot = (pct, msg) => { bootBar.style.width = pct + '%'; if (msg) bootMsg.textContent = msg; };
+
+function readUserWad() {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open('jerkwad', 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore('wads'); };
+      req.onsuccess = () => {
+        try {
+          const tx = req.result.transaction('wads', 'readonly');
+          const get = tx.objectStore('wads').get('current');
+          get.onsuccess = () => resolve(get.result || null);
+          get.onerror = () => resolve(null);
+        } catch (e) { resolve(null); }
+      };
+      req.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+
+// Engine args must be FINAL before websockets-doom.js is evaluated —
+// emscripten snapshots Module.arguments at script load, so we build the
+// arg list (async IndexedDB read included) first and inject the engine
+// script dynamically afterwards. The binary file staging happens in
+// preRun (it needs the runtime FS object).
+let userWadBytes = null;
+
+var Module = {
+  canvas: document.getElementById('canvas'),
+  arguments: [],           // finalized in boot() before script injection
+  preRun: [function () {
+    // Block run() until the IWAD + optional PWADs are staged into MEMFS.
+    Module.addRunDependency('jerkwad-files');
+    (async function stage() {
+      try {
+        setBoot(30, 'fetching freedoom2.wad…');
+        const iwadRes = await fetch('freedoom2.wad');
+        if (!iwadRes.ok) throw new Error('freedoom2.wad HTTP ' + iwadRes.status);
+        let iwad = new Uint8Array(await iwadRes.arrayBuffer());
+        // canOwn=true (6th arg): MEMFS takes the typed array instead of
+        // copying it — halves peak memory for the 28 MB IWAD, which matters
+        // a lot on memory-constrained mobile browsers.
+        FS.createDataFile('/', 'freedoom2.wad', iwad, true, true, true);
+        setBoot(60, 'IWAD staged (' + (iwad.length >> 20) + ' MB)');
+        iwad = null;   // drop our reference; MEMFS owns it now
+        if (userWadBytes) {
+          FS.createDataFile('/', 'shapeshifter.wad', new Uint8Array(userWadBytes), true, true, true);
+          setBoot(70, 'ShapeShifter WAD staged (' + userWadBytes.byteLength + ' bytes)');
+          userWadBytes = null;   // free the level bytes after staging
+        }
+        const wadUrl = qs.get('wad');
+        if (wadUrl) {
+          setBoot(75, 'fetching ' + wadUrl + '…');
+          const r = await fetch(wadUrl);
+          if (r.ok) FS.createDataFile('/', 'extra.wad', new Uint8Array(await r.arrayBuffer()), true, true, true);
+        }
+        setBoot(90, 'starting: ' + Module.arguments.join(' '));
+      } catch (e) {
+        setBoot(100, 'BOOT FAILED: ' + e.message);
+        throw e;
+      } finally {
+        Module.removeRunDependency('jerkwad-files');
+      }
+    })();
+  }],
+  print: (t) => {
+    console.log(t);
+    // Engine protocol lines: "doom: N, message"
+    if (/^doom: /.test(t)) hintEl.textContent = t.replace(/^doom: \d+,\s*/, '');
+    if (/^doom: 10/.test(t)) hintEl.textContent = 'net game started';
+    // A fatal engine error (visplane overflow, etc.) prints here right before
+    // the runtime exits — surface it on the (re-shown) boot screen instead of
+    // leaving a silent black canvas, so crashes are diagnosable.
+    if (/I_Error|R_Error|overflow|Error:/i.test(t)) {
+      bootEl.classList.remove('hidden');
+      setBoot(100, 'ENGINE: ' + t.slice(0, 120));
+    }
+  },
+  printErr: (t) => console.warn(t),
+  onRuntimeInitialized: () => setBoot(95, 'engine ready'),
+  postRun: [() => { bootEl.classList.add('hidden'); }],
+};
+// Hide the boot screen the moment the canvas starts rendering.
+const bootHider = setInterval(() => {
+  const c = Module.canvas;
+  if (c.width > 64) { bootEl.classList.add('hidden'); clearInterval(bootHider); }
+}, 500);
+
+// Build the final argument list, then inject the engine script.
+(async function boot() {
+  setBoot(5, 'reading saved WAD…');
+  userWadBytes = await readUserWad();
+  // Opened by the editor's DOOM button? The WAD write races our load —
+  // poll for up to 6 s before concluding there's no user level.
+  if ((qs.get('wait') || window.opener) && (!userWadBytes || userWadBytes.byteLength <= 16)) {
+    for (let i = 0; i < 20 && (!userWadBytes || userWadBytes.byteLength <= 16); i++) {
+      await new Promise(r => setTimeout(r, 300));
+      userWadBytes = await readUserWad();
+    }
+  }
+  if (userWadBytes && userWadBytes.byteLength <= 16) userWadBytes = null;
+  const args = ['-iwad', 'freedoom2.wad', '-nomusic'];
+  let haveUserWad = !!userWadBytes;
+  if (haveUserWad) args.push('-merge', 'shapeshifter.wad');
+  if (qs.get('wad')) { args.push('-merge', 'extra.wad'); haveUserWad = true; }
+  const joiningEarly = qs.get('ws') && qs.get('join');
+  if (!joiningEarly) {
+    const warp = qs.get('warp') || (haveUserWad ? '1' : null);
+    if (warp) args.push('-warp', warp);
+    args.push('-skill', qs.get('skill') || '3');
+  }
+  const ws = qs.get('ws');
+  const joining = ws && qs.get('join');
+  if (ws) {
+    args.push('-wss', ws);
+    if (qs.get('server')) {
+      args.push('-server');
+      args.push('-nodes', qs.get('nodes') || '2');
+      if (qs.get('dm')) args.push('-deathmatch');
+    } else if (joining) {
+      // The doom server peer is always uid 1 on the relay; the websocket
+      // transport resolves -connect via atoi(), so the address is "1".
+      args.push('-connect', '1');
+    }
+    if (qs.get('solo')) args.push('-solo-net');
+    hintEl.textContent = 'net: ' + ws;
+  }
+  const extra = qs.get('x');
+  if (extra) args.push(...extra.split(',').filter(Boolean));
+  Module.arguments = args;
+  setBoot(8, 'loading engine…');
+  const sc = document.createElement('script');
+  sc.src = 'websockets-doom.js';
+  sc.onerror = () => setBoot(100, 'BOOT FAILED: engine script failed to load');
+  document.body.appendChild(sc);
+})();
+
+// ---------------------------------------------------------------------------
+// Touch controls — synthesize keyboard events for SDL2's emscripten backend.
+// keyCodes: arrows 37-40, Ctrl 17 (fire), Space 32 (use), , 188 . 190
+// (strafe), Escape 27, Enter 13, y 89.
+// ---------------------------------------------------------------------------
+function sendKey(type, keyCode) {
+  const ev = new KeyboardEvent(type, { keyCode, which: keyCode, bubbles: true });
+  // SDL2 listens on window; KeyboardEvent keyCode is read-only in some
+  // browsers when constructed — defineProperty forces it.
+  try {
+    Object.defineProperty(ev, 'keyCode', { get: () => keyCode });
+    Object.defineProperty(ev, 'which', { get: () => keyCode });
+  } catch (e) {}
+  window.dispatchEvent(ev);
+  document.dispatchEvent(ev);
+  Module.canvas.dispatchEvent(ev);
+}
+document.querySelectorAll('.pad button').forEach((b) => {
+  if (!b.dataset.key) return;   // WPN has its own cycling handler
+  const kc = +b.dataset.key;
+  const down = (e) => { e.preventDefault(); b.classList.add('on'); sendKey('keydown', kc); };
+  const up = (e) => { e.preventDefault(); b.classList.remove('on'); sendKey('keyup', kc); };
+  b.addEventListener('touchstart', down, { passive: false });
+  b.addEventListener('touchend', up, { passive: false });
+  b.addEventListener('touchcancel', up, { passive: false });
+  b.addEventListener('mousedown', down);
+  b.addEventListener('mouseup', up);
+  b.addEventListener('mouseleave', (e) => { if (b.classList.contains('on')) up(e); });
+});
+document.getElementById('btn-esc').addEventListener('click', () => {
+  sendKey('keydown', 27); setTimeout(() => sendKey('keyup', 27), 80);
+});
+document.getElementById('btn-enter').addEventListener('click', () => {
+  sendKey('keydown', 13); setTimeout(() => sendKey('keyup', 13), 80);
+});
+document.getElementById('btn-yes').addEventListener('click', () => {
+  sendKey('keydown', 89); setTimeout(() => sendKey('keyup', 89), 80);
+});
+// WPN button cycles weapon slots 2→3→4→5→6→7→1. Selecting an unowned slot
+// is a harmless no-op in Doom, so tapping again advances to the next one.
+const WPN_KEYS = [50, 51, 52, 53, 54, 55, 49];   // '2'..'7', then '1'
+let wpnIdx = 0;
+document.getElementById('btn-wpn').addEventListener('click', () => {
+  const kc = WPN_KEYS[wpnIdx++ % WPN_KEYS.length];
+  sendKey('keydown', kc);
+  setTimeout(() => sendKey('keyup', kc), 80);
+});
+document.getElementById('btn-fs').addEventListener('click', () => {
+  const el = document.documentElement;
+  if (document.fullscreenElement) document.exitFullscreen();
+  else {
+    const p = (el.requestFullscreen || el.webkitRequestFullscreen || function(){}).call(el);
+    // Lock to landscape where supported — the game is unplayable portrait.
+    if (p && p.then) p.then(() => {
+      try { screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {}); }
+      catch (e) {}
+    }).catch(() => {});
+  }
+});
+</script>
+
+</body>
+</html>

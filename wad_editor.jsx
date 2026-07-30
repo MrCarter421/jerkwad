@@ -2974,16 +2974,23 @@ function _generateDungeonOnce(opts) {
     // player full headroom regardless of room floor mismatch. The DOOR1
     // panel still fills exactly 72 units when floors match, and a clean
     // step when they don't.
+    // A header is the SOLID underside of a lintel, not open air: its ceiling
+    // sits at fh+72, far below an open-sky room's ceiling plane. Inheriting
+    // F_SKY1 here made the resolve pass see sky-on-both-sides and skip the
+    // upper texture (Doom deliberately draws no upper between two sky
+    // sectors), so you saw sky through the strip above the door. Force a
+    // real flat whenever the room is skylit.
+    const lintelCeil = (p) => (p.ceil === 'F_SKY1' ? 'CEIL3_5' : p.ceil);
     co.headerAId = allocSec({
       floorH: ra.floorH, ceilH: fh + 72,
       floorTex: ra.palette.floor,
-      ceilTex: ra.palette.ceil,
+      ceilTex: lintelCeil(ra.palette),
       light: ra.light, special: 0,
     });
     co.headerBId = allocSec({
       floorH: rb.floorH, ceilH: fh + 72,
       floorTex: rb.palette.floor,
-      ceilTex: rb.palette.ceil,
+      ceilTex: lintelCeil(rb.palette),
       light: rb.light, special: 0,
     });
   });
@@ -7026,7 +7033,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.54</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.55</span>
         </div>
         <div className="flex gap-1.5">
           {onOpenEther && !previewMap && (
@@ -7495,7 +7502,7 @@ function EtherWad({ onEditInShapeShifter, onBack, customPresets }) {
         padding: '6px 8px', borderBottom: '1px solid ' + COLORS.border, background: COLORS.bgPanel,
         paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div style={{ color: '#9966ff', fontWeight: 700, letterSpacing: '0.18em', fontSize: 13 }}>
-          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.54</span>
+          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.55</span>
         </div>
         <button onClick={onBack}
           style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',

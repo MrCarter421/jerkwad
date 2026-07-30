@@ -9,7 +9,7 @@ browser. Three generations of tooling live in this repo, all inside `wad_editor.
 | **ShapeShifter** (`ShapeShifter`) | Room-composition editor: place preset rooms on a canvas, drag them together to **fuse**, connect with corridors/teleporters, drop things, BUILD → validated map → PLAY/SAVE exports a vanilla-Doom WAD. | The main app. |
 | **EtherWad** (`EtherWad`) | Automated level generator on top of the ShapeShifter engine. Quantum-random entropy, room-count/enemy/difficulty dials, generates overlapping compositions with intelligent thing placement, hands off to ShapeShifter for editing. | Newest layer (V0.53+). |
 
-Current version: **V0.54** (see the version `<span>` in the ShapeShifter/EtherWad headers).
+Current version: **V0.55** (see the version `<span>` in the ShapeShifter/EtherWad headers).
 
 ## Repo layout
 
@@ -35,25 +35,16 @@ CLAUDE.md        — this file.
 exact marker lines `      try {` and `      } catch (e) {` inside its boot script, and
 mounts `ShapeShifterApp`.
 
-Rebuild steps (Node + esbuild; puppeteer for e2e):
+Rebuild steps (Node + esbuild; puppeteer for e2e) — both scripts are committed:
 
-```js
-// build_app.js — wad_editor.jsx → /tmp/app.js
-const src = fs.readFileSync('wad_editor.jsx', 'utf8')
-  .replace(/^import React.*from 'react';$/m,
-    'const { useState, useRef, useEffect, useCallback, useMemo, useReducer } = React;')
-  .replace(/^export default /m, '');
-fs.writeFileSync('/tmp/app.js',
-  esbuild.transformSync(src, { loader: 'jsx', minify: true, target: 'es2017' }).code);
-
-// build_html.js — splice /tmp/app.js into index.html
-// Replace everything between the `      try {` line and the `      } catch (e) {` line with:
-//   <app.js content>
-//   var rootEl = document.getElementById("root");
-//   var root = ReactDOM.createRoot(rootEl);
-//   root.render(React.createElement(ShapeShifterApp));
-// Also refresh the <meta name="jerkwad-build"> timestamp.
 ```
+node scripts/build_app.js /tmp/app.js    # wad_editor.jsx → minified bundle
+node scripts/build_html.js /tmp/app.js   # splice into index.html + refresh build meta
+node scripts/build_engine.js             # arena/engine.js — React-free generator bundle
+```
+
+esbuild is expected at `/tmp/node_modules/esbuild` (override with `ESBUILD=<path>`).
+`build_html.js` fails loudly if the `      try {` / `      } catch (e) {` markers move.
 
 Bump the version string (`V0.xx</span>`, appears in both ShapeShifter and EtherWad headers)
 on every user-visible change.
@@ -181,8 +172,27 @@ QUAD PITS, ZIGGURAT nested tiers). Saved presets appear as amber chips in PLACE 
 
 ## Testing
 
-No committed test suite — tests are session-local Node scripts (the `/tmp` harness dies
-with the session; recreate as needed). The two key recipes:
+`scripts/` holds the committed validators. All are headless Node, all take
+`[seeds] [rooms]`-ish args, all exit non-zero on failure. Run the battery after any
+generator change:
+
+```
+node scripts/build_engine.js            # arena/engine.js — validators load THIS, rebuild first
+node scripts/check-load.js 30 8         # topology closes, no inverted sectors, WAD lumps complete
+node scripts/check-textures.js 20 14    # every flat/texture exists in freedoom2.wad namespaces
+node scripts/check-skybleed.js 20 14    # no unpainted ceiling gaps, no sky-ceilinged door lintels
+node scripts/check-spawns.js            # no player start inside solid geometry / without headroom
+node scripts/check-reachability.js      # every room reachable from P1 through doors/teleporters
+FUSE=0.25 node scripts/check-skybleed.js 12 14   # the editor's fused path (arena is corridor-only)
+```
+
+Deploy build: `node scripts/build_app.js /tmp/app.js && node scripts/build_html.js /tmp/app.js`.
+
+**A validator that can't fail is worse than none.** Twice now a check has read 0/N
+because it was inspecting field names the map never had (`frontSidedef` instead of
+`front`) or forgiving the exact case it was written to catch. Always run a *negative
+control*: rebuild the engine with the fix reverted and confirm the number moves.
+`check-skybleed.js` honours `JERKWAD_ENGINE=<path>` for precisely this.
 
 **Headless generator harness** (no browser): esbuild-transform `wad_editor.jsx` to CJS,
 stub React, append `module.exports = { generateShapeShifterMap, buildSectorLoops, ... }`,
@@ -222,6 +232,11 @@ actually exist* in the output.
 - V0.53: **EtherWad** — QRNG entropy, generate/add-areas, handoff to editor.
 - V0.54: bay-shelter door trim, catacombs/library/chasm themes, add-areas keeps
   monster count flat.
+- V0.55: **door lintels no longer show sky.** Header (door soffit) sectors inherited
+  `palette.ceil`, which is `F_SKY1` in skylit rooms, so the resolve pass saw
+  sky-on-both-sides and skipped the upper texture — 61 door tops per 20 levels rendered
+  open sky. Headers now force a real flat. Plus arena spawn relocation (no player start
+  inside solid geometry) and a playable landscape view in `play/` (build P7).
 
 ## Known issues / next ideas
 

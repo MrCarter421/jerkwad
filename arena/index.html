@@ -146,6 +146,85 @@ const quantumSeed = () => {
   return (u[0] & 0x7fffffff) || 1;
 };
 
+
+// ---- spawn safety ---------------------------------------------------------
+// Doom needs a spawn to sit in an OPEN sector (floor < ceil) with >= 56 units
+// of headroom and no solid column inside the player's 16-unit radius. A start
+// on a pillar top / building slab leaves the player stuck in geometry, which
+// makes the level unplayable. Given a built map, move any unsafe player start
+// (types 1-4, 11) to the nearest verified-safe spot in its room.
+const PLAYER_HEIGHT = 56, PLAYER_RADIUS = 16;
+function relocateUnsafeSpawns(map, things, rooms) {
+  const secById = new Map(map.sectors.map(s => [s.id, s]));
+  const sdById = new Map(map.sidedefs.map(s => [s.id, s]));
+  const vById = new Map(map.vertices.map(v => [v.id, v]));
+  // Per-sector bounding boxes (what the engine's point lookup effectively uses).
+  const bounds = new Map();
+  for (const l of map.linedefs) {
+    for (const side of [l.front, l.back]) {
+      if (side === -1 || side == null) continue;
+      const sd = sdById.get(side); if (!sd) continue;
+      const a = vById.get(l.v1), b = vById.get(l.v2); if (!a || !b) continue;
+      let e = bounds.get(sd.sector);
+      if (!e) { e = { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity }; bounds.set(sd.sector, e); }
+      e.x0 = Math.min(e.x0, a.x, b.x); e.x1 = Math.max(e.x1, a.x, b.x);
+      e.y0 = Math.min(e.y0, a.y, b.y); e.y1 = Math.max(e.y1, a.y, b.y);
+    }
+  }
+  const boundsArr = [...bounds.entries()].map(([sid, e]) => ({ sid, e,
+    area: (e.x1 - e.x0) * (e.y1 - e.y0), sec: secById.get(sid) }))
+    .filter(x => x.sec);
+  boundsArr.sort((a, b) => a.area - b.area);
+  const safeAt = (x, y) => {
+    let inner = null;
+    for (const c of boundsArr) {
+      if (x < c.e.x0 || x > c.e.x1 || y < c.e.y0 || y > c.e.y1) continue;
+      inner = c; break;                       // smallest containing sector
+    }
+    if (!inner) return false;                  // void
+    const s = inner.sec;
+    if (s.ceilH <= s.floorH) return false;     // inside solid geometry
+    if (s.ceilH - s.floorH < PLAYER_HEIGHT) return false;   // no headroom
+    // No solid column jammed into the player's cylinder.
+    for (const c of boundsArr) {
+      if (c.sec.ceilH > c.sec.floorH) continue;             // not solid
+      if (x + PLAYER_RADIUS <= c.e.x0 || x - PLAYER_RADIUS >= c.e.x1) continue;
+      if (y + PLAYER_RADIUS <= c.e.y0 || y - PLAYER_RADIUS >= c.e.y1) continue;
+      if (c.sec.floorH > s.floorH + 24) return false;       // column rises here
+    }
+    return true;
+  };
+  const sn = v => Math.round(v / 8) * 8;
+  let changed = false;
+  const out = things.map(t => {
+    const isStart = (t.type >= 1 && t.type <= 4) || t.type === 11;
+    if (!isStart || safeAt(t.x, t.y)) return t;
+    // Search outward from the original spot: rings of candidates, then the
+    // centres of every room as a fallback.
+    const cands = [];
+    for (let ring = 1; ring <= 10; ring++) {
+      const rad = ring * 48;
+      for (let k = 0; k < 12; k++) {
+        const a = (k / 12) * Math.PI * 2;
+        cands.push([sn(t.x + Math.cos(a) * rad), sn(t.y + Math.sin(a) * rad)]);
+      }
+    }
+    for (const r of rooms) {
+      cands.push([sn(r.cx), sn(r.cy)]);
+      const span = (r.type === 'square' ? Math.min(r.w, r.h) : 2 * r.r) / 2;
+      for (const f of [0.4, 0.6]) for (let k = 0; k < 8; k++) {
+        const a = k * Math.PI / 4;
+        cands.push([sn(r.cx + Math.cos(a) * span * f), sn(r.cy + Math.sin(a) * span * f)]);
+      }
+    }
+    for (const [cx, cy] of cands) {
+      if (safeAt(cx, cy)) { changed = true; return { ...t, x: cx, y: cy }; }
+    }
+    return t;   // nothing better found; leave as-is
+  });
+  return changed ? out : things;
+}
+
 // ---- multiplayer thing placement ------------------------------------------
 // On top of the EtherWad scatter (monsters/goodies/P1/exit) add: P2-P4 co-op
 // starts at mutually-farthest rooms, deathmatch starts, weapons in the
@@ -215,7 +294,14 @@ function generate(seed) {
     fuseChance: 0,
   });
   const things = arenaThings(lvl, rng, +$('players').value);
-  const map = E.generateShapeShifterMap(lvl.rooms, lvl.connections, things, { seed });
+  // Two-pass placement: build once to learn the real geometry, relocate any
+  // spawn that landed inside a pillar/slab, then rebuild. Blind placement put
+  // ~14% of starts inside solid geometry (player spawns stuck — unplayable).
+  let map = E.generateShapeShifterMap(lvl.rooms, lvl.connections, things, { seed });
+  const fixedThings = relocateUnsafeSpawns(map, things, lvl.rooms);
+  if (fixedThings !== things) {
+    map = E.generateShapeShifterMap(lvl.rooms, lvl.connections, fixedThings, { seed });
+  }
   const wadBuf = E.buildWad({ MAP01: map });
   const ms = Math.round(performance.now() - t0);
   current = { seed, roomCount, enemyCount, map, wadBuf };
@@ -396,7 +482,11 @@ function joinLevel(lv, btn) {
         fuseChance: 0,   // must match the host's value — determinism
       });
       const things = arenaThings(gen, rng, lv.maxPlayers);
-      const map = E.generateShapeShifterMap(gen.rooms, gen.connections, things, { seed: lv.seed });
+      let map = E.generateShapeShifterMap(gen.rooms, gen.connections, things, { seed: lv.seed });
+      const fixedThings = relocateUnsafeSpawns(map, things, gen.rooms);
+      if (fixedThings !== things) {
+        map = E.generateShapeShifterMap(gen.rooms, gen.connections, fixedThings, { seed: lv.seed });
+      }
       await saveWad(E.buildWad({ MAP01: map }));
       const url = '../play/?wait=1&join=1&ws=' + encodeURIComponent(WSS + '/api/ws/' + lv.room);
       if (win) win.location = url;

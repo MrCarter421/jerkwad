@@ -186,7 +186,10 @@ node scripts/check-reachability.js      # every room reachable from P1 through d
 FUSE=0.25 node scripts/check-skybleed.js 12 14   # the editor's fused path (arena is corridor-only)
 ```
 
-Deploy build: `node scripts/build_app.js /tmp/app.js && node scripts/build_html.js /tmp/app.js`.
+Deploying: **`node scripts/deploy.js`** runs the whole pipeline (build → validate →
+stage → package → upload → Worker → verify). See `DEPLOY.md`. `--dry-run` stops before
+uploading; `--code-only` skips the ~31 MB engine + IWAD. The publish set is an allowlist
+inside that script — `dist/` is rejected if it contains anything the manifest doesn't name.
 
 **A validator that can't fail is worse than none.** Twice now a check has read 0/N
 because it was inspecting field names the map never had (`frontSidedef` instead of

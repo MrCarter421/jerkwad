@@ -2,7 +2,7 @@
 // (Previously a throwaway /tmp script; committed so the build is reproducible.)
 const fs = require('fs');
 const path = require('path');
-const esbuild = require(process.env.ESBUILD || '/tmp/node_modules/esbuild');
+const esbuild = require('./lib/esbuild')();
 const ROOT = path.join(__dirname, '..');
 const OUT = process.argv[2] || '/tmp/app.js';
 

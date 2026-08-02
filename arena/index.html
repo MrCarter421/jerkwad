@@ -452,19 +452,41 @@ async function refreshLobby() {
     for (const lv of list.levels) {
       const tr = document.createElement('tr');
       const full = lv.players >= lv.maxPlayers;
-      tr.innerHTML = '<td>' + (lv.name || 'UNNAMED') + (lv.dm ? ' <span style="color:#ff5c5c">DM</span>' : '') + '</td>'
-        + '<td class="stat">' + lv.rooms + ' rooms · ' + lv.enemies + ' mobs</td>'
-        + '<td>' + lv.players + ' / ' + lv.maxPlayers + '</td><td></td>';
+      // Level names come from whoever published the arena — NEVER interpolate
+      // them into innerHTML. Building the cells as text nodes means a name like
+      // `<svg onload=...>` renders as those literal characters instead of
+      // executing on yuccabucca.com for every visitor reading the lobby.
+      const tdName = document.createElement('td');
+      tdName.textContent = lv.name || 'UNNAMED';
+      if (lv.dm) {
+        const dm = document.createElement('span');
+        dm.style.color = '#ff5c5c';
+        dm.textContent = ' DM';
+        tdName.appendChild(dm);
+      }
+      const tdStat = document.createElement('td');
+      tdStat.className = 'stat';
+      tdStat.textContent = (lv.rooms | 0) + ' rooms · ' + (lv.enemies | 0) + ' mobs';
+      const tdPlayers = document.createElement('td');
+      tdPlayers.textContent = (lv.players | 0) + ' / ' + (lv.maxPlayers | 0);
+      const tdJoin = document.createElement('td');
+      tr.append(tdName, tdStat, tdPlayers, tdJoin);
       const btn = document.createElement('button');
       btn.className = 'btn join';
       btn.textContent = full ? 'FULL' : 'JOIN';
       btn.disabled = full;
       btn.onclick = () => joinLevel(lv, btn);
-      tr.lastChild.appendChild(btn);
+      tdJoin.appendChild(btn);
       tbody.appendChild(tr);
     }
   } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="4" style="color:#ff5c5c">lobby error: ' + e.message + '</td></tr>';
+    // e.message can carry server-controlled text too — same rule.
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 4; td.style.color = '#ff5c5c';
+    td.textContent = 'lobby error: ' + e.message;
+    tr.appendChild(td);
+    tbody.innerHTML = ''; tbody.appendChild(tr);
   }
 }
 

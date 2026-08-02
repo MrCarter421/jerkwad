@@ -225,7 +225,15 @@ export class Lobby {
       }
       const entry = {
         room: String(body.room).slice(0, 80),
-        name: String(body.name || 'UNNAMED').slice(0, 24),
+        // Defence in depth: the arena page renders names as text nodes, but
+        // anyone can POST here from any origin, so don't STORE anything that
+        // could hurt a future/third-party client that is less careful.
+        // Arena names are a display label — letters, digits and basic
+        // punctuation are all they ever need.
+        name: (String(body.name || 'UNNAMED')
+          .replace(/[^A-Za-z0-9 _.\-!?']/g, '')
+          .trim()
+          .slice(0, 24)) || 'UNNAMED',
         seed: body.seed | 0,
         rooms: Math.max(1, Math.min(100, body.rooms | 0)),
         enemies: Math.max(0, Math.min(100, body.enemies | 0)),

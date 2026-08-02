@@ -30,9 +30,39 @@ Everything is same-origin — no CORS, no special headers needed. Serve
 `.wasm` with `application/wasm` (Pages does automatically).
 
 **Mobile controls** appear automatically on touch devices: left D-pad =
-move/turn, FIRE / USE / strafe buttons on the right, plus MENU / ENTER / Y
-buttons for the Doom menus. On desktop use the keyboard (arrows + Ctrl +
-Space, standard Chocolate Doom bindings).
+move/turn, FIRE / USE / strafe buttons on the right, plus WPN to cycle
+weapons and MENU / ENTER / Y for the Doom menus. On desktop use the keyboard
+(arrows + Ctrl + Space, standard Chocolate Doom bindings).
+
+**Orientation is the player's choice** — portrait and landscape both play.
+There is no rotate-to-landscape gate and no orientation lock (build P8 removed
+both; the old overlay covered the screen in portrait and could not be
+dismissed).
+
+**Sizing.** layoutCanvas() measures `window.innerWidth/innerHeight` — the
+viewport actually on screen — and scales the engine's framebuffer *uniformly*
+to fit. Two traps it avoids:
+
+- `100vh` does NOT shrink for a phone's address bar, so sizing off it made the
+  frame taller than the visible area.
+- Chocolate Doom does its own aspect correction: it draws the 320x200 view
+  correctly proportioned inside whatever framebuffer SDL hands it. So the
+  shape to preserve is `canvas.width/height`, not a hardcoded 4:3 — assuming
+  4:3 squeezed SDL's 844x390 buffer into 520x390 and distorted a picture that
+  was already right.
+
+A **FIT / FILL** button toggles between uniform scaling (default) and
+edge-to-edge stretch; the choice persists in localStorage. When SDL sizes its
+framebuffer to the canvas (the usual case) both give the same 1:1 result.
+
+**Audio** is initialised before the engine loads: the page creates the
+AudioContext itself and hands it to SDL (the glue adopts it via
+`if (!SDL2.audioContext)`), then keeps a persistent resume handler on every
+gesture plus tab re-focus. Emscripten's own `autoResumeAudioContext` uses
+`listenOnce` — a ONE-SHOT listener on document/#canvas — so if the first
+gesture landed before the context existed, or the tab was backgrounded (which
+re-suspends it), audio stayed dead or returned at random. A 🔈 SOUND button
+appears only while the context is still suspended.
 
 ## Multiplayer (yuccabucca.com / Cloudflare)
 

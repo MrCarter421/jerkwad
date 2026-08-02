@@ -16,31 +16,14 @@
   #stage { position: fixed; inset: 0; display: flex;
     align-items: center; justify-content: center; overflow: hidden; }
   canvas { background: #000; max-width: 100vw; max-height: 100vh;
-    image-rendering: pixelated; }
-  /* Touch devices in LANDSCAPE: the game frame fills the whole viewport and
-     the touch pads overlay it. SDL keeps writing inline width/height on the
-     canvas every resize, so these rules must be !important AND must override
-     the intrinsic aspect — object-fit: fill stretches the 320x200 buffer to
-     the screen instead of letterboxing it into a thin strip. */
-  @media (orientation: landscape) and (pointer: coarse) {
-    #stage { align-items: stretch; justify-content: stretch; }
-    canvas {
-      width: 100vw !important; height: 100vh !important;
-      max-width: none !important; max-height: none !important;
-      object-fit: fill;
-      display: block;
-    }
-  }
-  /* Touch devices in PORTRAIT: the game is unplayable squashed, so show the
-     frame across the top and tell the player to rotate. */
-  @media (orientation: portrait) and (pointer: coarse) {
-    #rotate-hint { display: flex !important; }
-  }
-  #rotate-hint { display: none; position: fixed; inset: 0; z-index: 45;
-    background: rgba(10,14,26,0.92); color: #ff9d3d;
-    flex-direction: column; align-items: center; justify-content: center;
-    gap: 14px; font-size: 15px; text-align: center; padding: 24px; }
-  #rotate-hint .big { font-size: 40px; }
+    image-rendering: pixelated; display: block; }
+  /* Touch devices: layoutCanvas() sets the exact pixel size on every resize.
+     It measures window.innerWidth/innerHeight — the viewport actually on
+     screen — instead of 100vw/100vh, which include the strip behind the
+     browser chrome and so made the frame taller than the visible area. */
+  /* Portrait plays fine and stays centred. It deliberately has no padding:
+     when the frame fills the viewport height, padding on #stage would push it
+     down and `overflow: hidden` would clip the status bar off the bottom. */
   #boot { position: fixed; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 12px; z-index: 50;
     background: #0a0e1a; transition: opacity 0.5s; padding: 24px; text-align: center; }
@@ -84,17 +67,14 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P7</div>
+  <div class="msg" style="opacity:0.5">player build P8</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
-<div id="rotate-hint">
-  <div class="big">📱↻</div>
-  <div>Rotate to landscape to play</div>
-  <div style="font-size:12px;color:#6b7d99">then tap FULLSCREEN for the full view</div>
-</div>
 <div id="hint"></div>
 <div id="topbar">
   <button id="btn-start" style="display:none; background:#7fff7f; color:#0a0e1a; font-weight:700">▶ START</button>
+  <button id="btn-sound" style="display:none; background:#ffb74d; color:#0a0e1a; font-weight:700">🔈 SOUND</button>
+  <button id="btn-fit">FIT</button>
   <button id="btn-fs">FULLSCREEN</button>
   <button id="btn-esc">MENU</button>
   <button id="btn-yes">Y</button>
@@ -245,28 +225,115 @@ var Module = {
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),
   postRun: [() => { bootEl.classList.add('hidden'); }],
 };
-// SDL rewrites the canvas's inline size on every SDL_SetWindowSize; on touch
-// landscape we re-assert the full-viewport stretch so the frame never falls
-// back to a letterboxed strip.
-function enforceCanvasFill() {
+// ---------------------------------------------------------------------------
+// AUDIO. Two things made sound arrive late and inconsistently:
+//
+//  1. SDL creates its AudioContext when the game opens the audio device, well
+//     into engine startup. A context created without a user gesture starts
+//     SUSPENDED, so the opening sounds were written into a context that
+//     wasn't running yet.
+//  2. Emscripten's autoResumeAudioContext() arms its resume handler with
+//     listenOnce — a ONE-SHOT listener, on document/#canvas only, for
+//     keydown/mousedown/touchstart. If that first gesture landed before the
+//     context existed, or the tab was backgrounded (which re-suspends the
+//     context), nothing ever re-armed it and audio stayed dead or came back
+//     at random.
+//
+// So: build the context ourselves at page load, hand it to SDL (the glue does
+// `if (!SDL2.audioContext)` and adopts ours), and keep a PERSISTENT resume
+// handler on every gesture plus tab re-focus.
+// ---------------------------------------------------------------------------
+const AudioCtor = window.AudioContext || window.webkitAudioContext;
+let audioCtx = null;
+if (AudioCtor) {
+  try {
+    audioCtx = new AudioCtor({ latencyHint: 'interactive' });
+    Module.SDL2 = Module.SDL2 || {};
+    Module.SDL2.audioContext = audioCtx;
+  } catch (e) { audioCtx = null; }
+}
+function resumeAudio() {
+  if (!audioCtx) return;
+  if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+  updateSoundHint();
+}
+function updateSoundHint() {
+  const b = document.getElementById('btn-sound');
+  if (!b) return;
+  b.style.display = (audioCtx && audioCtx.state !== 'running') ? '' : 'none';
+}
+// capture:true so a control that calls preventDefault/stopPropagation on its
+// own touch handling can never starve the resume.
+['pointerdown', 'touchstart', 'mousedown', 'keydown', 'click'].forEach(ev =>
+  window.addEventListener(ev, resumeAudio, { capture: true, passive: true }));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeAudio(); });
+if (audioCtx) audioCtx.onstatechange = updateSoundHint;
+
+// ---------------------------------------------------------------------------
+// LAYOUT. Doom renders a 320x200 buffer that is MEANT to be displayed at 4:3
+// (non-square pixels). Stretching that across a 19.5:9 phone is what made the
+// picture look squashed. Default to the largest correctly-proportioned frame
+// the visible viewport allows — the touch pads then sit in the margins
+// instead of on top of the game — with a FILL toggle for anyone who prefers
+// edge-to-edge over correct proportions.
+// ---------------------------------------------------------------------------
+const DOOM_ASPECT = 4 / 3;      // fallback before the engine sizes anything
+let fitMode = 'fit';
+try { fitMode = localStorage.getItem('jerkwadFit') || 'fit'; } catch (e) {}
+let applyingLayout = false;
+
+// The shape to preserve is the ENGINE'S FRAMEBUFFER, not a constant. Chocolate
+// Doom does its own aspect correction — it draws the 320x200 view correctly
+// proportioned inside whatever framebuffer SDL gave it, pillarboxing as
+// needed. So the only safe rule is to scale that framebuffer UNIFORMLY.
+// Hardcoding 4:3 here squeezed SDL's 844x390 buffer into a 520x390 box and
+// distorted a picture that was already correct.
+function frameAspect(c) {
+  // Before SDL sizes it, a canvas reports the 300x150 HTML default — that is
+  // not the engine's shape, so fall back until the attribute really exists.
+  if (!c.getAttribute('width') || !c.getAttribute('height')) return DOOM_ASPECT;
+  const w = c.width, h = c.height;
+  return (w > 0 && h > 0) ? w / h : DOOM_ASPECT;
+}
+
+function layoutCanvas() {
   const c = Module.canvas;
-  if (!c) return;
-  const touch = window.matchMedia('(pointer: coarse)').matches;
-  const landscape = window.matchMedia('(orientation: landscape)').matches;
-  if (touch && landscape) {
-    c.style.setProperty('width', '100vw', 'important');
-    c.style.setProperty('height', '100vh', 'important');
+  if (!c || applyingLayout) return;
+  applyingLayout = true;
+  try {
+    if (!window.matchMedia('(pointer: coarse)').matches) {
+      ['width', 'height', 'max-width', 'max-height'].forEach(p => c.style.removeProperty(p));
+      return;
+    }
+    // innerWidth/innerHeight are the viewport actually on screen. 100vh does
+    // NOT shrink for the browser's address bar, so the old rule sized the
+    // frame taller than the visible area and the picture came out squashed.
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const aspect = frameAspect(c);
+    let w, h;
+    if (fitMode === 'fill') { w = vw; h = vh; }
+    else {
+      // Largest uniformly-scaled frame that fits. Never grows past the
+      // viewport, so SDL resizing its buffer to match cannot oscillate.
+      w = vw; h = w / aspect;
+      if (h > vh) { h = vh; w = h * aspect; }
+    }
+    c.style.setProperty('width', Math.round(w) + 'px', 'important');
+    c.style.setProperty('height', Math.round(h) + 'px', 'important');
     c.style.setProperty('max-width', 'none', 'important');
     c.style.setProperty('max-height', 'none', 'important');
-    c.style.objectFit = 'fill';
-  } else {
-    c.style.removeProperty('width');
-    c.style.removeProperty('height');
-  }
+    c.style.objectFit = 'fill';   // the box already carries the right aspect
+  } finally { applyingLayout = false; }
 }
-window.addEventListener('resize', enforceCanvasFill);
-window.addEventListener('orientationchange', () => setTimeout(enforceCanvasFill, 250));
-setInterval(enforceCanvasFill, 1000);
+window.addEventListener('resize', layoutCanvas);
+window.addEventListener('orientationchange', () => setTimeout(layoutCanvas, 250));
+// SDL_SetWindowSize rewrites the canvas's inline width/height. Re-assert the
+// moment it does, rather than leaving the frame wrong until the next poll.
+try {
+  new MutationObserver(layoutCanvas)
+    .observe(document.getElementById('canvas'), { attributes: true, attributeFilter: ['style', 'width', 'height'] });
+} catch (e) {}
+setInterval(layoutCanvas, 1000);   // backstop
 
 // Hide the boot screen the moment the canvas starts rendering.
 const bootHider = setInterval(() => {
@@ -393,14 +460,26 @@ document.getElementById('btn-fs').addEventListener('click', () => {
   const el = document.documentElement;
   if (document.fullscreenElement) document.exitFullscreen();
   else {
+    // No orientation lock: portrait is playable now, and forcing landscape
+    // took the choice away from the player.
     const p = (el.requestFullscreen || el.webkitRequestFullscreen || function(){}).call(el);
-    // Lock to landscape where supported — the game is unplayable portrait.
-    if (p && p.then) p.then(() => {
-      try { screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {}); }
-      catch (e) {}
-    }).catch(() => {});
+    if (p && p.then) p.catch(() => {});
   }
+  setTimeout(layoutCanvas, 200);
 });
+// FIT keeps Doom's 4:3 proportions (default); FILL stretches edge to edge.
+const fitBtn = document.getElementById('btn-fit');
+function paintFitBtn() { fitBtn.textContent = fitMode === 'fit' ? 'FIT' : 'FILL'; }
+paintFitBtn();
+fitBtn.addEventListener('click', () => {
+  fitMode = fitMode === 'fit' ? 'fill' : 'fit';
+  try { localStorage.setItem('jerkwadFit', fitMode); } catch (e) {}
+  paintFitBtn();
+  layoutCanvas();
+});
+document.getElementById('btn-sound').addEventListener('click', resumeAudio);
+updateSoundHint();
+layoutCanvas();
 </script>
 
 </body>

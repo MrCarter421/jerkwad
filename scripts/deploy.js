@@ -181,12 +181,16 @@ const human = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
         ['sky bleed / door tops',['scripts/check-skybleed.js', '10', '14']],
         ['spawn safety',         ['scripts/check-spawns.js']],
         ['room reachability',    ['scripts/check-reachability.js']],
+        ['player layout + audio', ['scripts/check-player-layout.js']],
       ];
       let bad = 0;
       for (const [label, args] of CHECKS) {
         if (!fs.existsSync(path.join(ROOT, args[0]))) { warn(`${label} — script missing, skipped`); continue; }
         const r = run(process.execPath, args);
-        if (r.code === 0) ok(label);
+        // exit 2 means the check could not run here (e.g. no browser). Say so
+        // plainly rather than counting it as a pass.
+        if (r.code === 2) warn(label + ' — ' + (r.out.trim().split('\n').pop() || 'skipped'));
+        else if (r.code === 0) ok(label);
         else { bad++; fail(label); console.log(dim(r.out.split('\n').slice(-14).join('\n'))); }
       }
       if (bad) {

@@ -70,6 +70,8 @@ for testing.
 ## API summary (worker)
 
 ```
+GET  /api/health                  → { ok, build, time }        is the relay live + which build
+GET  /api/echo   (WS upgrade)     → echoes frames back         WebSocket transport probe
 GET  /api/newroom                 → { room }                  create signed room id
 GET  /api/room/<room>             → { room, gameStarted, players }
 WS   /api/ws/<room>               → per-room packet relay (Durable Object)
@@ -77,6 +79,21 @@ POST /api/lobby/register          → { ok }    body: { room, name, seed, rooms,
                                                enemies, maxPlayers, dm }
 GET  /api/lobby/list              → { levels: [ …entry, players ] }
 ```
+
+`health` and `echo` exist to diagnose "cannot connect". `health` is a plain GET
+that proves DNS + the Cloudflare route + the worker; `echo` is a WebSocket that
+proves the upgrade actually works through Cloudflare — the part a plain HTTPS
+check can't see. The play page's connection-failure screen runs both and shows
+which one broke:
+
+- both fail → DNS, the `doom.yuccabucca.com/*` route, or the worker is down.
+- health ok, echo fails → **Cloudflare WebSockets are off, or the worker was
+  not redeployed** with this code. This is the usual cause.
+- both ok but the game won't start → the Doom netgame layer, not the relay.
+
+**Redeploy after pulling this** (`cd workers/doom-relay && npx wrangler deploy`).
+Confirm it took by opening `https://doom.yuccabucca.com/api/health` — it should
+report `"build":"relay-2"`. `DOOM_KEY` persists across deploys; don't re-set it.
 
 Lobby entries expire after 4 h, or after 10 min with zero connected
 players. Room ids are signed with DOOM_KEY (vendored silentspacemarine

@@ -1,3 +1,8 @@
+// Bump on every worker deploy. /api/health echoes it so the arena page — and
+// you — can confirm which build is actually live at doom.yuccabucca.com,
+// rather than guessing from the dashboard's version list.
+const BUILD = 'relay-2'
+
 export default {
   async fetch(request, env) {
     let url = new URL(request.url)
@@ -98,6 +103,25 @@ async function handleApiRequest(path, request, env) {
       room = await createRoom(env)
       return jsonReply({ room: room }, 200)
 
+    // Is the relay alive, and which build? Cheap GET, no Durable Object.
+    case 'health':
+      return jsonReply({ ok: true, build: BUILD, time: Date.now() }, 200)
+
+    // Transport probe. Isolates "the WebSocket path through Cloudflare works"
+    // from "the Doom netgame handshake works" — the play page's TEST RELAY
+    // button opens this and echoes a ping. If echo succeeds but a game still
+    // fails, the problem is in the game layer, not the relay. If echo fails,
+    // it is DNS / the route / Cloudflare WebSockets / an un-redeployed worker.
+    case 'echo': {
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        return jsonReply({ ok: true, note: 'connect with a websocket to echo-test' }, 200)
+      }
+      const [client, server] = Object.values(new WebSocketPair())
+      server.accept()
+      server.addEventListener('message', (e) => { try { server.send(e.data) } catch (x) {} })
+      return new Response(null, { status: 101, webSocket: client })
+    }
+
     default:
       return jsonReply({ reason: 'api not found' }, 404)
   }
@@ -146,6 +170,11 @@ export class Router {
 
         await this.handleSession(server)
         return new Response(null, { status: 101, webSocket: client })
+
+      // A Durable Object that returns undefined is a runtime error (it shows
+      // up as a spike in the dashboard's error count). Answer unknown paths.
+      default:
+        return jsonReply({ reason: 'router: unknown path' }, 404)
     }
   }
 
@@ -176,10 +205,13 @@ export class Router {
         // send this packet to the corresponding client
         i = this.sessions.map(c => c.from).indexOf(to)
         if (i != -1) {
-          this.sessions[i].ws.send(data.slice(4))
+          try { this.sessions[i].ws.send(data.slice(4)) } catch (x) { /* peer gone */ }
         }
       } catch (err) {
-        webSocket.send(err.stack)
+        // Sending the stack back down a game socket corrupts the binary
+        // protocol (and throws again if the socket is already closing).
+        // Swallow it — a single bad frame must not tear the relay down.
+        try { console.log('relay session error: ' + (err && err.stack || err)) } catch (x) {}
       }
     })
 

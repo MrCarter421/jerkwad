@@ -15,15 +15,29 @@
     font-family: system-ui, sans-serif; touch-action: none; }
   #stage { position: fixed; inset: 0; display: flex;
     align-items: center; justify-content: center; overflow: hidden; }
+  /* Desktop: centred at natural size. */
   canvas { background: #000; max-width: 100vw; max-height: 100vh;
     image-rendering: pixelated; display: block; }
-  /* Touch devices: layoutCanvas() sets the exact pixel size on every resize.
-     It measures window.innerWidth/innerHeight — the viewport actually on
-     screen — instead of 100vw/100vh, which include the strip behind the
-     browser chrome and so made the frame taller than the visible area. */
-  /* Portrait plays fine and stays centred. It deliberately has no padding:
-     when the frame fills the viewport height, padding on #stage would push it
-     down and `overflow: hidden` would clip the status bar off the bottom. */
+  /* Touch devices: the earlier build read canvas.width/height in JS to size
+     the frame, but the engine sets the backing store to a FIXED Doom
+     resolution independent of the screen — so that math produced a tiny box
+     on real phones. Instead let the canvas box fill the viewport and let the
+     browser's object-fit preserve the picture's aspect. object-fit reads the
+     canvas backing store as the intrinsic size, so `contain` letterboxes the
+     game at the largest UNDISTORTED size no matter what resolution the engine
+     picked — no JS, nothing to get wrong.
+       dvw/dvh track the viewport actually visible under the mobile browser
+     chrome (the address bar); vw/vh are the fallback for older engines.
+       !important beats the inline width/height SDL writes on the canvas. */
+  @media (pointer: coarse) {
+    canvas {
+      width: 100vw !important;  height: 100vh !important;
+      width: 100dvw !important; height: 100dvh !important;
+      max-width: none !important; max-height: none !important;
+      object-fit: contain;                /* FIT: keep aspect, letterbox */
+    }
+    body.fill canvas { object-fit: fill; } /* FILL: stretch edge to edge */
+  }
   #boot { position: fixed; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 12px; z-index: 50;
     background: #0a0e1a; transition: opacity 0.5s; padding: 24px; text-align: center; }
@@ -67,7 +81,7 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P8</div>
+  <div class="msg" style="opacity:0.5">player build P9</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
@@ -218,6 +232,7 @@ var Module = {
         a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
           'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
         bootEl.appendChild(a);
+        addRelayTest();   // let the player see WHERE it broke
       }
     }
   },
@@ -225,6 +240,42 @@ var Module = {
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),
   postRun: [() => { bootEl.classList.add('hidden'); }],
 };
+
+// Relay self-test shown on the connection-failure screen. It splits the two
+// possible causes apart so a bug report can be specific:
+//   HEALTH  — a plain GET; proves DNS + the Cloudflare route + the worker.
+//   ECHO    — a WebSocket that echoes a byte; proves WebSockets actually
+//             upgrade through Cloudflare (the part a plain HTTPS check misses).
+// If both pass but the game still won't connect, the fault is the Doom netgame
+// layer, not the relay — which is a very different fix.
+function addRelayTest() {
+  if (document.getElementById('relay-test')) return;
+  const ws = qs.get('ws') || '';
+  const origin = ws.replace(/^wss:/, 'https:').replace(/\/api\/ws\/.*$/, '');
+  const line = document.createElement('div');
+  line.id = 'relay-test';
+  line.style.cssText = 'margin-top:14px;font-size:12px;color:#c5d4e8;max-width:90vw;line-height:1.7';
+  bootEl.appendChild(line);
+  const set = (html) => { line.innerHTML = 'relay self-test:<br>' + html; };
+  let health = '…', echo = '…';
+  const paint = () => set('&nbsp;&nbsp;HEALTH (route): ' + health + '<br>&nbsp;&nbsp;ECHO (websocket): ' + echo);
+  paint();
+
+  fetch(origin + '/api/health', { cache: 'no-store' })
+    .then(r => r.json())
+    .then(j => { health = '✅ up, build ' + (j.build || '?'); paint(); })
+    .catch(e => { health = '❌ ' + e.message + ' (route/DNS/worker not reachable)'; paint(); });
+
+  try {
+    const probe = new WebSocket(origin.replace(/^https:/, 'wss:') + '/api/echo');
+    probe.binaryType = 'arraybuffer';
+    const timer = setTimeout(() => { echo = '❌ timeout (WebSockets not upgrading)'; paint(); try { probe.close(); } catch (x) {} }, 8000);
+    probe.onopen = () => probe.send(new Uint8Array([1, 2, 3, 4]));
+    probe.onmessage = (m) => { clearTimeout(timer); echo = '✅ round-trip ok'; paint(); probe.close(); };
+    probe.onerror = () => { clearTimeout(timer); echo = '❌ connection failed (Cloudflare WebSockets off, or worker not redeployed)'; paint(); };
+    probe.onclose = (e) => { if (echo === '…') { clearTimeout(timer); echo = '❌ closed before echo (code ' + e.code + ')'; paint(); } };
+  } catch (e) { echo = '❌ ' + e.message; paint(); }
+}
 // ---------------------------------------------------------------------------
 // AUDIO. Two things made sound arrive late and inconsistently:
 //
@@ -270,70 +321,17 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) resu
 if (audioCtx) audioCtx.onstatechange = updateSoundHint;
 
 // ---------------------------------------------------------------------------
-// LAYOUT. Doom renders a 320x200 buffer that is MEANT to be displayed at 4:3
-// (non-square pixels). Stretching that across a 19.5:9 phone is what made the
-// picture look squashed. Default to the largest correctly-proportioned frame
-// the visible viewport allows — the touch pads then sit in the margins
-// instead of on top of the game — with a FILL toggle for anyone who prefers
-// edge-to-edge over correct proportions.
+// LAYOUT is CSS now (see the `pointer: coarse` block). The canvas box fills
+// the visible viewport (100dvw x 100dvh) and object-fit does the aspect work:
+//   FIT  = object-fit: contain — largest UNDISTORTED size, letterboxed
+//   FILL = object-fit: fill    — stretched edge to edge
+// object-fit reads the engine's real backing store, so nothing here needs to
+// know or guess the resolution. The only JS is the toggle.
 // ---------------------------------------------------------------------------
-const DOOM_ASPECT = 4 / 3;      // fallback before the engine sizes anything
 let fitMode = 'fit';
 try { fitMode = localStorage.getItem('jerkwadFit') || 'fit'; } catch (e) {}
-let applyingLayout = false;
-
-// The shape to preserve is the ENGINE'S FRAMEBUFFER, not a constant. Chocolate
-// Doom does its own aspect correction — it draws the 320x200 view correctly
-// proportioned inside whatever framebuffer SDL gave it, pillarboxing as
-// needed. So the only safe rule is to scale that framebuffer UNIFORMLY.
-// Hardcoding 4:3 here squeezed SDL's 844x390 buffer into a 520x390 box and
-// distorted a picture that was already correct.
-function frameAspect(c) {
-  // Before SDL sizes it, a canvas reports the 300x150 HTML default — that is
-  // not the engine's shape, so fall back until the attribute really exists.
-  if (!c.getAttribute('width') || !c.getAttribute('height')) return DOOM_ASPECT;
-  const w = c.width, h = c.height;
-  return (w > 0 && h > 0) ? w / h : DOOM_ASPECT;
-}
-
-function layoutCanvas() {
-  const c = Module.canvas;
-  if (!c || applyingLayout) return;
-  applyingLayout = true;
-  try {
-    if (!window.matchMedia('(pointer: coarse)').matches) {
-      ['width', 'height', 'max-width', 'max-height'].forEach(p => c.style.removeProperty(p));
-      return;
-    }
-    // innerWidth/innerHeight are the viewport actually on screen. 100vh does
-    // NOT shrink for the browser's address bar, so the old rule sized the
-    // frame taller than the visible area and the picture came out squashed.
-    const vw = window.innerWidth, vh = window.innerHeight;
-    const aspect = frameAspect(c);
-    let w, h;
-    if (fitMode === 'fill') { w = vw; h = vh; }
-    else {
-      // Largest uniformly-scaled frame that fits. Never grows past the
-      // viewport, so SDL resizing its buffer to match cannot oscillate.
-      w = vw; h = w / aspect;
-      if (h > vh) { h = vh; w = h * aspect; }
-    }
-    c.style.setProperty('width', Math.round(w) + 'px', 'important');
-    c.style.setProperty('height', Math.round(h) + 'px', 'important');
-    c.style.setProperty('max-width', 'none', 'important');
-    c.style.setProperty('max-height', 'none', 'important');
-    c.style.objectFit = 'fill';   // the box already carries the right aspect
-  } finally { applyingLayout = false; }
-}
-window.addEventListener('resize', layoutCanvas);
-window.addEventListener('orientationchange', () => setTimeout(layoutCanvas, 250));
-// SDL_SetWindowSize rewrites the canvas's inline width/height. Re-assert the
-// moment it does, rather than leaving the frame wrong until the next poll.
-try {
-  new MutationObserver(layoutCanvas)
-    .observe(document.getElementById('canvas'), { attributes: true, attributeFilter: ['style', 'width', 'height'] });
-} catch (e) {}
-setInterval(layoutCanvas, 1000);   // backstop
+function applyFit() { document.body.classList.toggle('fill', fitMode === 'fill'); }
+applyFit();
 
 // Hide the boot screen the moment the canvas starts rendering.
 const bootHider = setInterval(() => {
@@ -465,9 +463,9 @@ document.getElementById('btn-fs').addEventListener('click', () => {
     const p = (el.requestFullscreen || el.webkitRequestFullscreen || function(){}).call(el);
     if (p && p.then) p.catch(() => {});
   }
-  setTimeout(layoutCanvas, 200);
 });
-// FIT keeps Doom's 4:3 proportions (default); FILL stretches edge to edge.
+// FIT keeps the picture's real proportions (default); FILL stretches it edge
+// to edge. Both are just an object-fit swap via the body.fill class.
 const fitBtn = document.getElementById('btn-fit');
 function paintFitBtn() { fitBtn.textContent = fitMode === 'fit' ? 'FIT' : 'FILL'; }
 paintFitBtn();
@@ -475,11 +473,10 @@ fitBtn.addEventListener('click', () => {
   fitMode = fitMode === 'fit' ? 'fill' : 'fit';
   try { localStorage.setItem('jerkwadFit', fitMode); } catch (e) {}
   paintFitBtn();
-  layoutCanvas();
+  applyFit();
 });
 document.getElementById('btn-sound').addEventListener('click', resumeAudio);
 updateSoundHint();
-layoutCanvas();
 </script>
 
 </body>

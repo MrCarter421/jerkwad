@@ -39,21 +39,22 @@ There is no rotate-to-landscape gate and no orientation lock (build P8 removed
 both; the old overlay covered the screen in portrait and could not be
 dismissed).
 
-**Sizing.** layoutCanvas() measures `window.innerWidth/innerHeight` — the
-viewport actually on screen — and scales the engine's framebuffer *uniformly*
-to fit. Two traps it avoids:
+**Sizing (build P9).** The canvas box fills the visible viewport (`100dvw`
+x `100dvh`, which track the area under the mobile browser chrome), and CSS
+`object-fit` does the aspect work:
 
-- `100vh` does NOT shrink for a phone's address bar, so sizing off it made the
-  frame taller than the visible area.
-- Chocolate Doom does its own aspect correction: it draws the 320x200 view
-  correctly proportioned inside whatever framebuffer SDL hands it. So the
-  shape to preserve is `canvas.width/height`, not a hardcoded 4:3 — assuming
-  4:3 squeezed SDL's 844x390 buffer into 520x390 and distorted a picture that
-  was already right.
+- **FIT** (default) = `object-fit: contain` — the browser letterboxes the
+  engine's framebuffer at the largest UNDISTORTED size. The browser reads the
+  canvas backing store as the intrinsic aspect, so this is correct no matter
+  what resolution the engine picked.
+- **FILL** = `object-fit: fill` — stretched edge to edge for anyone who
+  prefers no black bars over correct proportions. Persisted in localStorage.
 
-A **FIT / FILL** button toggles between uniform scaling (default) and
-edge-to-edge stretch; the choice persists in localStorage. When SDL sizes its
-framebuffer to the canvas (the usual case) both give the same 1:1 result.
+Build P8 tried to compute the pixel size in JS from `canvas.width/height`, but
+the engine sets the backing store to a FIXED Doom resolution independent of the
+screen, so that math produced a tiny box on real phones. Letting `object-fit`
+read the backing store removes the guesswork entirely — there is no JS layout
+code left to get wrong.
 
 **Audio** is initialised before the engine loads: the page creates the
 AudioContext itself and hands it to SDL (the glue adopts it via

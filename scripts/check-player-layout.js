@@ -11,9 +11,9 @@
 // Asserts, per viewport:
 //   - nothing full-screen covers the game (the old rotate-hint blocked
 //     portrait play entirely)
-//   - the frame fits inside the visible viewport
-//   - it is as large as it can be: one axis is maxed out
-//   - FIT keeps Doom's 4:3 proportions; FILL goes edge to edge
+//   - the canvas box fills the visible viewport (not a tiny letterbox)
+//   - FIT = object-fit: contain (browser-guaranteed no distortion),
+//     FILL = object-fit: fill (edge-to-edge stretch)
 //   - the canvas survives SDL rewriting its inline styles
 //   - an AudioContext exists before the engine loads and SDL adopts it
 //   - the resume handler is persistent, not emscripten's one-shot listenOnce
@@ -156,6 +156,8 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
         topAtCentre: top ? top.tagName + (top.id ? '#' + top.id : '') : null,
         blockers,
         backingW: c.width, backingH: c.height,
+        objectFit: getComputedStyle(c).objectFit,
+        bodyFill: document.body.classList.contains('fill'),
         sdlRewrote: !!window.__sdlRewroteCanvas,
         stubError: window.__stubError || null,
         hasAudioCtx: !!(window.Module && Module.SDL2 && Module.SDL2.audioContext),
@@ -169,33 +171,35 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
       m.blockers.length ? 'blocked by ' + m.blockers.join(', ') : 'centre shows ' + m.topAtCentre);
     report(m.sdlRewrote && !m.stubError, 'stub engine ran and rewrote the canvas inline size',
       m.stubError ? 'stub threw: ' + m.stubError : '');
-    report(m.cw <= m.vw + 1 && m.ch <= m.vh + 1, 'frame fits the visible viewport',
-      `${Math.round(m.cw)}x${Math.round(m.ch)} in ${m.vw}x${m.vh}`);
-    report(near(m.cw, m.vw, 2) || near(m.ch, m.vh, 2), 'frame is maximised on one axis',
-      `w ${Math.round(m.cw)}/${m.vw}  h ${Math.round(m.ch)}/${m.vh}`);
-    const aspect = m.cw / m.ch;
-    const want = m.backingW && m.backingH ? m.backingW / m.backingH : DOOM_ASPECT;
-    report(near(aspect, want, 0.02),
-      'FIT scales the engine framebuffer uniformly (no distortion)',
-      `box ${aspect.toFixed(3)} vs framebuffer ${want.toFixed(3)} (${m.backingW}x${m.backingH})`);
+    // The canvas box fills the visible viewport on both axes; object-fit does
+    // the aspect work, so the ELEMENT should be viewport-sized, not tiny.
+    report(near(m.cw, m.vw, 2) && near(m.ch, m.vh, 2), 'canvas fills the visible viewport',
+      `${Math.round(m.cw)}x${Math.round(m.ch)} vs ${m.vw}x${m.vh}`);
+    // FIT = object-fit: contain -> the browser guarantees no distortion,
+    // whatever resolution the engine chose. This is the property that was
+    // broken before (the old code stretched with object-fit: fill).
+    report(m.objectFit === 'contain' && !m.bodyFill,
+      'FIT uses object-fit: contain (no distortion, largest undistorted size)',
+      'object-fit=' + m.objectFit);
     report(m.hasAudioCtx, 'AudioContext handed to SDL before engine load',
       'state=' + m.audioState);
 
-    // FILL mode: edge to edge. Tolerate the button being absent so the
-    // negative control still produces a full report instead of throwing.
+    // FILL toggles to object-fit: fill (edge to edge). Tolerate the button
+    // being absent so the negative control still produces a full report.
     let f = null;
     try {
       await page.click('#btn-fit');
       await new Promise(r => setTimeout(r, 300));
       f = await page.evaluate(() => {
-        const r = document.getElementById('canvas').getBoundingClientRect();
-        return { cw: r.width, ch: r.height, vw: innerWidth, vh: innerHeight,
-          label: document.getElementById('btn-fit').textContent };
+        const c = document.getElementById('canvas');
+        return { fit: getComputedStyle(c).objectFit,
+          label: document.getElementById('btn-fit').textContent,
+          bodyFill: document.body.classList.contains('fill') };
       });
     } catch (e) { f = null; }
-    report(!!f && near(f.cw, f.vw, 2) && near(f.ch, f.vh, 2) && f.label === 'FILL',
-      'FILL stretches edge to edge',
-      f ? `${Math.round(f.cw)}x${Math.round(f.ch)} label=${f.label}` : 'no FIT/FILL control on the page');
+    report(!!f && f.fit === 'fill' && f.label === 'FILL' && f.bodyFill,
+      'FILL toggles to object-fit: fill (edge to edge)',
+      f ? 'object-fit=' + f.fit + ' label=' + f.label : 'no FIT/FILL control on the page');
 
     await page.close();
     await ctx.close();

@@ -81,12 +81,11 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P9</div>
+  <div class="msg" style="opacity:0.5">player build P10</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
 <div id="topbar">
-  <button id="btn-start" style="display:none; background:#7fff7f; color:#0a0e1a; font-weight:700">▶ START</button>
   <button id="btn-sound" style="display:none; background:#ffb74d; color:#0a0e1a; font-weight:700">🔈 SOUND</button>
   <button id="btn-fit">FIT</button>
   <button id="btn-fs">FULLSCREEN</button>
@@ -213,33 +212,132 @@ var Module = {
       bootEl.classList.remove('hidden');
       setBoot(100, 'ENGINE: ' + t.slice(0, 120));
     }
+    if (/^doom: 10/.test(t)) { netLaunched = true; hideNetStatus(); }
     // Relay handshake failure ("doom: 1"). A netgame with a dead socket
     // limps unplayably (the net loop stalls every tic) — stop and offer a
     // clean solo restart instead.
     if (/^doom: 1,/.test(t) && qs.get('ws')) {
-      bootEl.classList.remove('hidden');
-      setBoot(100, 'RELAY CONNECTION FAILED — the game socket could not reach ' +
-        (qs.get('ws') || '').replace(/^wss:\/\//, '').split('/')[0] +
-        '. Check the relay deploy / Cloudflare WebSockets setting, or:');
-      if (!document.getElementById('solo-esc')) {
-        const a = document.createElement('a');
-        a.id = 'solo-esc';
-        a.textContent = '▶ PLAY THIS LEVEL SOLO';
-        const solo = new URLSearchParams(location.search);
-        solo.delete('ws'); solo.delete('server'); solo.delete('join');
-        solo.delete('nodes'); solo.delete('dm');
-        a.href = location.pathname + '?' + solo.toString();
-        a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
-          'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
-        bootEl.appendChild(a);
-        addRelayTest();   // let the player see WHERE it broke
-      }
+      netFailure('RELAY CONNECTION FAILED — the game socket could not reach ' +
+        (qs.get('ws') || '').replace(/^wss:\/\//, '').split('/')[0] + '.', true);
+    }
+    // "doom: 9, disconnected from server" / "doom: 7, failed to connect to …".
+    // These had NO handler, which is why a failed join just sat on a black
+    // screen with no way out. The overwhelmingly common cause is that the host
+    // already started: vanilla Doom has no late join, so the server refuses
+    // anyone arriving after launch ("not in waiting start state").
+    if (/^doom: (9|7),/.test(t) && qs.get('ws') && !netLaunched) {
+      netFailure(qs.get('join')
+        ? 'COULD NOT JOIN — the host has already started this game. Vanilla ' +
+          'Doom cannot join a match in progress, so ask the host to start a ' +
+          'fresh arena and join before they launch.'
+        : 'LOST THE CONNECTION to the relay.', false);
     }
   },
   printErr: (t) => console.warn(t),
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),
   postRun: [() => { bootEl.classList.add('hidden'); }],
 };
+
+// ---------------------------------------------------------------------------
+// NETGAME LOBBY STATUS.
+//
+// Chocolate Doom's "waiting for players" screen is drawn by the textscreen
+// library, which does not render to the canvas in this build — so a host sat
+// looking at pure black, assumed it had hung, and pressed START. That begins
+// the match with one player, and vanilla Doom has NO late join, so every
+// subsequent joiner is refused ("not in waiting start state") and lands on a
+// black screen of its own. That single interaction was the whole multiplayer
+// bug. So: show the real player count, and refuse to start early by accident.
+// ---------------------------------------------------------------------------
+let netLaunched = false;
+const wsParam = qs.get('ws') || '';
+const relayOrigin = wsParam.replace(/^ws/, 'http').replace(/\/api\/ws\/.*$/, '');
+const roomId = (wsParam.match(/\/api\/ws\/([^/?]+)/) || [])[1] || null;
+const wantNodes = Math.max(2, +(qs.get('nodes') || 2));
+let playersIn = 0;
+
+function netStatusEl() {
+  let el = document.getElementById('netstatus');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'netstatus';
+    el.style.cssText = 'position:fixed;inset:0;z-index:46;display:flex;flex-direction:column;' +
+      'align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px;' +
+      'background:rgba(10,14,26,0.94);color:#c5d4e8;font-size:14px;line-height:1.6';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function hideNetStatus() { const el = document.getElementById('netstatus'); if (el) el.remove(); }
+
+function renderNetStatus() {
+  if (netLaunched) return hideNetStatus();
+  const el = netStatusEl();
+  const isHost = !!qs.get('server');
+  el.innerHTML =
+    '<div style="color:#ff9d3d;letter-spacing:.18em;font-weight:700">' +
+      (isHost ? 'WAITING FOR PLAYERS' : 'WAITING FOR THE HOST') + '</div>' +
+    '<div style="font-size:30px;font-weight:700;color:#7fffd4">' +
+      playersIn + ' / ' + wantNodes + '</div>' +
+    '<div style="color:#6b7d99;font-size:12px;max-width:34em">' +
+      (isHost
+        ? 'The match starts by itself the moment everyone is in. Share the arena ' +
+          'from the ARENA page so others can JOIN.<br><br>Doom cannot add players ' +
+          'after the match begins, so starting early locks everyone else out.'
+        : 'Connected. The host\'s game will start automatically once everyone has arrived.') +
+    '</div>';
+  if (isHost) {
+    const b = document.createElement('button');
+    const ready = playersIn >= wantNodes;
+    b.textContent = ready ? '▶ START NOW' : '▶ START ANYWAY (locks others out)';
+    b.style.cssText = 'margin-top:6px;padding:11px 18px;border:0;border-radius:5px;font-weight:700;' +
+      'font-size:13px;background:' + (ready ? '#7fff7f' : '#33405c') + ';color:' +
+      (ready ? '#0a0e1a' : '#c5d4e8');
+    // When players are still missing this needs TWO taps. The single-tap
+    // button is exactly how the game kept getting started with nobody in it.
+    let armed = ready;
+    b.onclick = () => {
+      if (!armed) { armed = true; b.textContent = '▶ TAP AGAIN TO START WITHOUT THEM'; b.style.background = '#ff9d3d'; b.style.color = '#0a0e1a'; return; }
+      sendKey('keydown', 32); setTimeout(() => sendKey('keyup', 32), 80);
+      b.disabled = true; b.textContent = 'STARTING…';
+    };
+    el.appendChild(b);
+  }
+}
+
+async function pollRoom() {
+  if (netLaunched || !roomId || !relayOrigin) return;
+  try {
+    const r = await fetch(relayOrigin + '/api/room/' + roomId, { cache: 'no-store' });
+    if (r.ok) { const j = await r.json(); playersIn = j.players | 0; }
+  } catch (e) { /* transient — keep the last count */ }
+  renderNetStatus();
+}
+if (qs.get('ws') && (qs.get('server') || qs.get('join'))) {
+  renderNetStatus();
+  setInterval(pollRoom, 2000);
+  pollRoom();
+}
+
+// Shared failure screen for every netgame dead end, with a solo escape.
+function netFailure(msg, withRelayTest) {
+  hideNetStatus();
+  bootEl.classList.remove('hidden');
+  setBoot(100, msg);
+  if (!document.getElementById('solo-esc')) {
+    const a = document.createElement('a');
+    a.id = 'solo-esc';
+    a.textContent = '▶ PLAY THIS LEVEL SOLO';
+    const solo = new URLSearchParams(location.search);
+    solo.delete('ws'); solo.delete('server'); solo.delete('join');
+    solo.delete('nodes'); solo.delete('dm');
+    a.href = location.pathname + '?' + solo.toString();
+    a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
+      'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
+    bootEl.appendChild(a);
+    if (withRelayTest) addRelayTest();
+  }
+}
 
 // Relay self-test shown on the connection-failure screen. It splits the two
 // possible causes apart so a bug report can be specific:
@@ -431,14 +529,10 @@ document.querySelectorAll('.pad button').forEach((b) => {
 document.getElementById('btn-esc').addEventListener('click', () => {
   sendKey('keydown', 27); setTimeout(() => sendKey('keyup', 27), 80);
 });
-// Netgame hosts see Chocolate Doom's waiting screen ("press SPACE to start").
-// Mobile has no space bar — give hosts an explicit START button.
-if (qs.get('server')) {
-  document.getElementById('btn-start').style.display = '';
-  document.getElementById('btn-start').addEventListener('click', () => {
-    sendKey('keydown', 32); setTimeout(() => sendKey('keyup', 32), 80);
-  });
-}
+// The host's START control now lives on the WAITING FOR PLAYERS overlay,
+// where it shows the live player count and needs a second tap to start
+// without everyone. The old unconditional top-bar START button is gone: it
+// was a single tap, on a black screen, that silently locked out every joiner.
 document.getElementById('btn-enter').addEventListener('click', () => {
   sendKey('keydown', 13); setTimeout(() => sendKey('keyup', 13), 80);
 });

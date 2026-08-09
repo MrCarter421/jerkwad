@@ -87,9 +87,10 @@ check can't see. The play page's connection-failure screen runs both and shows
 which one broke:
 
 - both fail → DNS, the `doom.yuccabucca.com/*` route, or the worker is down.
-- health ok, echo fails → **Cloudflare WebSockets are off, or the worker was
-  not redeployed** with this code. This is the usual cause.
+- health ok, echo fails → the worker was not redeployed with this code (the
+  pre-fix build 500s every upgrade), or WebSockets are disabled for the zone.
 - both ok but the game won't start → the Doom netgame layer, not the relay.
+  In practice this meant the host had already launched; see *Netgame notes*.
 
 **Diagnose from your own machine** (this repo, any Node 14+, no installs):
 
@@ -119,6 +120,31 @@ players. Room ids are signed with DOOM_KEY (vendored silentspacemarine
 scheme) so private rooms can't be enumerated.
 
 ## Netgame notes
+
+**The joiner-black-screen bug (build P10).** Vanilla Doom has no late join: once
+the server launches, anyone arriving is refused with "not in waiting start
+state" and lands on a black screen. The play page used to hand the host a
+single-tap START button in the top bar — and because Chocolate Doom's "waiting
+for players" screen is drawn by the textscreen library, which does NOT render
+to the canvas in this build, the host saw pure black, assumed a hang, and
+pressed it. That one tap started the match with nobody in it and locked out
+every joiner.
+
+`scripts/check-netgame.js` reproduces this end to end (real engine, two real
+browser pages, a local port of the relay's routing) and is the regression
+guard. Three scenarios:
+
+```
+node scripts/check-netgame.js                     # both peers must reach "game started"
+SCENARIO=earlystart node scripts/check-netgame.js # host taps START early: must NOT strand the joiner
+SCENARIO=forcestart node scripts/check-netgame.js # deliberate override: joiner must fail GRACEFULLY
+```
+
+The fix: the host's start control moved onto a WAITING FOR PLAYERS overlay that
+shows the live count from `/api/room/<room>`, and starting without everyone
+needs a second, explicitly-labelled tap. Joiners now handle `doom: 9`
+(disconnected) and `doom: 7` (connect failed), which previously had no handler
+at all — that is why a failed join sat on black with no solo escape.
 
 - The doom server peer is always uid **1** on the relay; joiners connect
   with `-connect 1` (the WebSocket transport resolves addresses via

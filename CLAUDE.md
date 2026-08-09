@@ -9,7 +9,7 @@ browser. Three generations of tooling live in this repo, all inside `wad_editor.
 | **ShapeShifter** (`ShapeShifter`) | Room-composition editor: place preset rooms on a canvas, drag them together to **fuse**, connect with corridors/teleporters, drop things, BUILD → validated map → PLAY/SAVE exports a vanilla-Doom WAD. | The main app. |
 | **EtherWad** (`EtherWad`) | Automated level generator on top of the ShapeShifter engine. Quantum-random entropy, room-count/enemy/difficulty dials, generates overlapping compositions with intelligent thing placement, hands off to ShapeShifter for editing. | Newest layer (V0.53+). |
 
-Current version: **V0.55** (see the version `<span>` in the ShapeShifter/EtherWad headers).
+Current version: **V0.56** (see the version `<span>` in the ShapeShifter/EtherWad headers).
 
 ## Repo layout
 
@@ -181,6 +181,7 @@ node scripts/build_engine.js            # arena/engine.js — validators load TH
 node scripts/check-load.js 30 8         # topology closes, no inverted sectors, WAD lumps complete
 node scripts/check-textures.js 20 14    # every flat/texture exists in freedoom2.wad namespaces
 node scripts/check-skybleed.js 20 14    # no unpainted ceiling gaps, no sky-ceilinged door lintels
+node scripts/check-tjunctions.js 8 14   # no vertex mid-linedef (cracks / missing wall)
 node scripts/check-spawns.js            # no player start inside solid geometry / without headroom
 node scripts/check-reachability.js      # every room reachable from P1 through doors/teleporters
 FUSE=0.25 node scripts/check-skybleed.js 12 14   # the editor's fused path (arena is corridor-only)
@@ -235,6 +236,15 @@ actually exist* in the output.
 - V0.53: **EtherWad** — QRNG entropy, generate/add-areas, handoff to editor.
 - V0.54: bay-shelter door trim, catacombs/library/chasm themes, add-areas keeps
   monster count flat.
+- V0.56: **no more cracks / missing wall in room trim.** HEADER_DEPTH and TRIM_W are
+  both 16, so a corridor door's header inner edge landed exactly on trim ring 1 — and
+  the ring loop then emitted its own full-width line straight over it. Two lines
+  claiming the same span, four T-junctions per doorway. The header now names the ring
+  as its inner neighbour and the ring walk steps around the doorway. Exit posts also
+  gained a clearance check (they were carved at the marker with no regard for
+  buildings). 196 T-junctions per 8 levels -> 0, at 8/14/20/40/60 rooms.
+  Invisible to check-load.js: both sectors still closed, so topology passed while the
+  geometry was wrong. `scripts/check-tjunctions.js` is the guard.
 - V0.55: **door lintels no longer show sky.** Header (door soffit) sectors inherited
   `palette.ceil`, which is `F_SKY1` in skylit rooms, so the resolve pass saw
   sky-on-both-sides and skipped the upper texture — 61 door tops per 20 levels rendered
@@ -242,6 +252,15 @@ actually exist* in the output.
   inside solid geometry) and a playable landscape view in `play/` (build P7).
 
 ## Known issues / next ideas
+
+- **The FUSED path still has T-junctions** (`FUSE=0.25 node scripts/check-tjunctions.js`
+  reports ~2400 over 6 levels). The 32-unit grid rasterizer emits one wall per cell
+  boundary while an abutting non-fused polygon emits a single long line, so vertices
+  land mid-line every 32 units. This is pre-existing — it measured 2525 before the
+  V0.56 work and 2443 after — and it is why the arena runs `fuseChance: 0`. Corridor-only
+  is clean at 0. Fixing it means splitting long lines at the grid pitch wherever they
+  abut a fused group, in the most intricate part of the generator, so it is deliberately
+  not bundled with a small fix.
 
 - Rare topology fragment on extreme fused arrangements (~2/24 easy-difficulty EtherWad
   seeds); the V0.48 safety net degrades them to solid walls rather than fixing the root.

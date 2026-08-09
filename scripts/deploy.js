@@ -179,6 +179,7 @@ const human = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
         ['topology + WAD lumps', ['scripts/check-load.js', '14', '4']],
         ['texture namespaces',   ['scripts/check-textures.js', '10', '14']],
         ['sky bleed / door tops',['scripts/check-skybleed.js', '10', '14']],
+        ['T-junctions / cracks', ['scripts/check-tjunctions.js', '8', '14']],
         ['spawn safety',         ['scripts/check-spawns.js']],
         ['room reachability',    ['scripts/check-reachability.js']],
         ['player layout + audio', ['scripts/check-player-layout.js']],

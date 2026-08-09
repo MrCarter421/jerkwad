@@ -3187,9 +3187,22 @@ function _generateDungeonOnce(opts) {
       const B2y = A2y + inY * HEADER_DEPTH;
       // U lines (outerId | header). Walking each so outerId is the right
       // side of v1→v2 — that places outerId outside the header rectangle.
+      //
+      // The INNER edge (B1→B2) is the subtle one. HEADER_DEPTH and TRIM_W are
+      // both 16, so in a room with trim rings this edge lands exactly on trim
+      // ring 1 — and the space on its far side is the first trim ring, NOT
+      // the outer band (the header has replaced the outer band here). Naming
+      // outerId there described geometry that does not exist, and the ring
+      // loop then emitted its own full-width line straight across the
+      // doorway, overlapping this one. Two lines claiming the same space is
+      // what tore holes in the trim.
+      const insideId = (room.trimLayers > 0 && room.trimIds && room.trimIds.length)
+        ? room.trimIds[0] : room.outerId;
       emitWall(A1x, A1y, B1x, B1y, room.outerId, att.headerId);
-      emitWall(B1x, B1y, B2x, B2y, room.outerId, att.headerId);
+      emitWall(B1x, B1y, B2x, B2y, insideId, att.headerId);
       emitWall(B2x, B2y, A2x, A2y, room.outerId, att.headerId);
+      // Record the span so the trim-ring walk can leave a gap for it.
+      (room._doorInner || (room._doorInner = [])).push({ x1: B1x, y1: B1y, x2: B2x, y2: B2y });
       // Doorway segment: header ↔ doorBody. The DOOR3 panel spans the
       // header's 96-tall ceiling so the door image is proportional.
       emitWall(A1x, A1y, A2x, A2y, att.headerId, att.doorBodyId, { flags: 16 });
@@ -3199,6 +3212,30 @@ function _generateDungeonOnce(opts) {
       if (isHoriz) emitWall(cur, ortho, end, ortho, room.outerId, null, { middle: room.palette.wall });
       else emitWall(ortho, cur, ortho, end, room.outerId, null, { middle: room.palette.wall });
     }
+  }
+
+  // Door-header inner spans lying on this (axis-aligned) ring edge, returned
+  // as {lo, hi} along the edge's axis and sorted in walk order by the caller.
+  function doorCutsOnEdge(p1, p2, inners) {
+    const horiz = Math.abs(p2.y - p1.y) < 0.5;
+    const vert = Math.abs(p2.x - p1.x) < 0.5;
+    if (!horiz && !vert) return [];
+    const ortho = horiz ? p1.y : p1.x;
+    const eLo = Math.min(horiz ? p1.x : p1.y, horiz ? p2.x : p2.y);
+    const eHi = Math.max(horiz ? p1.x : p1.y, horiz ? p2.x : p2.y);
+    const out = [];
+    for (const s of inners) {
+      const sHoriz = Math.abs(s.y2 - s.y1) < 0.5;
+      if (sHoriz !== horiz) continue;
+      if (Math.abs((sHoriz ? s.y1 : s.x1) - ortho) > 0.5) continue;
+      const lo = Math.min(sHoriz ? s.x1 : s.y1, sHoriz ? s.x2 : s.y2);
+      const hi = Math.max(sHoriz ? s.x1 : s.y1, sHoriz ? s.x2 : s.y2);
+      if (lo < eLo - 0.5 || hi > eHi + 0.5) continue;
+      out.push({ lo, hi });
+    }
+    const dir = Math.sign(horiz ? p2.x - p1.x : p2.y - p1.y);
+    out.sort((a, b) => (a.lo - b.lo) * dir);
+    return out;
   }
 
   // Decide which fused-room buildings can keep their CRISP precise facade
@@ -3257,7 +3294,33 @@ function _generateDungeonOnce(opts) {
         if (ringPoly.length < 3) break;
         for (let j = 0; j < ringPoly.length; j++) {
           const p1 = ringPoly[j], p2 = ringPoly[(j + 1) % ringPoly.length];
-          emitWall(p1.x, p1.y, p2.x, p2.y, layerIds[layer - 1], layerIds[layer]);
+          // Ring 1 sits exactly HEADER_DEPTH inside the wall, so a doorway's
+          // header inner edge lies ON it and has already been emitted (as
+          // header ↔ ring-1). Walk around those spans instead of laying a
+          // second line straight over them.
+          const cuts = (layer === 1 && room._doorInner)
+            ? doorCutsOnEdge(p1, p2, room._doorInner) : [];
+          if (!cuts.length) {
+            emitWall(p1.x, p1.y, p2.x, p2.y, layerIds[layer - 1], layerIds[layer]);
+            continue;
+          }
+          const horiz = Math.abs(p2.y - p1.y) < 0.5;
+          const dir = Math.sign(horiz ? p2.x - p1.x : p2.y - p1.y);
+          const ortho = horiz ? p1.y : p1.x;
+          const start = horiz ? p1.x : p1.y, end = horiz ? p2.x : p2.y;
+          let cur = start;
+          const seg = (from, to) => {
+            if (Math.abs(to - from) < 0.5) return;
+            if (horiz) emitWall(from, ortho, to, ortho, layerIds[0], layerIds[1]);
+            else emitWall(ortho, from, ortho, to, layerIds[0], layerIds[1]);
+          };
+          for (const cut of cuts) {
+            const near = dir > 0 ? cut.lo : cut.hi;
+            const far = dir > 0 ? cut.hi : cut.lo;
+            seg(cur, near);
+            cur = far;                       // skip: the header owns this span
+          }
+          seg(cur, end);
         }
       }
     }
@@ -4422,8 +4485,72 @@ function _generateDungeonOnce(opts) {
     const POST_W = 64, POST_D = 32, POST_H = 64;
     // Snap the post's centre to the 8-grid (SW1EXIT alignment), and offset
     // so the marker thing sits on the SOUTH face the player will press.
-    const pcx = Math.round(mk.x / 8) * 8;
-    const pcy = Math.round((mk.y + POST_D / 2) / 8) * 8;
+    let pcx = Math.round(mk.x / 8) * 8;
+    let pcy = Math.round((mk.y + POST_D / 2) / 8) * 8;
+
+    // The post is carved in AFTER every room and building, straight at the
+    // marker, with no regard for what is already there. Land it flush against
+    // a courtyard building and its face is collinear with that building's
+    // wall — a T-junction at each corner, which the renderer draws as a crack
+    // or a missing stretch of wall. Step it clear.
+    //
+    // A candidate is only accepted if a straight line from the original
+    // centre to it crosses NO existing linedef. That is what keeps the post
+    // inside hostSecId: if nothing is crossed, no sector boundary was
+    // crossed either. Without that check a nudge could silently walk the post
+    // into a neighbouring sector and its walls would name the wrong one.
+    {
+      const CLEAR = 8;                     // keep this far off any wall
+      const segHit = (ax, ay, bx2, by2, cx2, cy2, dx2, dy2) => {
+        const s = (px, py, qx, qy, rx, ry) =>
+          Math.sign((qx - px) * (ry - py) - (qy - py) * (rx - px));
+        const d1 = s(ax, ay, bx2, by2, cx2, cy2), d2 = s(ax, ay, bx2, by2, dx2, dy2);
+        const d3 = s(cx2, cy2, dx2, dy2, ax, ay), d4 = s(cx2, cy2, dx2, dy2, bx2, by2);
+        return d1 !== d2 && d3 !== d4;
+      };
+      const rectClear = (cx2, cy2) => {
+        const x0 = cx2 - POST_W / 2 - CLEAR, x1 = cx2 + POST_W / 2 + CLEAR;
+        const y0 = cy2 - POST_D / 2 - CLEAR, y1 = cy2 + POST_D / 2 + CLEAR;
+        for (const ld of linedefs) {
+          const a = vById(ld.v1), b = vById(ld.v2);
+          if (!a || !b) continue;
+          if (Math.max(a.x, b.x) < x0 || Math.min(a.x, b.x) > x1) continue;
+          if (Math.max(a.y, b.y) < y0 || Math.min(a.y, b.y) > y1) continue;
+          if ((a.x >= x0 && a.x <= x1 && a.y >= y0 && a.y <= y1) ||
+              (b.x >= x0 && b.x <= x1 && b.y >= y0 && b.y <= y1)) return false;
+          if (segHit(a.x, a.y, b.x, b.y, x0, y0, x1, y0) ||
+              segHit(a.x, a.y, b.x, b.y, x1, y0, x1, y1) ||
+              segHit(a.x, a.y, b.x, b.y, x1, y1, x0, y1) ||
+              segHit(a.x, a.y, b.x, b.y, x0, y1, x0, y0)) return false;
+        }
+        return true;
+      };
+      const reachable = (tx, ty) => {
+        for (const ld of linedefs) {
+          const a = vById(ld.v1), b = vById(ld.v2);
+          if (!a || !b) continue;
+          if (segHit(pcx, pcy, tx, ty, a.x, a.y, b.x, b.y)) return false;
+        }
+        return true;
+      };
+      if (!rectClear(pcx, pcy)) {
+        const poly = roomPoly(exRoom);
+        let best = null;
+        for (let radius = 32; radius <= 192 && !best; radius += 32) {
+          for (let a = 0; a < 16 && !best; a++) {
+            const th = (a / 16) * Math.PI * 2;
+            const tx = Math.round((pcx + Math.cos(th) * radius) / 8) * 8;
+            const ty = Math.round((pcy + Math.sin(th) * radius) / 8) * 8;
+            if (!pointInPolygon(tx, ty, poly)) continue;
+            if (!rectClear(tx, ty)) continue;
+            if (!reachable(tx, ty)) continue;   // same sector guaranteed
+            best = { x: tx, y: ty };
+          }
+        }
+        // No clear spot: keep the original rather than lose the level's exit.
+        if (best) { pcx = best.x; pcy = best.y; }
+      }
+    }
     const FL = { x: pcx - POST_W / 2, y: pcy - POST_D / 2 };
     const FR = { x: pcx + POST_W / 2, y: pcy - POST_D / 2 };
     const BR = { x: pcx + POST_W / 2, y: pcy + POST_D / 2 };
@@ -7033,7 +7160,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.55</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.56</span>
         </div>
         <div className="flex gap-1.5">
           {onOpenEther && !previewMap && (
@@ -7502,7 +7629,7 @@ function EtherWad({ onEditInShapeShifter, onBack, customPresets }) {
         padding: '6px 8px', borderBottom: '1px solid ' + COLORS.border, background: COLORS.bgPanel,
         paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div style={{ color: '#9966ff', fontWeight: 700, letterSpacing: '0.18em', fontSize: 13 }}>
-          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.55</span>
+          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.56</span>
         </div>
         <button onClick={onBack}
           style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',

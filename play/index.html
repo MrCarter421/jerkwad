@@ -56,14 +56,18 @@
   #dpad { left: calc(env(safe-area-inset-left) + 14px); bottom: calc(env(safe-area-inset-bottom) + 20px);
     width: 180px; height: 180px; }
   #dpad .u { left: 61px; top: 0; }  #dpad .d { left: 61px; bottom: 0; }
-  #dpad .l { left: 0; top: 61px; }  #dpad .r { right: 0; top: 61px; }
-  #dpad .sl { left: 0; top: 0; font-size: 11px; }
-  #dpad .sr { right: 0; top: 0; font-size: 11px; }
+  /* Middle row = STRAFE, top corners = TURN. */
+  #dpad .l { left: 0; top: 61px; font-size: 11px; }
+  #dpad .r { right: 0; top: 61px; font-size: 11px; }
+  #dpad .tl { left: 0; top: 0; }
+  #dpad .tr { right: 0; top: 0; }
   #acts { right: calc(env(safe-area-inset-right) + 14px); bottom: calc(env(safe-area-inset-bottom) + 20px);
-    width: 190px; height: 190px; }
+    width: 190px; height: 200px; }
   #acts .fire { right: 0; bottom: 62px; width: 72px; height: 72px; color: #ff5c5c; border-color: rgba(255,92,92,0.55); }
   #acts .use  { right: 84px; bottom: 8px; }
-  #acts .wpn  { right: 90px; bottom: 116px; font-size: 11px; color: #ffb74d; border-color: rgba(255,183,77,0.55); }
+  #acts .run  { right: 84px; bottom: 72px; font-size: 11px; color: #9fd0ff; border-color: rgba(159,208,255,0.55); }
+  #acts .run.on { background: rgba(159,208,255,0.42); color: #eaf4ff; }
+  #acts .wpn  { right: 84px; bottom: 136px; font-size: 11px; color: #ffb74d; border-color: rgba(255,183,77,0.55); }
   #topbar { position: fixed; top: calc(env(safe-area-inset-top) + 8px); right: 10px; z-index: 40;
     display: flex; gap: 6px; }
   #topbar button { background: rgba(20,32,51,0.55); color: #c5d4e8; border: 1px solid #243759;
@@ -81,7 +85,7 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P10</div>
+  <div class="msg" style="opacity:0.5">player build P11</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
@@ -96,14 +100,17 @@
 <div class="pad" id="dpad">
   <button class="u" data-key="38">▲</button>
   <button class="d" data-key="40">▼</button>
-  <button class="l" data-key="37">◀</button>
-  <button class="r" data-key="39">▶</button>
-  <button class="sl" data-key="188">⟨STR</button>
-  <button class="sr" data-key="190">STR⟩</button>
+  <!-- Strafe sits on the main left/right (the positions your thumb rests on);
+       turning moved up to the corners. -->
+  <button class="l" data-key="188">⟨STR</button>
+  <button class="r" data-key="190">STR⟩</button>
+  <button class="tl" data-key="37">◀</button>
+  <button class="tr" data-key="39">▶</button>
 </div>
 <div class="pad" id="acts">
   <button class="fire" data-key="17">FIRE</button>
   <button class="use"  data-key="32">USE</button>
+  <button class="run"  id="btn-run">RUN</button>
   <button class="wpn"  id="btn-wpn">WPN</button>
 </div>
 
@@ -235,7 +242,9 @@ var Module = {
   },
   printErr: (t) => console.warn(t),
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),
-  postRun: [() => { bootEl.classList.add('hidden'); }],
+  // Re-assert a latched RUN once the engine exists: the keydown sent before
+  // boot went nowhere.
+  postRun: [() => { bootEl.classList.add('hidden'); if (runLocked) applyRunLock(); }],
 };
 
 // ---------------------------------------------------------------------------
@@ -514,8 +523,41 @@ function sendKey(type, keyCode) {
   document.dispatchEvent(ev);
   Module.canvas.dispatchEvent(ev);
 }
+// ---------------------------------------------------------------------------
+// WASD. Chocolate Doom's vanilla bindings are arrows + , / . for strafe, and
+// it reads them from its own config, which we can't edit from here. So instead
+// of rebinding the engine, translate WASD into the keys it already knows:
+//   W/S -> forward/back (same as up/down arrow)
+//   A/D -> strafe left/right (the modern convention, and it matches the touch
+//          pad, where the main left/right are strafe and the corners turn)
+// Arrow keys keep working exactly as before, so both schemes are live at once.
+// ---------------------------------------------------------------------------
+const WASD = { KeyW: 38, KeyS: 40, KeyA: 188, KeyD: 190 };
+const wasdHeld = new Set();
+window.addEventListener('keydown', (e) => {
+  const kc = WASD[e.code];
+  // Let browser/OS shortcuts through (Ctrl+W etc.), and ignore auto-repeat:
+  // the engine only needs the initial press to consider the key held.
+  if (!kc || e.ctrlKey || e.metaKey || e.altKey || e.repeat || wasdHeld.has(e.code)) return;
+  wasdHeld.add(e.code);
+  e.preventDefault();
+  sendKey('keydown', kc);
+});
+window.addEventListener('keyup', (e) => {
+  const kc = WASD[e.code];
+  if (!kc || !wasdHeld.has(e.code)) return;
+  wasdHeld.delete(e.code);
+  e.preventDefault();
+  sendKey('keyup', kc);
+});
+// Losing focus mid-strafe would otherwise leave the key stuck down.
+window.addEventListener('blur', () => {
+  wasdHeld.forEach(code => sendKey('keyup', WASD[code]));
+  wasdHeld.clear();
+});
+
 document.querySelectorAll('.pad button').forEach((b) => {
-  if (!b.dataset.key) return;   // WPN has its own cycling handler
+  if (!b.dataset.key) return;   // WPN / RUN have their own handlers
   const kc = +b.dataset.key;
   const down = (e) => { e.preventDefault(); b.classList.add('on'); sendKey('keydown', kc); };
   const up = (e) => { e.preventDefault(); b.classList.remove('on'); sendKey('keyup', kc); };
@@ -541,6 +583,30 @@ document.getElementById('btn-yes').addEventListener('click', () => {
 });
 // WPN button cycles weapon slots 2→3→4→5→6→7→1. Selecting an unowned slot
 // is a harmless no-op in Doom, so tapping again advances to the next one.
+// RUN LOCK. Doom's "speed" key is Shift, normally held. On a touchscreen there
+// is no spare thumb for that, so this latches it: one tap sends keydown and
+// never releases, so the engine sees Shift held until you tap again. The
+// choice is remembered, and re-asserted after boot and whenever the tab is
+// re-focused — a keydown with no matching keyup can otherwise be forgotten if
+// the page loses focus while it is latched.
+const RUN_KEY = 16;
+let runLocked = false;
+try { runLocked = localStorage.getItem('jerkwadRun') === '1'; } catch (e) {}
+const runBtn = document.getElementById('btn-run');
+function applyRunLock() {
+  runBtn.classList.toggle('on', runLocked);
+  runBtn.textContent = runLocked ? 'RUN●' : 'RUN';
+  sendKey(runLocked ? 'keydown' : 'keyup', RUN_KEY);
+}
+runBtn.addEventListener('click', () => {
+  runLocked = !runLocked;
+  try { localStorage.setItem('jerkwadRun', runLocked ? '1' : '0'); } catch (e) {}
+  applyRunLock();
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden && runLocked) applyRunLock(); });
+runBtn.classList.toggle('on', runLocked);
+runBtn.textContent = runLocked ? 'RUN●' : 'RUN';
+
 const WPN_KEYS = [50, 51, 52, 53, 54, 55, 49];   // '2'..'7', then '1'
 let wpnIdx = 0;
 document.getElementById('btn-wpn').addEventListener('click', () => {

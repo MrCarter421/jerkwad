@@ -29,10 +29,37 @@ Hosting requirement: any static host works (Cloudflare Pages is ideal).
 Everything is same-origin — no CORS, no special headers needed. Serve
 `.wasm` with `application/wasm` (Pages does automatically).
 
-**Mobile controls** appear automatically on touch devices: left D-pad =
-move/turn, FIRE / USE / strafe buttons on the right, plus WPN to cycle
-weapons and MENU / ENTER / Y for the Doom menus. On desktop use the keyboard
-(arrows + Ctrl + Space, standard Chocolate Doom bindings).
+**Controls.**
+
+Keyboard (desktop): **WASD and the arrow keys both work at once.**
+
+| | |
+|---|---|
+| `W` / `S` | forward / back (same as ↑ / ↓) |
+| `A` / `D` | strafe left / right |
+| `←` / `→` | turn left / right |
+| `Ctrl` | fire &nbsp;&nbsp; `Space` use &nbsp;&nbsp; `Shift` run |
+
+Chocolate Doom reads its bindings from its own config, which the page can't
+edit, so WASD is not a rebind — `play/index.html` translates those four keys
+into the ones the engine already knows (`,`/`.` are its strafe keys). Arrow
+keys are passed through untouched, never duplicated or `preventDefault`ed.
+
+Touch (mobile), appearing automatically on touch devices:
+
+- **D-pad** — ▲/▼ forward/back, **strafe on the main left/right** (where your
+  thumb rests), **turn in the top corners**. This mirrors WASD.
+- **FIRE / USE**, **WPN** cycles weapons, and **RUN** *latches* Doom's Shift
+  key: tap once to run permanently, tap again to walk. Latching matters
+  because a touchscreen has no spare thumb to hold Shift. The setting is
+  remembered and re-asserted after boot and on tab re-focus, since a keydown
+  with no matching keyup can otherwise be dropped.
+- **MENU / ENTER / Y** drive the Doom menus.
+
+`scripts/check-controls.js` asserts the exact keyCodes each control emits
+(instrumenting `sendKey`, not counting window events — the same event is
+dispatched on window, document and canvas, so a naive listener sees each key
+three times), and that no two touch buttons overlap.
 
 **Orientation is the player's choice** — portrait and landscape both play.
 There is no rotate-to-landscape gate and no orientation lock (build P8 removed

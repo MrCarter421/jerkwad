@@ -91,9 +91,28 @@ which one broke:
   not redeployed** with this code. This is the usual cause.
 - both ok but the game won't start → the Doom netgame layer, not the relay.
 
+**Diagnose from your own machine** (this repo, any Node 14+, no installs):
+
+```
+node scripts/check-relay.js
+```
+
+It tests DNS/route/worker, room signing, the WebSocket upgrade, and a real
+game socket separately, then tells you which layer broke and what to do.
+
 **Redeploy after pulling this** (`cd workers/doom-relay && npx wrangler deploy`).
 Confirm it took by opening `https://doom.yuccabucca.com/api/health` — it should
 report `"build":"relay-2"`. `DOOM_KEY` persists across deploys; don't re-set it.
+
+### Note on the Cloudflare WebSockets setting
+
+There is a toggle at **Network → WebSockets** in the dashboard, but it is ON by
+default on every plan including Free, so it is rarely the cause. If plain HTTPS
+to the relay works (the arena shows a green light) while WebSockets fail, the
+far more likely explanation is a worker still running the pre-fix code that
+called `routerObject.fetch(path, request)` with a relative URL string: the
+modern module-workers runtime rejects that and 500s every upgrade, while HTTPS
+routes keep working. Redeploying is the fix.
 
 Lobby entries expire after 4 h, or after 10 min with zero connected
 players. Room ids are signed with DOOM_KEY (vendored silentspacemarine

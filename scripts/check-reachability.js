@@ -8,13 +8,16 @@
 //   - a door (special 1/DR or 31/D1): the doorBody opens on use.
 // Step-up limit is 24 units (vanilla); doors/lifts handled specially.
 // ============================================================================
-const fs = require('fs'); const vm = require('vm');
+const fs = require('fs'); const vm = require('vm'); const path = require('path');
+// Repo-relative: this used to read an absolute path from the machine it was
+// written on, which crashed the deploy gate with ENOENT everywhere else.
+const ROOT = path.join(__dirname, '..');
 function loadEngine() {
   const ctx = { window: {}, localStorage: { getItem: () => null, setItem: () => {} },
     document: { createElement: () => ({ getContext: () => null }) }, console, Math, Date, JSON,
     TextDecoder, TextEncoder, navigator: {}, performance };
   ctx.globalThis = ctx; vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync('/home/user/jerkwad/arena/engine.js', 'utf8'), ctx);
+  vm.runInContext(fs.readFileSync(process.env.JERKWAD_ENGINE || path.join(ROOT, 'arena/engine.js'), 'utf8'), ctx);
   return ctx.window.JerkwadEngine;
 }
 const mulberry32 = (a) => () => { a |= 0; a = (a + 0x6D2B79F5) | 0;
@@ -202,7 +205,7 @@ module.exports = { loadEngine, mulberry32, analyze };
 if (require.main === module) {
   const E = loadEngine();
   const presets = E.SHAPESHIFTER_PRESETS.filter(p => p.feature !== 'terrain');
-  const arenaSrc = fs.readFileSync('/home/user/jerkwad/arena/index.html', 'utf8');
+  const arenaSrc = fs.readFileSync(path.join(ROOT, 'arena/index.html'), 'utf8');
   const arenaThings = eval('(' + arenaSrc.match(/function arenaThings\(lvl, rng, playerCount\) \{[\s\S]*?\n\}/)[0] + ')');
   let tot = 0, sum = 0, worst = 100, badDoors = 0, exitFails = 0;
   const N = +(process.argv[2] || 8), ROOMS = +(process.argv[3] || 20);

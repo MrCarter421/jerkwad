@@ -53,6 +53,8 @@ const server = http.createServer((rq, rs) => {
 // is the server announcing itself, and resets the room.
 let sessions = [];
 const relayLog = [];
+const allSockets = [];   // for the blip scenario
+const LEGACY = !!process.env.RELAY_LEGACY;
 function startRelay() {
   const wss = new WebSocketServer({ server, path: '/api/ws/room' });
   wss.on('connection', (ws) => {
@@ -66,14 +68,24 @@ function startRelay() {
         sessions.forEach(s => { if (s.ws !== ws) { try { s.ws.close(1011, 'closing'); } catch (e) {} } });
         sessions = [];
       }
-      if (!sessions.some(s => s.from === from)) {
-        sessions.push({ ws, from });
-        relayLog.push('registered uid ' + from);
-      }
+      // Mirrors workers/doom-relay: bind OR REBIND the uid to the socket the
+      // packet arrived on. The engine reconnects with the same uid after any
+      // blip, and only-add-if-unknown left the relay routing to a dead socket.
+      // RELAY_LEGACY reproduces the pre-fix worker for the negative control.
+      const known = sessions.find(s => s.from === from);
+      if (!known) { sessions.push({ ws, from }); relayLog.push('registered uid ' + from); }
+      else if (known.ws !== ws && !LEGACY) { known.ws = ws; relayLog.push('REBOUND uid ' + from); }
       const dst = sessions.find(s => s.from === to);
-      if (dst) { try { dst.ws.send(buf.slice(4)); } catch (e) {} }
+      if (dst) {
+        try { dst.ws.send(buf.slice(4)); }
+        catch (e) { sessions = sessions.filter(s => s !== dst); }
+      }
     });
-    ws.on('close', () => { sessions = sessions.filter(s => s.ws !== ws); });
+    // The pre-fix worker assigned an UNDECLARED `i` here. Worker modules are
+    // strict mode, so this handler threw ReferenceError on every close and the
+    // session was never removed — leaving a corpse the relay kept routing to.
+    ws.on('close', () => { if (!LEGACY) sessions = sessions.filter(s => s.ws !== ws); });
+    allSockets.push(ws);
   });
 }
 
@@ -146,6 +158,45 @@ async function peer(browser, label, url) {
   const t0 = Date.now();
   while (Date.now() - t0 < BUDGET_MS && !(host.started && join.started)) {
     await new Promise(r => setTimeout(r, 1500));
+  }
+
+  // SCENARIO=blip: once both are in, sever a socket from the RELAY side, the
+  // way a transient Cloudflare hiccup would. The engine reconnects with the
+  // SAME uid, so the relay must rebind that uid to the new socket. If it keeps
+  // routing to the corpse, both peers fall silent and Doom times them out —
+  // "the game runs a few seconds then everyone gets booted".
+  if (process.env.SCENARIO === 'blip' && host.started && join.started) {
+    console.log('  severing a relay socket mid-game…');
+    const before = host.codes.length + join.codes.length;
+    for (const ws of allSockets) { try { ws.close(1011, 'simulated blip'); } catch (e) {} }
+    await new Promise(r => setTimeout(r, 25000));
+    const dropped = [...host.codes, ...join.codes].slice(before)
+      .filter(c => c === 9 || c === 12 || c === 7);
+    const rebound = relayLog.filter(l => /REBOUND/.test(l)).length;
+    console.log('\n' + bold('BLIP RECOVERY'));
+    // The assertion that matters is simply: did the game survive? (rebind
+    // count is informational — with a working close handler the reconnect
+    // re-registers instead of rebinding, and either route is fine.)
+    console.log(dim('  relay: ' + rebound + ' rebind(s), ' +
+      relayLog.filter(l => /registered/.test(l)).length + ' registration(s)'));
+    console.log('  ' + (dropped.length === 0 ? green('✓') : red('✗')) +
+      ' no peer disconnected after the blip  ' + dim('codes ' + JSON.stringify(dropped)));
+    await browser.close(); server.close();
+    process.exit(dropped.length === 0 ? 0 : 1);
+  }
+
+  // Sustained play: the game must still be alive well after launch, not just
+  // reach "game started" and die.
+  if (process.env.SCENARIO === 'sustain' && host.started && join.started) {
+    const before = host.codes.length + join.codes.length;
+    console.log('  holding the game for 40s…');
+    await new Promise(r => setTimeout(r, 40000));
+    const dropped = [...host.codes, ...join.codes].slice(before)
+      .filter(c => c === 9 || c === 12 || c === 7);
+    console.log('\n' + bold('SUSTAIN') + '  ' +
+      (dropped.length === 0 ? green('✓ still connected') : red('✗ dropped: ' + dropped)));
+    await browser.close(); server.close();
+    process.exit(dropped.length === 0 ? 0 : 1);
   }
 
   // Did the browser event loop keep turning on each peer, or is the page

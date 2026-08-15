@@ -140,6 +140,26 @@ SCENARIO=earlystart node scripts/check-netgame.js # host taps START early: must 
 SCENARIO=forcestart node scripts/check-netgame.js # deliberate override: joiner must fail GRACEFULLY
 ```
 
+**Mid-game disconnects (relay-3).** Two bugs in the relay's session table made
+a game die a few seconds in, with every player booted:
+
+- Sessions were keyed by uid and only ever ADDED when the uid was unknown. The
+  engine re-opens its socket after any blip (`net_websockets.c` clears
+  `inittedWebSockets` in `WebSocketClose` and on a failed send, then reconnects
+  on the next packet) and keeps the SAME uid — so the relay went on routing to
+  the dead socket, both peers fell silent, and Doom timed them out. The uid is
+  now rebound to whichever socket the packet actually arrived on.
+- The close handler assigned an **undeclared** `i`. Worker modules are strict
+  mode, so it threw `ReferenceError` on every close: sessions were never
+  cleaned up, and each disconnect added to the dashboard's error count.
+
+`SCENARIO=blip node scripts/check-netgame.js` severs a socket mid-game and
+asserts nobody is dropped. With `RELAY_LEGACY=1` (the pre-fix logic) it
+reproduces the failure exactly — `doom: 9, disconnected from server` on the
+joiner and `doom: 12, client timed out` on the host. `SCENARIO=sustain` holds a
+game for 40s. **These need a worker redeploy**; confirm with `/api/health`
+reporting `"build":"relay-3"`.
+
 The fix: the host's start control moved onto a WAITING FOR PLAYERS overlay that
 shows the live count from `/api/room/<room>`, and starting without everyone
 needs a second, explicitly-labelled tap. Joiners now handle `doom: 9`

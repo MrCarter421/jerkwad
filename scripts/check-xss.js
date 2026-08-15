@@ -20,8 +20,18 @@
 // Serves arena/ with a stubbed lobby returning a HOSTILE level name, and
 // asserts the page's real render path treats it as text, not markup.
 // The page is served with API forced to http:// so ?relay= can point at the stub.
-const puppeteer=require(process.env.PUPPETEER||'/tmp/node_modules/puppeteer');
 const http=require('http'),fs=require('fs'),path=require('path');
+// Needs a real browser. Exit 2 = SKIPPED (reported as skipped, never as
+// passed) so a machine without puppeteer can't silently green-light a deploy.
+let puppeteer;
+try { puppeteer = require(process.env.PUPPETEER || 'puppeteer'); }
+catch (e) { try { puppeteer = require('/tmp/node_modules/puppeteer'); }
+  catch (e2) { console.log('SKIPPED — puppeteer not installed (npm install puppeteer to run this)'); process.exit(2); } }
+const CHROME = process.env.CHROMIUM || '/opt/pw-browsers/chromium';
+if (!fs.existsSync(CHROME)) {
+  try { puppeteer.executablePath(); }
+  catch (e) { console.log('SKIPPED — no chromium binary found (set CHROMIUM=/path/to/chrome)'); process.exit(2); }
+}
 const ROOT=path.join(__dirname,'..'), PORT=+(process.env.PORT||8196);
 const PAYLOAD="<img src=x onerror=window.__pwned=1>";
 let arena=fs.readFileSync(path.join(ROOT,'arena/index.html'),'utf8')
@@ -39,7 +49,7 @@ const srv=http.createServer((rq,rs)=>{
 });
 (async()=>{
 await new Promise(r=>srv.listen(PORT,r));
-const b=await puppeteer.launch({args:['--no-sandbox'],executablePath:process.env.CHROMIUM||'/opt/pw-browsers/chromium'});
+const b=await puppeteer.launch({args:['--no-sandbox'],executablePath: fs.existsSync(CHROME) ? CHROME : undefined});
 const pg=await b.newPage();
 await pg.goto('http://localhost:'+PORT+'/arena/?relay=localhost:'+PORT,{waitUntil:'networkidle2'});
 await new Promise(r=>setTimeout(r,4000));

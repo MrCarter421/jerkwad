@@ -1,7 +1,7 @@
 // Bump on every worker deploy. /api/health echoes it so the arena page — and
 // you — can confirm which build is actually live at doom.yuccabucca.com,
 // rather than guessing from the dashboard's version list.
-const BUILD = 'relay-2'
+const BUILD = 'relay-3'
 
 export default {
   async fetch(request, env) {
@@ -196,16 +196,28 @@ export class Router {
           this.sessions = []
         }
 
-        // if it's a new client, add it to the table of clients
-        if (this.sessions.map(c => c.from).indexOf(from) == -1) {
-          let session = { ws: webSocket, from: from }
-          this.sessions.push(session)
-        }
+        // Bind — or REBIND — this uid to the socket the packet actually
+        // arrived on. Only adding when the uid was unknown was the bug behind
+        // "the game runs for a few seconds then everyone is booted": the
+        // engine re-opens its socket after ANY blip (net_websockets.c clears
+        // inittedWebSockets in WebSocketClose and on a failed send, then
+        // reconnects on the next packet), and it keeps the SAME uid. The
+        // relay went on routing that uid to the dead socket, so both peers
+        // fell silent and Doom timed them out.
+        const known = this.sessions.find(c => c.from === from)
+        if (!known) this.sessions.push({ ws: webSocket, from: from })
+        else if (known.ws !== webSocket) known.ws = webSocket
 
         // send this packet to the corresponding client
-        i = this.sessions.map(c => c.from).indexOf(to)
-        if (i != -1) {
-          try { this.sessions[i].ws.send(data.slice(4)) } catch (x) { /* peer gone */ }
+        const dst = this.sessions.find(c => c.from === to)
+        if (dst) {
+          try {
+            dst.ws.send(data.slice(4))
+          } catch (x) {
+            // Target socket is gone. Drop it so the peer's next packet can
+            // rebind a fresh one instead of us holding a corpse forever.
+            this.sessions = this.sessions.filter(s => s !== dst)
+          }
         }
       } catch (err) {
         // Sending the stack back down a game socket corrupts the binary
@@ -215,12 +227,14 @@ export class Router {
       }
     })
 
-    // On "close" and "error" events, remove the WebSocket from the clients list
-    let closeOrErrorHandler = async () => {
-      i = this.sessions.map(e => e.ws).indexOf(webSocket)
-      if (i != -1) {
-        this.sessions.splice(i, 1)
-      }
+    // On "close" and "error" events, drop this socket from the table.
+    // `i` used to be assigned here without a declaration. Worker modules are
+    // strict mode, so that threw ReferenceError on EVERY close: sessions were
+    // never cleaned up, and each disconnect added to the dashboard's error
+    // count. Only remove the entry if it still points at THIS socket — a
+    // reconnect may already have rebound the uid to a newer one.
+    const closeOrErrorHandler = () => {
+      this.sessions = this.sessions.filter(e => e.ws !== webSocket)
     }
     webSocket.addEventListener('close', closeOrErrorHandler)
     webSocket.addEventListener('error', closeOrErrorHandler)

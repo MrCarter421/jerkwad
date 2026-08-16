@@ -66,6 +66,21 @@ There is no rotate-to-landscape gate and no orientation lock (build P8 removed
 both; the old overlay covered the screen in portrait and could not be
 dismissed).
 
+**When a game will not start (build P12).** The waiting screen and the solo
+watchdog both print the ENGINE'S OWN last lines, so a stuck boot or handshake
+can be screenshotted off a phone instead of needing a devtools console. Read
+the `doom: N` codes: 2 connected, 8 uid assigned, 10 game started, 9
+disconnected, 7 connect failed, 12 peer timed out.
+
+The count on the waiting screen is **relay connections, not confirmed Doom
+players** — two sockets can be attached while Doom's own handshake is still
+incomplete. It is labelled as such; do not read "2 / 2" as "Doom has both
+players".
+
+Note the arena's **Players dropdown defaults to 2**, so pressing PLAY without
+changing it starts a two-player netgame that waits for someone else. The
+waiting screen always offers **PLAY SOLO INSTEAD** for exactly that case.
+
 **Sizing (build P9).** The canvas box fills the visible viewport (`100dvw`
 x `100dvh`, which track the area under the mobile browser chrome), and CSS
 `object-fit` does the aspect work:

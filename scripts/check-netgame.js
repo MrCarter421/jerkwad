@@ -55,6 +55,7 @@ let sessions = [];
 const relayLog = [];
 const allSockets = [];   // for the blip scenario
 const LEGACY = !!process.env.RELAY_LEGACY;
+let overlayStuck = false;
 function startRelay() {
   const wss = new WebSocketServer({ server, path: '/api/ws/room' });
   wss.on('connection', (ws) => {
@@ -211,6 +212,25 @@ async function peer(browser, label, url) {
   };
   const hostAlive = await responsive(host), joinAlive = await responsive(join);
 
+  // The overlays MUST get out of the way once the game starts. A stuck
+  // "WAITING FOR PLAYERS" panel looks exactly like a game that never
+  // launched, even though it is running underneath.
+  for (const st of [host, join]) {
+    try {
+      const ui = await st.page.evaluate(() => ({
+        netstatus: !!document.getElementById('netstatus'),
+        netText: (document.getElementById('netstatus') || {}).innerText || '',
+        bootShown: !document.getElementById('boot').classList.contains('hidden'),
+        bootMsg: (document.getElementById('bootmsg') || {}).textContent || '',
+      }));
+      const clean = !ui.netstatus && !ui.bootShown;
+      console.log('  ' + (clean ? green('✓') : red('✗')) + ` ${st.label} overlays cleared` +
+        dim(`  netstatus=${ui.netstatus ? JSON.stringify(ui.netText.slice(0,40)) : 'gone'}` +
+            `  boot=${ui.bootShown ? JSON.stringify(ui.bootMsg.slice(0,50)) : 'hidden'}`));
+      if (!clean) overlayStuck = true;
+    } catch (e) { console.log('  ? ' + st.label + ' overlay check failed: ' + e.message); }
+  }
+
   console.log('\n' + bold('RESULT'));
   for (const [st, alive] of [[host, hostAlive], [join, joinAlive]]) {
     const ok = st.started;
@@ -238,7 +258,7 @@ async function peer(browser, label, url) {
     process.exit(good ? 0 : 1);
   }
 
-  const pass = host.started && join.started;
+  const pass = host.started && join.started && !overlayStuck;
   if (!pass) {
     console.log('\n' + bold('DIAGNOSIS'));
     if (relayLog.length < 2) {

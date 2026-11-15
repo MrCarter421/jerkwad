@@ -14,6 +14,13 @@
 //   3 ECHO     WS   /api/echo       WebSockets actually UPGRADE through
 //                                   Cloudflare (an HTTPS check cannot see this)
 //   4 GAME WS  WS   /api/ws/<room>  the room Durable Object accepts a socket
+//   5 PING     WS   (same socket)   the relay answers a ping — i.e. it is
+//                                   relay-4 or newer, the first build that can
+//                                   carry a game across a reconnect
+//
+// Layer 5 is the one that separates "the relay works" from "the relay is the
+// CURRENT one". An older build passes 1-4 and still loses every game the
+// moment a player's connection blips.
 //
 // Layers 1-2 are plain HTTPS; 3-4 are WebSockets. If 1-2 pass and 3-4 fail,
 // the HTTP path is healthy and only the WebSocket path is broken — which is
@@ -28,6 +35,16 @@ const net = require('net');
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// The build this checkout's worker would deploy — what HEALTH should report.
+const REPO_BUILD = (() => {
+  try {
+    return (fs.readFileSync(path.join(__dirname, '..', 'workers', 'doom-relay', 'index.mjs'), 'utf8')
+      .match(/const BUILD = '([^']+)'/) || [])[1] || null;
+  } catch (e) { return null; }
+})();
 
 const raw = process.argv[2] || 'doom.yuccabucca.com';
 const base = /^https?:\/\//.test(raw) ? new URL(raw) : new URL('https://' + raw);
@@ -139,7 +156,12 @@ function wsProbe(path, { send = Buffer.from([1, 2, 3, 4]), expectEcho = true, ti
   if (h.error) failed('HEALTH  ' + dim('GET /api/health'), h.error);
   else if (h.status === 200 && h.json && h.json.ok) {
     healthOk = true; build = h.json.build;
-    pass('HEALTH  ' + dim('GET /api/health'), 'build ' + build);
+    pass('HEALTH  ' + dim('GET /api/health'), 'build ' + build +
+      (REPO_BUILD && build !== REPO_BUILD ? '   ' + yellow('(this repo has ' + REPO_BUILD + ')') : ''));
+    if (REPO_BUILD && build !== REPO_BUILD) {
+      notes.push('The deployed relay is ' + build + '; this repo\'s worker is ' + REPO_BUILD +
+        '. Deploy it: cd workers/doom-relay && npx wrangler deploy');
+    }
   } else if (h.status === 404 || /notfound|api not found/.test(h.body)) {
     failed('HEALTH  ' + dim('GET /api/health'), 'HTTP ' + h.status + ' — endpoint missing');
     notes.push('The deployed worker predates /api/health, so it is NOT running the current code. Redeploy it.');
@@ -166,12 +188,26 @@ function wsProbe(path, { send = Buffer.from([1, 2, 3, 4]), expectEcho = true, ti
   else failed('ECHO    ' + dim('WS  /api/echo'), (e.status || 'no upgrade') + (e.head ? ' — ' + e.head.split('\n')[0] : ''));
 
   // 4 ---- the real game socket
-  let gameOk = false;
+  let gameOk = false, pingOk = false;
   if (room) {
     const g = await wsProbe('/api/ws/' + room, { expectEcho: false });
     if (g.error) failed('GAME WS ' + dim('WS  /api/ws/<room>'), g.error);
     else if (g.upgraded) { gameOk = true; pass('GAME WS ' + dim('WS  /api/ws/<room>'), 'Durable Object accepted the socket'); }
     else failed('GAME WS ' + dim('WS  /api/ws/<room>'), (g.status || 'no upgrade') + (g.head ? ' — ' + g.head.split('\n')[0] : ''));
+
+    // 5 ---- ping: [to = FFFFFFFF][from = uid] must come back as FF FF FF FF
+    if (gameOk) {
+      const ping = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x39, 0x30, 0x00, 0x00]);
+      const pg = await wsProbe('/api/ws/' + room, { send: ping, expectEcho: true, timeoutMs: 6000 });
+      if (pg.echo && pg.echo.toString('hex') === 'ffffffff') {
+        pingOk = true;
+        pass('PING    ' + dim('WS  relay answers'), 'this relay can carry a game across a reconnect');
+      } else {
+        failed('PING    ' + dim('WS  relay answers'), 'no answer — this relay predates relay-4');
+        notes.push('This relay cannot recover a dropped connection: when a player\'s socket blips, ' +
+          'the game is lost. Deploy the current worker: cd workers/doom-relay && npx wrangler deploy');
+      }
+    }
   } else {
     console.log('  ' + yellow('–') + ' GAME WS ' + dim('skipped (no room id)'));
   }
@@ -179,7 +215,12 @@ function wsProbe(path, { send = Buffer.from([1, 2, 3, 4]), expectEcho = true, ti
   // ---- verdict -------------------------------------------------------------
   const httpOk = healthOk || !!room;
   console.log('\n' + bold('VERDICT'));
-  if (gameOk && echoOk) {
+  if (gameOk && echoOk && !pingOk) {
+    console.log('  ' + yellow('The relay is reachable, but it is an OLD build.'));
+    console.log('  Games start on it. They do not survive a dropped connection: this');
+    console.log('  build cannot follow a player who reconnects, so one network blip ends');
+    console.log('  the game for everyone. ' + bold('Fix: cd workers/doom-relay && npx wrangler deploy'));
+  } else if (gameOk && echoOk) {
     console.log('  ' + green('The relay is fully working, WebSockets included.'));
     console.log('  If a game still will not start, the fault is in the Doom netgame');
     console.log('  layer, not the relay. Check both players are on the SAME deployed');
@@ -192,7 +233,7 @@ function wsProbe(path, { send = Buffer.from([1, 2, 3, 4]), expectEcho = true, ti
     console.log('  modern runtime rejects that and 500s every upgrade, while plain');
     console.log('  HTTPS routes keep working (which is why the arena shows green).');
     console.log('  ' + bold('Fix: cd workers/doom-relay && npx wrangler deploy'));
-    console.log('  Then re-run this; HEALTH should report build relay-2.');
+    console.log('  Then re-run this; HEALTH should report build ' + (REPO_BUILD || 'the current one') + '.');
   } else if (!httpOk) {
     console.log('  ' + red('The relay is not reachable at all.'));
     console.log('  Check the DNS record for this subdomain is Proxied (orange cloud)');
@@ -202,5 +243,5 @@ function wsProbe(path, { send = Buffer.from([1, 2, 3, 4]), expectEcho = true, ti
   }
   for (const n of notes) console.log('  ' + yellow('note: ') + n);
   console.log();
-  process.exit(gameOk && echoOk ? 0 : 1);
+  process.exit(gameOk && echoOk && pingOk ? 0 : 1);
 })();

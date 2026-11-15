@@ -1,7 +1,7 @@
 // Bump on every worker deploy. /api/health echoes it so the arena page — and
 // you — can confirm which build is actually live at doom.yuccabucca.com,
 // rather than guessing from the dashboard's version list.
-const BUILD = 'relay-3'
+const BUILD = 'relay-4'
 
 export default {
   async fetch(request, env) {
@@ -178,35 +178,73 @@ export class Router {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // The relay protocol. Every frame from a player is
+  //
+  //     [to: u32 LE][from: u32 LE][payload…]
+  //
+  // and is delivered to whichever socket `to` is bound to as [from][payload].
+  // uids are the engine's "addresses": the host (the Doom server) is always 1,
+  // joiners pick a random one. Three addresses are special:
+  //
+  //   from 1, to 0            the host announcing a NEW game — clear the room
+  //   to 0xFFFFFFFF           a ping: nobody to deliver to. The frame still
+  //                           (re)binds its sender, and the relay answers with
+  //                           the four bytes FF FF FF FF. The engine uses the
+  //                           answer to tell "the relay is unreachable" apart
+  //                           from "the other player's tab is frozen" — only
+  //                           the first is fixed by opening a new socket.
+  //
+  // The binding rule is the heart of it: a uid belongs to the socket its most
+  // recent frame arrived on. Players reconnect (a network handover, a phone
+  // waking up, this object being restarted) and come back with the SAME uid
+  // on a NEW socket; routing must follow them. relay-2 only ever bound a uid
+  // once, so the first reconnect in a game left everyone talking to a dead
+  // socket until Doom timed them out.
+  // -------------------------------------------------------------------------
   async handleSession(webSocket) {
     webSocket.accept()
 
-    webSocket.addEventListener('message', async msg => {
-      try {
-        let data = msg.data
-        let from = new Uint32Array(data.slice(4, 8))[0]
-        let to = new Uint32Array(data.slice(0, 4))[0]
-        let i
+    const PING = 0xffffffff
+    const PONG = new Uint8Array([0xff, 0xff, 0xff, 0xff])
 
-        if (from == 1 && to == 0) {
-          // initial packet from doom server, let's restart
-          this.sessions.forEach(s => {
-            s.ws.close(1011, 'closing')
-          })
+    webSocket.addEventListener('message', msg => {
+      try {
+        const data = msg.data
+        // Text frames and runts are not ours; a bad frame must not throw.
+        if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return
+        const head = new DataView(data)
+        const to = head.getUint32(0, true)
+        const from = head.getUint32(4, true)
+
+        if (from === 1 && to === 0) {
+          // The host is starting a new game in this room: drop whoever was
+          // here before — but not the socket this very frame arrived on.
+          for (const s of this.sessions) {
+            if (s.ws !== webSocket) {
+              try { s.ws.close(1000, 'new game') } catch (x) {}
+            }
+          }
           this.sessions = []
         }
 
-        // Bind — or REBIND — this uid to the socket the packet actually
-        // arrived on. Only adding when the uid was unknown was the bug behind
-        // "the game runs for a few seconds then everyone is booted": the
-        // engine re-opens its socket after ANY blip (net_websockets.c clears
-        // inittedWebSockets in WebSocketClose and on a failed send, then
-        // reconnects on the next packet), and it keeps the SAME uid. The
-        // relay went on routing that uid to the dead socket, so both peers
-        // fell silent and Doom timed them out.
+        // Bind — or REBIND — this uid to the socket the frame arrived on.
         const known = this.sessions.find(c => c.from === from)
-        if (!known) this.sessions.push({ ws: webSocket, from: from })
-        else if (known.ws !== webSocket) known.ws = webSocket
+        if (!known) {
+          this.sessions.push({ ws: webSocket, from: from })
+        } else if (known.ws !== webSocket) {
+          // The player came back on a new socket. Retire the old one so it
+          // cannot linger half-open, and so a late frame still buffered on it
+          // cannot steal the binding back.
+          const old = known.ws
+          known.ws = webSocket
+          try { old.close(1000, 'replaced') } catch (x) {}
+        }
+
+        if (to === PING) {
+          try { webSocket.send(PONG) } catch (x) {}
+          return
+        }
 
         // send this packet to the corresponding client
         const dst = this.sessions.find(c => c.from === to)
@@ -227,14 +265,18 @@ export class Router {
       }
     })
 
-    // On "close" and "error" events, drop this socket from the table.
-    // `i` used to be assigned here without a declaration. Worker modules are
-    // strict mode, so that threw ReferenceError on EVERY close: sessions were
-    // never cleaned up, and each disconnect added to the dashboard's error
-    // count. Only remove the entry if it still points at THIS socket — a
-    // reconnect may already have rebound the uid to a newer one.
+    // On "close" and "error" events, drop this socket from the table. Only
+    // remove the entry if it still points at THIS socket — a reconnect may
+    // already have rebound the uid to a newer one.
+    //
+    // And ANSWER the close. With this worker's compatibility date the runtime
+    // does not reply to a client's Close frame by itself, so a browser that
+    // closed its end sat in CLOSING forever: its `onclose` never fired, the
+    // engine went on believing the socket was open, and wrote every packet
+    // into the void. Closing our end completes the handshake.
     const closeOrErrorHandler = () => {
       this.sessions = this.sessions.filter(e => e.ws !== webSocket)
+      try { webSocket.close(1000, 'bye') } catch (x) {}
     }
     webSocket.addEventListener('close', closeOrErrorHandler)
     webSocket.addEventListener('error', closeOrErrorHandler)

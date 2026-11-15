@@ -1,20 +1,37 @@
 #!/bin/bash
 # ============================================================================
-# Reproducible build of play/websockets-doom.{js,wasm} — Chocolate Doom
+# Reproducible build of play/{websockets,fast}-doom.{js,wasm} — Chocolate Doom
 # compiled to WebAssembly with WebSocket netplay (cloudflare/doom-wasm fork).
 #
 # Tested on Ubuntu 24.04 with the distro emscripten (3.1.6). Newer emsdk
 # versions also work and need FEWER workarounds (skip steps 2-4).
 #
 # Usage:  ./scripts/build-doom-wasm.sh [workdir]
+#         OUT_DIR=/somewhere ./scripts/build-doom-wasm.sh   # don't touch play/
+#
+# The engine is upstream cloudflare/doom-wasm at a PINNED commit plus the
+# patches in scripts/engine-patches/ (the netcode fixes — read the README
+# there) and the small inline edits below. A patch that no longer applies
+# aborts the build: silently shipping an unpatched engine is how the
+# 4-second network timeout would come back.
 # ============================================================================
 set -euo pipefail
 WORK="${1:-/tmp/doom-wasm-build}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+OUT_DIR="${OUT_DIR:-$REPO_DIR/play}"
+PATCH_DIR="$REPO_DIR/scripts/engine-patches"
+UPSTREAM=https://github.com/cloudflare/doom-wasm.git
+UPSTREAM_COMMIT=65e0d3ae2ffa604155eebd96ed40da6567bd08f4
+mkdir -p "$WORK"
+WORK="$(cd "$WORK" && pwd)"
 
 # 1. Toolchain -------------------------------------------------------------
-command -v emcc >/dev/null || sudo apt-get install -y emscripten
-sudo apt-get install -y automake autoconf libtool pkg-config
+SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+command -v emcc >/dev/null || $SUDO apt-get install -y emscripten
+for tool in automake autoconf libtool pkg-config; do
+  command -v "$tool" >/dev/null || command -v "${tool}ize" >/dev/null || NEED_TOOLS=1
+done
+[ -z "${NEED_TOOLS:-}" ] || $SUDO apt-get install -y automake autoconf libtool pkg-config
 
 # 2. Debian's emscripten ships a FROZEN system cache — use a writable one.
 export EM_CACHE_DIR="$WORK/emcache"
@@ -34,6 +51,20 @@ CLANG_ADD_VERSION = '15'
 EOF
 export EM_CONFIG="$WORK/emconfig.py"
 
+# Keep the work dir's absolute path out of our own objects (debug info records
+# the compile directory): with it in, the same source built in two places gave
+# two different engines. The SDL port needs separate treatment — see step 3.
+export EMCC_CFLAGS="-ffile-prefix-map=$WORK=/jerkwad-engine"
+
+# What is and is not reproducible here (measured, emscripten 3.1.6):
+#   - every OBJECT we compile is byte-identical from any directory, on any run;
+#   - the build directory no longer appears anywhere in the output;
+#   - the final LINK is not bit-stable: linking the same objects repeatedly
+#     gives one of a few .wasm files that differ only in the ORDER of functions
+#     (same size, same code). Pinning BINARYEN_CORES, EMCC_CORES and
+#     PYTHONHASHSEED does not change that. So `cmp` against play/ may differ
+#     on an honest rebuild; compare sizes and re-run the netgame tests instead.
+
 # 3. emscripten-ports ZIP downloads fail two ways in restricted environments:
 #    (a) GitHub re-archives change the pinned sha512, (b) proxies may block
 #    codeload URLs. Pre-seed the ports cache from git clones instead.
@@ -48,6 +79,17 @@ seed_port() { # name subdir giturl tag url
 }
 mkdir -p "$EM_CACHE_DIR/ports"
 seed_port sdl2       SDL-release-2.0.20       https://github.com/libsdl-org/SDL.git              release-2.0.20 https://github.com/libsdl-org/SDL/archive/release-2.0.20.zip
+# SDL's error macros bake __FILE__ — the ABSOLUTE path of this work dir — into
+# the binary, so the same source built in two directories produced two
+# different engines (every data offset after the string shifts with the path's
+# length), and the shipped .wasm advertised wherever it happened to be built.
+# __FILE_NAME__ is the basename only. (EMCC_CFLAGS=-ffile-prefix-map would be
+# the obvious tool, but emscripten deliberately strips EMCC_CFLAGS when it
+# builds ports.)
+sed -i 's/^#define SDL_FILE    __FILE__$/#define SDL_FILE    __FILE_NAME__/' \
+  "$EM_CACHE_DIR/ports/sdl2/SDL-release-2.0.20/include/SDL_assert.h"
+grep -q '^#define SDL_FILE    __FILE_NAME__$' "$EM_CACHE_DIR/ports/sdl2/SDL-release-2.0.20/include/SDL_assert.h" \
+  || { echo "ABORT: could not neutralise SDL_FILE in the SDL port" >&2; exit 1; }
 seed_port sdl2_mixer SDL2_mixer-release-2.0.2 https://github.com/emscripten-ports/SDL2_mixer.git release-2.0.2  https://github.com/emscripten-ports/SDL2_mixer/archive/release-2.0.2.zip
 seed_port sdl2_net   SDL2_net-version_2       https://github.com/emscripten-ports/SDL2_net.git   version_2      https://github.com/emscripten-ports/SDL2_net/archive/version_2.zip
 seed_port ogg        Ogg-version_1            https://github.com/emscripten-ports/ogg.git        version_1      https://github.com/emscripten-ports/ogg/archive/version_1.zip
@@ -59,8 +101,24 @@ seed_port vorbis     Vorbis-version_1         https://github.com/emscripten-port
 #    We seed the cache above so this usually never triggers.
 
 # 5. Source ------------------------------------------------------------------
-[ -d "$WORK/doom-wasm" ] || git clone --depth 1 https://github.com/cloudflare/doom-wasm.git "$WORK/doom-wasm"
+[ -d "$WORK/doom-wasm" ] || git clone --depth 1 "$UPSTREAM" "$WORK/doom-wasm"
 cd "$WORK/doom-wasm"
+if [ "$(git rev-parse HEAD)" != "$UPSTREAM_COMMIT" ]; then
+  git fetch --depth 1 origin "$UPSTREAM_COMMIT" && git checkout -q "$UPSTREAM_COMMIT" || {
+    echo "ABORT: upstream is not at the pinned commit $UPSTREAM_COMMIT and it could not be fetched." >&2
+    echo "       The patches in scripts/engine-patches/ are written against exactly that tree." >&2
+    exit 1; }
+fi
+
+# 5a. JerkWad netcode patches. Always from a clean tree, so a re-run cannot
+#     stack a patch on top of itself, and --check first so a patch that does
+#     not apply stops the build instead of being skipped.
+git checkout -q -- .
+for patch in "$PATCH_DIR"/*.patch; do
+  git apply --check "$patch" || { echo "ABORT: $(basename "$patch") does not apply to upstream $UPSTREAM_COMMIT" >&2; exit 1; }
+  git apply "$patch"
+  echo "applied $(basename "$patch")"
+done
 
 # clang >= 15 renames `int main(int, char**)` to `__main_argc_argv`, which
 # emscripten 3.1.6's linker does not map back to `main` — the entire game
@@ -90,8 +148,17 @@ PYEOF
 # 6. Configure + compile objects --------------------------------------------
 emconfigure autoreconf -fiv
 ac_cv_exeext=".html" emconfigure ./configure --host=none-none-none
-emmake make -j"$(nproc)" -k || true   # -k: the .html link step fails on
+rm -f src/d_loop.o src/i_system.o src/net_client.o src/net_common.o src/net_gui.o \
+      src/net_server.o src/net_websockets.o          # no stale objects from an earlier run
+emmake make -j"$(nproc)" -k > "$WORK/make.log" 2>&1 || true
+                                      # -k: the .html link step fails on
                                       # missing `htmlmin`; objects still build.
+# ...but `|| true` must not hide a real compile error. The final link below
+# names every object; make sure the ones we patch were actually rebuilt.
+for obj in d_loop i_system net_client net_common net_gui net_server net_websockets; do
+  [ -f "src/$obj.o" ] || { echo "ABORT: src/$obj.c did not compile:" >&2
+    grep -n -B2 -A12 "$obj\.c:.*error" "$WORK/make.log" | head -60 >&2; exit 1; }
+done
 
 # 7. Final link — straight to .js (skips emcc's html-shell + htmlmin) --------
 cd src
@@ -147,6 +214,8 @@ emcc -I../textscreen -I../opl -I../pcsound -O3 \
   $FAST_OBJS doom/libdoom.a ../textscreen/libtextscreen.a \
   ../pcsound/libpcsound.a ../opl/libopl.a -lwebsocket.js -lm
 
-# 8. Install into the repo ----------------------------------------------------
-cp websockets-doom.js websockets-doom.wasm fast-doom.js fast-doom.wasm "$REPO_DIR/play/"
-echo "OK: $(ls -la "$REPO_DIR"/play/*doom*.wasm)"
+# 8. Install -----------------------------------------------------------------
+mkdir -p "$OUT_DIR"
+cp websockets-doom.js websockets-doom.wasm fast-doom.js fast-doom.wasm "$OUT_DIR/"
+echo "OK: $(ls -la "$OUT_DIR"/*doom*.wasm)"
+echo "Remember: bump ENGINE_BUILD in play/index.html so browsers fetch the new engine."

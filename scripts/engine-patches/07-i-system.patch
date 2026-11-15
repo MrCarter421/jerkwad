@@ -1,0 +1,52 @@
+diff --git a/src/i_system.c b/src/i_system.c
+index 5546e04..8a13f57 100644
+--- a/src/i_system.c
++++ b/src/i_system.c
+@@ -255,12 +255,20 @@ void I_Error(const char *error, ...)
+ 
+     if (already_quitting) {
+         fprintf(stderr, "Warning: recursive call to I_Error detected.\n");
++        emscripten_cancel_main_loop();
+         exit(-1);
+     }
+     else {
+         already_quitting = true;
+     }
+ 
++    // JERKWAD: stop the frame loop before anything else. exit() does not do
++    // that on the web — the browser kept calling D_RunFrame on an engine that
++    // had already given up, every frame raised I_Error again ("recursive call
++    // to I_Error detected", thousands of times) and it ended in a memory
++    // fault. One error, reported once.
++    emscripten_cancel_main_loop();
++
+     // Message first.
+     va_start(argptr, error);
+     // fprintf(stderr, "\nError: ");
+@@ -275,6 +283,26 @@ void I_Error(const char *error, ...)
+     M_vsnprintf(msgbuf, sizeof(msgbuf), error, argptr);
+     va_end(argptr);
+ 
++    // JERKWAD: and say it where the page is listening. stderr only reaches
++    // the browser console, so to a player a fatal error was a frozen picture
++    // with no explanation at all.
++    {
++        size_t n = strlen(msgbuf);
++
++        while (n > 0 && (msgbuf[n - 1] == '\n' || msgbuf[n - 1] == '\r')) {
++            msgbuf[--n] = '\0';
++        }
++
++        if (strncmp(msgbuf, "doom: ", 6) == 0) {
++            printf("%s\n", msgbuf);
++        }
++        else {
++            printf("doom: 17, %s\n", msgbuf);
++        }
++
++        fflush(stdout);
++    }
++
+     // Shutdown. Here might be other errors.
+ 
+     entry = exit_funcs;

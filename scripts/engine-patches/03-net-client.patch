@@ -1,0 +1,76 @@
+diff --git a/src/net_client.c b/src/net_client.c
+index c8896ea..71103ed 100644
+--- a/src/net_client.c
++++ b/src/net_client.c
+@@ -110,6 +110,10 @@ static net_gamesettings_t settings;
+ // Why did the server reject us?
+ char *net_client_reject_reason = NULL;
+ 
++// JERKWAD: why the connection ended (a net_disconnect_reason_t), so the page
++// can tell the player what actually happened instead of "disconnected".
++int net_client_disconnect_reason = -1;
++
+ // true if the client code is in use
+ 
+ boolean net_client_connected;
+@@ -171,7 +175,11 @@ unsigned int net_local_is_freedoom;
+ 
+ // Called when we become disconnected from the server
+ 
+-static void NET_CL_Disconnected(void) { D_ReceiveTic(NULL, NULL); }
++static void NET_CL_Disconnected(void)
++{
++    net_client_disconnect_reason = client_connection.disconnect_reason;
++    D_ReceiveTic(NULL, NULL);
++}
+ 
+ // Called when a packet is received from the server containing game
+ // data. This updates the clock synchronization variable (offsetms)
+@@ -1046,6 +1054,27 @@ boolean NET_CL_GetSettings(net_gamesettings_t *_settings)
+     return true;
+ }
+ 
++// JERKWAD: leave without waiting. NET_CL_Disconnect() below sleeps for up to
++// five seconds until the server acknowledges; on the web, the moments a
++// player leaves (the tab is closing, the engine hit a fatal error) are
++// exactly the moments that cannot sleep. One DISCONNECT, sent right now, is
++// enough for the server to let the others carry on immediately instead of
++// freezing them until this player times out.
++
++void NET_CL_LeaveNow(void)
++{
++    net_packet_t *packet;
++
++    if (!net_client_connected) {
++        return;
++    }
++
++    packet = NET_NewPacket(10);
++    NET_WriteInt16(packet, NET_PACKET_TYPE_DISCONNECT);
++    NET_Conn_SendPacket(&client_connection, packet);
++    NET_FreePacket(packet);
++}
++
+ // disconnect from the server
+ 
+ void NET_CL_Disconnect(void)
+diff --git a/src/net_client.h b/src/net_client.h
+index 7c9a2eb..3cb4934 100644
+--- a/src/net_client.h
++++ b/src/net_client.h
+@@ -25,6 +25,7 @@
+ boolean NET_CL_Connect(net_addr_t *addr, net_connect_data_t *data);
+ boolean NET_CL_ConnectWebsockets(net_addr_t *addr, net_connect_data_t *data);
+ void NET_CL_Disconnect(void);
++void NET_CL_LeaveNow(void);
+ void NET_CL_Run(void);
+ void NET_CL_Init(void);
+ void NET_CL_LaunchGame(void);
+@@ -39,6 +40,7 @@ extern boolean net_client_connected;
+ extern boolean net_client_received_wait_data;
+ extern net_waitdata_t net_client_wait_data;
+ extern char *net_client_reject_reason;
++extern int net_client_disconnect_reason;
+ extern boolean net_waiting_for_launch;
+ extern char *net_player_name;
+ 

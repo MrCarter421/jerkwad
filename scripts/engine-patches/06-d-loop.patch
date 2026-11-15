@@ -1,0 +1,162 @@
+diff --git a/src/d_loop.c b/src/d_loop.c
+index e5f3a3c..363a1ec 100644
+--- a/src/d_loop.c
++++ b/src/d_loop.c
+@@ -35,6 +35,7 @@
+ #include "m_fixed.h"
+ 
+ #include "net_client.h"
++#include "net_common.h"
+ #include "net_gui.h"
+ #include "net_io.h"
+ #include "net_loop.h"
+@@ -248,7 +249,21 @@ static void D_Disconnected(void)
+ 
+     // disconnected from server
+ 
+-    printf("doom: 9, disconnected from server\n");
++    // JERKWAD: not while still CONNECTING. A refused connection also passes
++    // through here, a moment before the refusal's actual reason is printed
++    // (doom: 13) — and "disconnected" arriving first is what a player would
++    // be shown. The reject reason is non-NULL for exactly as long as a
++    // connection attempt is in progress.
++    if (net_client_reject_reason != NULL) {
++        return;
++    }
++
++    // JERKWAD: with the reason. "Disconnected" on its own made a host who
++    // closed their tab, a dead network and a genuine timeout indistinguishable.
++    printf("doom: 9, disconnected from server (%s)\n",
++           net_client_disconnect_reason == NET_DISCONNECT_TIMEOUT  ? "nothing heard from the host for too long"
++           : net_client_disconnect_reason == NET_DISCONNECT_REMOTE ? "the host ended the game"
++                                                                   : "left the game");
+ }
+ 
+ //
+@@ -398,6 +413,21 @@ void D_StartNetGame(net_gamesettings_t *settings, netgame_startup_callback_t cal
+     //}
+ }
+ 
++// JERKWAD: the relay routes by this number, so two players must never share
++// one. It used to be `srand(time(NULL)); rand() % 0xfffe` — seeded by the
++// clock in whole seconds, so two friends who pressed JOIN in the same second
++// got the SAME uid and the relay could not tell them apart; and it could come
++// out as 1 (the host's own uid) or 0 (which the relay treats as "new game").
++// 31 random bits from the browser, never 0 or 1.
++static uint32_t JW_RandomUID(void)
++{
++    uint32_t hi = (uint32_t)(emscripten_random() * 32768.0f) & 0x7fff;
++    uint32_t lo = (uint32_t)(emscripten_random() * 65536.0f) & 0xffff;
++    uint32_t uid = (hi << 16) | lo;
++
++    return uid < 2 ? uid + 2 : uid;
++}
++
+ boolean D_InitNetGame(net_connect_data_t *connect_data)
+ {
+     boolean result = false;
+@@ -436,8 +466,7 @@ boolean D_InitNetGame(net_connect_data_t *connect_data)
+         //
+ 
+         // Generate UID for this instance - it will be used as the websocketsID
+-        srand((unsigned int)time(NULL));
+-        instanceUID = rand() % 0xfffe;
++        instanceUID = JW_RandomUID();
+ 
+         i = M_CheckParmWithArgs("-connect", 1);
+ 
+@@ -456,6 +485,12 @@ boolean D_InitNetGame(net_connect_data_t *connect_data)
+         }
+ 
+         if (!NET_CL_Connect(addr, connect_data)) {
++            // JERKWAD: the server told us why. Pass it on — "level mismatch",
++            // "game already started" and "server full" need different fixes.
++            if (net_client_reject_reason != NULL) {
++                printf("doom: 13, %s\n", net_client_reject_reason);
++            }
++
+             I_Error("doom: 7, failed to connect to %s\n", NET_AddrToString(addr));
+         }
+ 
+@@ -475,10 +510,22 @@ boolean D_InitNetGame(net_connect_data_t *connect_data)
+ // Called before quitting to leave a net game
+ // without hanging the other players
+ //
++// JERKWAD: leave the netgame NOW. Exported so the page can call it when the
++// tab is closing (pagehide): the server tells its clients the game is over,
++// a client tells the server it is going. Nothing here waits or sleeps, so it
++// is safe from an unload handler and from the fatal-error path — the stock
++// NET_SV_Shutdown/NET_CL_Disconnect pair each sleep-wait up to five seconds
++// for acknowledgements, which under ASYNCIFY means unwinding the stack from
++// inside exit(), and that is how one fatal error used to turn into thousands.
++EMSCRIPTEN_KEEPALIVE void jw_net_leave(void)
++{
++    NET_SV_LeaveNow();
++    NET_CL_LeaveNow();
++}
++
+ void D_QuitNetGame(void)
+ {
+-    NET_SV_Shutdown();
+-    NET_CL_Disconnect();
++    jw_net_leave();
+ }
+ 
+ static int GetLowTic(void)
+@@ -601,6 +648,39 @@ static void SinglePlayerClear(ticcmd_set_t *set)
+ // TryRunTics
+ //
+ 
++// JERKWAD: say when the game is being held up waiting for another player.
++// Lockstep netcode cannot advance without everyone's input, so while one
++// player's tab is hidden or their network is stalled the others' games simply
++// stop. With the 4 s timeout that state never lasted long enough to notice;
++// now that a stalled player is waited for, a frozen screen with no
++// explanation would read as a hang. The page shows "waiting for players".
++// Momentary waits (ordinary latency) end long before the 1.5 s threshold.
++static void JW_ReportStall(boolean stalled)
++{
++    static int since_ms = 0;
++    static boolean reported = false;
++
++    if (stalled && net_client_connected) {
++        int now = I_GetTimeMS();
++
++        if (since_ms == 0) {
++            since_ms = now != 0 ? now : 1;
++        }
++        else if (!reported && now - since_ms > 1500) {
++            printf("doom: 15, waiting for another player\n");
++            reported = true;
++        }
++    }
++    else {
++        if (reported) {
++            printf("doom: 16, game resumed\n");
++        }
++
++        since_ms = 0;
++        reported = false;
++    }
++}
++
+ void TryRunTics(void)
+ {
+     int i;
+@@ -667,6 +747,7 @@ void TryRunTics(void)
+             // new network data to be received. So don't stay in here
+             // forever - give the menu a chance to work.
+             if (I_GetTime() / ticdup - entertic >= MAX_NETGAME_STALL_TICS) {
++                JW_ReportStall(true);
+                 return;
+             }
+ 
+@@ -674,6 +755,8 @@ void TryRunTics(void)
+         }
+     }
+ 
++    JW_ReportStall(false);
++
+     // run the count * ticdup dics
+     while (counts--) {
+         ticcmd_set_t *set;

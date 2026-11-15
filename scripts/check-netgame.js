@@ -8,6 +8,12 @@
 //
 // Pass condition: BOTH peers print `doom: 10, game started`.
 //
+// This is the "does a game START" test (and SCENARIO=earlystart|forcestart
+// for the host's START control). For "does it STAY up" — stalls, dropped and
+// dead sockets, leaving, mismatched levels — use scripts/check-netplay.js,
+// which plays each case through the real arena page against the real Worker
+// file under workerd rather than the hand-written relay port below.
+//
 //   node scripts/check-netgame.js            # headless, ~90s
 //   HEADFUL=1 node scripts/check-netgame.js  # watch it
 //

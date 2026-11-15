@@ -102,26 +102,55 @@
   </div>
 </div>
 
-<script src="engine.js"></script>
+<!-- ?v= is the generator version (V0.xx in wad_editor.jsx). This page and
+     engine.js decide a level's bytes TOGETHER; a browser that kept last
+     version's cached engine.js under this page would build levels nobody else
+     has. scripts/deploy.js refuses to ship if the number is stale. -->
+<script src="engine.js?v=57"></script>
 <script>
 // ---------------------------------------------------------------------------
 // JerkWad Arena. Generates a multiplayer-ready ShapeShifter level from two
 // sliders, renders its automap, and hosts/joins netgames over the Cloudflare
 // WebSocket relay (workers/doom-relay). JOIN never transfers the WAD — the
 // level is rebuilt locally, byte-identical, from {seed, rooms, enemies}.
+//
+// "Byte-identical" is load-bearing: Doom's netcode is lockstep, and the moment
+// two players' simulations disagree the engine aborts the game for everyone.
+// So buildArenaLevel() below must give the same bytes in every browser. See
+// LEVEL PIPELINE, and scripts/check-determinism.js, which runs it in three
+// different JavaScript engines and compares.
 // ---------------------------------------------------------------------------
 const E = window.JerkwadEngine;
-// Arena preset pool: everything except 'terrain', whose tightly-packed
-// concentric height rings are the worst per-room visplane pressure in the
-// library. Corridor-only layout (fuseChance 0) covers the rest — doors
-// close off cross-room sightlines so vanilla's 128-visplane budget holds.
 
 const $ = (id) => document.getElementById(id);
 const qs = new URLSearchParams(location.search);
 // Relay origin (https for API, wss for game traffic). Override: ?relay=host
-const RELAY_HOST = qs.get('relay') || 'doom.yuccabucca.com';
-const API = 'https://' + RELAY_HOST;
-const WSS = 'wss://' + RELAY_HOST;
+// A bare host means a deployed relay, always over TLS. A full origin
+// (?relay=http://localhost:8787) is for the local stack in scripts/dev-stack.js,
+// where the relay runs under workerd on plain http.
+const RELAY_PARAM = qs.get('relay') || 'doom.yuccabucca.com';
+const API = (/^https?:\/\//.test(RELAY_PARAM) ? RELAY_PARAM : 'https://' + RELAY_PARAM).replace(/\/+$/, '');
+const WSS = API.replace(/^http/, 'ws');
+const RELAY_HOST = API.replace(/^https?:\/\//, '');
+
+$('rooms').oninput = () => $('roomsv').textContent = $('rooms').value;
+$('enemies').oninput = () => $('enemiesv').textContent = $('enemies').value;
+
+const quantumSeed = () => {
+  const u = new Uint32Array(1);
+  crypto.getRandomValues(u);
+  return (u[0] & 0x7fffffff) || 1;
+};
+
+// ==== LEVEL PIPELINE — BEGIN ================================================
+// Everything between these markers decides the bytes of the level, and it is
+// the ONLY definition of "the level for this seed": the host (GENERATE), every
+// joiner (JOIN) and the validators all call buildArenaLevel(). The validators
+// lift this block out of the page verbatim (scripts/lib/arena-level.js), so
+// keep it self-contained: it may use E (the engine bundle) and nothing else
+// from the page — no DOM, no Date, no Math.random, and no Math.sin / cos /
+// atan2 / hypot (use E.DMath: the native ones differ between browsers).
+// ============================================================================
 
 // Arena preset pool. Excludes:
 //  - 'terrain': tightly-packed concentric rings, worst visplane pressure.
@@ -129,10 +158,10 @@ const WSS = 'wss://' + RELAY_HOST;
 //    hexagon anchored east-west can take no corridor at all; when it also
 //    can't host a teleport pad it strands itself and everything past it.
 //    (Measured: the sole remaining unreachable-room case at 12 rooms.)
+// Corridor-only layout (fuseChance 0) covers the rest — doors close off
+// cross-room sightlines so vanilla's 128-visplane budget holds.
 const ARENA_PRESETS = E.SHAPESHIFTER_PRESETS.filter(
   p => p.feature !== 'terrain' && p.type !== 'hexagon');
-$('rooms').oninput = () => $('roomsv').textContent = $('rooms').value;
-$('enemies').oninput = () => $('enemiesv').textContent = $('enemies').value;
 
 const mulberry32 = (a) => () => {
   a |= 0; a = (a + 0x6D2B79F5) | 0;
@@ -140,12 +169,6 @@ const mulberry32 = (a) => () => {
   t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 };
-const quantumSeed = () => {
-  const u = new Uint32Array(1);
-  crypto.getRandomValues(u);
-  return (u[0] & 0x7fffffff) || 1;
-};
-
 
 // ---- spawn safety ---------------------------------------------------------
 // Doom needs a spawn to sit in an OPEN sector (floor < ceil) with >= 56 units
@@ -155,6 +178,10 @@ const quantumSeed = () => {
 // (types 1-4, 11) to the nearest verified-safe spot in its room.
 const PLAYER_HEIGHT = 56, PLAYER_RADIUS = 16;
 function relocateUnsafeSpawns(map, things, rooms) {
+  // Never Math.cos/sin here: they differ per browser engine, and this feeds
+  // the WAD every player must build identically. (E.DMath is absent only when
+  // a validator points at an older engine bundle as a negative control.)
+  const DM = E.DMath || Math;
   const secById = new Map(map.sectors.map(s => [s.id, s]));
   const sdById = new Map(map.sidedefs.map(s => [s.id, s]));
   const vById = new Map(map.vertices.map(v => [v.id, v]));
@@ -206,7 +233,7 @@ function relocateUnsafeSpawns(map, things, rooms) {
       const rad = ring * 48;
       for (let k = 0; k < 12; k++) {
         const a = (k / 12) * Math.PI * 2;
-        cands.push([sn(t.x + Math.cos(a) * rad), sn(t.y + Math.sin(a) * rad)]);
+        cands.push([sn(t.x + DM.cos(a) * rad), sn(t.y + DM.sin(a) * rad)]);
       }
     }
     for (const r of rooms) {
@@ -214,7 +241,7 @@ function relocateUnsafeSpawns(map, things, rooms) {
       const span = (r.type === 'square' ? Math.min(r.w, r.h) : 2 * r.r) / 2;
       for (const f of [0.4, 0.6]) for (let k = 0; k < 8; k++) {
         const a = k * Math.PI / 4;
-        cands.push([sn(r.cx + Math.cos(a) * span * f), sn(r.cy + Math.sin(a) * span * f)]);
+        cands.push([sn(r.cx + DM.cos(a) * span * f), sn(r.cy + DM.sin(a) * span * f)]);
       }
     }
     for (const [cx, cy] of cands) {
@@ -230,6 +257,7 @@ function relocateUnsafeSpawns(map, things, rooms) {
 // starts at mutually-farthest rooms, deathmatch starts, weapons in the
 // biggest rooms with ammo beside them, and health/armor spread out.
 function arenaThings(lvl, rng, playerCount) {
+  const DM = E.DMath || Math;   // engine-independent math — see relocateUnsafeSpawns
   const sizeOf = r => r.type === 'square' ? Math.max(r.w | 0, r.h | 0) : 2 * (r.r | 0);
   const rooms = lvl.rooms;
   const things = [...lvl.things];
@@ -240,7 +268,7 @@ function arenaThings(lvl, rng, playerCount) {
   for (let p = 2; p <= 4; p++) {
     let best = null, bestD = -1;
     for (const r of rooms) {
-      const d = Math.min(...chosen.map(c => Math.hypot(r.cx - c.cx, r.cy - c.cy)));
+      const d = Math.min(...chosen.map(c => DM.hypot(r.cx - c.cx, r.cy - c.cy)));
       if (d > bestD) { bestD = d; best = r; }
     }
     chosen.push({ cx: best.cx, cy: best.cy });
@@ -274,13 +302,8 @@ function arenaThings(lvl, rng, playerCount) {
   return things;
 }
 
-let current = null;   // { seed, roomCount, enemyCount, map, wadBuf }
-
-function generate(seed) {
-  const roomCount = +$('rooms').value;
-  const enemyCount = +$('enemies').value;
-  seed = seed || quantumSeed();
-  const t0 = performance.now();
+// The whole recipe, seed in, WAD out.
+function buildArenaLevel(seed, roomCount, enemyCount) {
   const rng = mulberry32(seed);
   const difficulty = enemyCount > 60 ? 'hard' : enemyCount > 25 ? 'medium' : 'easy';
   const lvl = E.etherGenerateLevel({
@@ -293,7 +316,7 @@ function generate(seed) {
     // comes from the preset mix instead.
     fuseChance: 0,
   });
-  const things = arenaThings(lvl, rng, +$('players').value);
+  const things = arenaThings(lvl, rng);
   // Two-pass placement: build once to learn the real geometry, relocate any
   // spawn that landed inside a pillar/slab, then rebuild. Blind placement put
   // ~14% of starts inside solid geometry (player spawns stuck — unplayable).
@@ -302,7 +325,18 @@ function generate(seed) {
   if (fixedThings !== things) {
     map = E.generateShapeShifterMap(lvl.rooms, lvl.connections, fixedThings, { seed });
   }
-  const wadBuf = E.buildWad({ MAP01: map });
+  return { map, wadBuf: E.buildWad({ MAP01: map }) };
+}
+// ==== LEVEL PIPELINE — END ==================================================
+
+let current = null;   // { seed, roomCount, enemyCount, map, wadBuf }
+
+function generate(seed) {
+  const roomCount = +$('rooms').value;
+  const enemyCount = +$('enemies').value;
+  seed = seed || quantumSeed();
+  const t0 = performance.now();
+  const { map, wadBuf } = buildArenaLevel(seed, roomCount, enemyCount);
   const ms = Math.round(performance.now() - t0);
   current = { seed, roomCount, enemyCount, map, wadBuf };
   $('genstat').textContent = 'seed ' + seed + ' · ' + map.sectors.length + ' sectors · '
@@ -376,15 +410,33 @@ function saveWad(buf) {
   });
 }
 
-let relayUp = false;
+// The oldest relay build the player page's netcode is whole against (keep in
+// step with RELAY_MIN_BUILD in play/index.html). An older relay still carries
+// a game, but cannot re-route a player whose connection dropped and came
+// back — so say so here, before anyone starts one.
+const RELAY_MIN_BUILD = 4;
+let relayUp = false, relayBuild = '';
 async function checkRelay() {
+  // /api/health is answered by the Worker alone. (This used to ask for the
+  // whole lobby list — a Durable Object call per listed room — twice per
+  // refresh, just to learn "is it up".)
   try {
-    const r = await fetch(API + '/api/lobby/list', { signal: AbortSignal.timeout(6000) });
+    const r = await fetch(API + '/api/health', { signal: AbortSignal.timeout(6000), cache: 'no-store' });
     relayUp = r.ok;
-  } catch (e) { relayUp = false; }
-  $('relaystat').innerHTML = relayUp
-    ? '<span class="dot ok"></span>relay online (' + RELAY_HOST + ')'
-    : '<span class="dot err"></span>relay offline — solo play only';
+    relayBuild = relayUp ? String((await r.json()).build || '') : '';
+  } catch (e) { relayUp = false; relayBuild = ''; }
+  const outdated = relayUp && (+(relayBuild.match(/(\d+)/) || [0, 0])[1]) < RELAY_MIN_BUILD;
+  // Text nodes only. RELAY_HOST comes from the ?relay= query parameter, and
+  // this line used to be assembled into innerHTML — so a crafted link pointing
+  // at a relay of the attacker's choosing ran script on this origin.
+  const stat = $('relaystat');
+  stat.textContent = '';
+  const dot = document.createElement('span');
+  dot.className = 'dot ' + (!relayUp ? 'err' : outdated ? 'warn' : 'ok');
+  stat.appendChild(dot);
+  stat.appendChild(document.createTextNode(!relayUp ? 'relay offline — solo play only'
+    : 'relay online (' + RELAY_HOST + ')' + (outdated
+      ? ' — OUTDATED ' + relayBuild + ': a dropped connection cannot recover on it. Redeploy the worker.' : '')));
 }
 
 $('generate').onclick = () => {
@@ -495,21 +547,13 @@ function joinLevel(lv, btn) {
   const win = window.open('', '_blank');
   (async () => {
     try {
-      // Rebuild the host's level locally — deterministic from the seed.
-      const rng = mulberry32(lv.seed);
-      const difficulty = lv.enemies > 60 ? 'hard' : lv.enemies > 25 ? 'medium' : 'easy';
-      const gen = E.etherGenerateLevel({
-        rng, presets: ARENA_PRESETS,
-        roomCount: lv.rooms, enemyCount: lv.enemies, difficulty,
-        fuseChance: 0,   // must match the host's value — determinism
-      });
-      const things = arenaThings(gen, rng, lv.maxPlayers);
-      let map = E.generateShapeShifterMap(gen.rooms, gen.connections, things, { seed: lv.seed });
-      const fixedThings = relocateUnsafeSpawns(map, things, gen.rooms);
-      if (fixedThings !== things) {
-        map = E.generateShapeShifterMap(gen.rooms, gen.connections, fixedThings, { seed: lv.seed });
-      }
-      await saveWad(E.buildWad({ MAP01: map }));
+      // Rebuild the host's level locally — the same function the host ran,
+      // so the same seed gives the same bytes.
+      // The lobby entry is whatever a relay sent us; keep it inside what the
+      // sliders can ask for before handing it to the generator.
+      const built = buildArenaLevel((lv.seed | 0) || 1,
+        Math.max(3, Math.min(60, lv.rooms | 0)), Math.max(0, Math.min(100, lv.enemies | 0)));
+      await saveWad(built.wadBuf);
       const url = '../play/?wait=1&join=1&ws=' + encodeURIComponent(WSS + '/api/ws/' + lv.room);
       if (win) win.location = url;
       btn.textContent = 'JOINED';

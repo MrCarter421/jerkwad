@@ -1,6 +1,134 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo, useReducer } from 'react';
 
 // ============================================================================
+// DETERMINISTIC MATH
+//
+// The arena's multiplayer depends on every player's browser building the SAME
+// level, byte for byte, from the same seed: the level is never transferred,
+// and Doom's lockstep netcode aborts the whole game ("consistency failure")
+// the moment two peers' simulations disagree.
+//
+// Math.sin / cos / atan2 / hypot cannot be used for that. ECMAScript only
+// requires them to be "implementation-approximated", and the engines really do
+// disagree in the last digit: measured on one machine, Chrome's V8, Safari's
+// JavaScriptCore (which is also EVERY browser on iOS) and Firefox's
+// SpiderMonkey returned different bits for all four. One flipped rounding is
+// enough to move a wall, reorder a sort, or change which branch a placement
+// loop takes.
+//
+// + - * / and Math.sqrt, on the other hand, are required to be correctly
+// rounded IEEE-754 operations, identical everywhere. So DMath builds the four
+// functions out of nothing else (argument reduction and polynomial kernels
+// from fdlibm). It agrees with the native functions to within 1 ulp and is
+// bit-identical across engines — scripts/check-determinism.js proves both.
+//
+// RULE: nothing that can influence a generated level may call Math.sin,
+// Math.cos, Math.tan, Math.atan*, Math.hypot, Math.pow / `**`, Math.exp or
+// Math.log. Use DMath, or plain arithmetic.
+// ============================================================================
+const DMath = (() => {
+  const INVPIO2 = 6.36619772367581382433e-01;
+  const PIO2_1 = 1.57079632673412561417e+00, PIO2_2 = 6.07710050630396597660e-11,
+    PIO2_2T = 2.02226624879595063154e-21;
+  const S1 = -1.66666666666666324348e-01, S2 = 8.33333333332248946124e-03,
+    S3 = -1.98412698298579493134e-04, S4 = 2.75573137070700676789e-06,
+    S5 = -2.50507602534068634195e-08, S6 = 1.58969099521155010221e-10;
+  const C1 = 4.16666666666666019037e-02, C2 = -1.38888888888741095749e-03,
+    C3 = 2.48015872894767294178e-05, C4 = -2.75573143513906633035e-07,
+    C5 = 2.08757232129817482790e-09, C6 = -1.13596475577881948265e-11;
+  // Kernels on [-pi/4, pi/4]; (x + y) is the reduced argument, y its tail.
+  const ksin = (x, y) => {
+    const z = x * x, v = z * x;
+    const r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)));
+    return x - ((z * (0.5 * y - v * r) - y) - v * S1);
+  };
+  const kcos = (x, y) => {
+    const z = x * x, w = z * z;
+    const r = z * (C1 + z * (C2 + z * C3)) + (w * w) * (C4 + z * (C5 + z * C6));
+    const hz = 0.5 * z, a = 1 - hz;
+    return a + (((1 - a) - hz) + (z * r - x * y));
+  };
+  // |x| = n * pi/2 + (y0 + y1). pi/2 is split in three so the subtraction
+  // stays exact for the argument sizes a level generator ever produces.
+  let y0 = 0, y1 = 0;
+  const reduce = (ax) => {
+    const fn = Math.floor(ax * INVPIO2 + 0.5);
+    const t = ax - fn * PIO2_1;
+    let w = fn * PIO2_2;
+    const r = t - w;
+    w = fn * PIO2_2T - ((t - r) - w);
+    y0 = r - w;
+    y1 = (r - y0) - w;
+    return fn % 4;
+  };
+  const sin = (x) => {
+    x = +x;
+    if (x !== x || x === Infinity || x === -Infinity) return NaN;
+    if (x === 0) return x;
+    const neg = x < 0, ax = neg ? -x : x;
+    let v;
+    if (ax <= 0.7853981633974483) v = ksin(ax, 0);
+    else {
+      const q = reduce(ax);
+      v = q === 0 ? ksin(y0, y1) : q === 1 ? kcos(y0, y1) : q === 2 ? -ksin(y0, y1) : -kcos(y0, y1);
+    }
+    return neg ? -v : v;
+  };
+  const cos = (x) => {
+    x = +x;
+    if (x !== x || x === Infinity || x === -Infinity) return NaN;
+    const ax = x < 0 ? -x : x;
+    if (ax <= 0.7853981633974483) return kcos(ax, 0);
+    const q = reduce(ax);
+    return q === 0 ? kcos(y0, y1) : q === 1 ? -ksin(y0, y1) : q === 2 ? -kcos(y0, y1) : ksin(y0, y1);
+  };
+  const ATHI = [4.63647609000806093515e-01, 7.85398163397448278999e-01,
+    9.82793723247329054082e-01, 1.57079632679489655800e+00];
+  const ATLO = [2.26987774529616870924e-17, 3.06161699786838301793e-17,
+    1.39033110312309984516e-17, 6.12323399573676603587e-17];
+  const AT = [3.33333333333329318027e-01, -1.99999999998764832476e-01,
+    1.42857142725034663711e-01, -1.11111104054623557880e-01,
+    9.09088713343650656196e-02, -7.69187620504482999495e-02,
+    6.66107313738753120669e-02, -5.83357013379057348645e-02,
+    4.97687799461593236017e-02, -3.65315727442169155270e-02,
+    1.62858201153657823623e-02];
+  const atanPos = (x) => {            // x >= 0
+    let id;
+    if (x < 0.4375) { if (x < 1.862645149230957e-9) return x; id = -1; }
+    else if (x < 1.1875) {
+      if (x < 0.6875) { id = 0; x = (2 * x - 1) / (2 + x); }
+      else { id = 1; x = (x - 1) / (x + 1); }
+    } else if (x < 2.4375) { id = 2; x = (x - 1.5) / (1 + 1.5 * x); }
+    else if (x < 7.378697629483821e19) { id = 3; x = -1 / x; }
+    else return ATHI[3] + ATLO[3];
+    const z = x * x, w = z * z;
+    const s1 = z * (AT[0] + w * (AT[2] + w * (AT[4] + w * (AT[6] + w * (AT[8] + w * AT[10])))));
+    const s2 = w * (AT[1] + w * (AT[3] + w * (AT[5] + w * (AT[7] + w * AT[9]))));
+    if (id < 0) return x - x * (s1 + s2);
+    return ATHI[id] - ((x * (s1 + s2) - ATLO[id]) - x);
+  };
+  const PI = 3.1415926535897931160e+00, PI_LO = 1.2246467991473531772e-16;
+  const atan2 = (y, x) => {
+    y = +y; x = +x;
+    if (x !== x || y !== y) return NaN;
+    const yneg = y < 0 || (y === 0 && 1 / y < 0), xneg = x < 0 || (x === 0 && 1 / x < 0);
+    if (y === 0) return xneg ? (yneg ? -PI : PI) : y;
+    if (x === 0) return yneg ? -PI / 2 : PI / 2;
+    const ay = yneg ? -y : y, ax = xneg ? -x : x;
+    let z;
+    if (ax === Infinity) z = ay === Infinity ? PI / 4 : 0;
+    else if (ay === Infinity) z = PI / 2;
+    else z = atanPos(ay / ax);
+    if (xneg) z = PI - (z - PI_LO);
+    return yneg ? -z : z;
+  };
+  // sqrt and * are exactly rounded, so this needs no cleverness. (Map
+  // coordinates are nowhere near the overflow range Math.hypot guards.)
+  const hypot = (a, b) => Math.sqrt(a * a + b * b);
+  return { sin, cos, atan2, hypot };
+})();
+
+// ============================================================================
 // CONSTANTS
 // ============================================================================
 const DOOM_THING_TYPES = [
@@ -185,7 +313,7 @@ function buildFlatCanvas(name) {
     ctx.lineWidth = 1;
     for (let y = 4; y < 64; y += 10) {
       ctx.beginPath(); ctx.moveTo(0, y);
-      for (let x = 0; x <= 64; x += 4) ctx.lineTo(x, y + Math.sin((x + rnd * 0.001) * 0.3) * 2);
+      for (let x = 0; x <= 64; x += 4) ctx.lineTo(x, y + DMath.sin((x + rnd * 0.001) * 0.3) * 2);
       ctx.stroke();
     }
   } else if (/^STEP/.test(name)) {
@@ -370,7 +498,7 @@ function buildBsp(m, vIdx, sdIdx) {
   });
   const distTo = (part, x, y) => {
     const cross = (x - part.x) * part.dy - (y - part.y) * part.dx;
-    return cross / Math.hypot(part.dx, part.dy);
+    return cross / DMath.hypot(part.dx, part.dy);
   };
   const addVert = (x, y) => {
     const k = x + ',' + y;
@@ -402,7 +530,7 @@ function buildBsp(m, vIdx, sdIdx) {
     }
     const segA = { v1: s.v1, v2: vi, line: s.line, dir: s.dir, offset: s.offset };
     const segB = { v1: vi, v2: s.v2, line: s.line, dir: s.dir,
-      offset: s.offset + Math.hypot(ix - x1, iy - y1) };
+      offset: s.offset + DMath.hypot(ix - x1, iy - y1) };
     return d1 > 0 ? { front: segA, back: segB } : { front: segB, back: segA };
   }
   function scoreSplitter(segs, cand) {
@@ -442,7 +570,7 @@ function buildBsp(m, vIdx, sdIdx) {
     return best;
   }
   const segAngleBAM = (s) => {
-    const a = Math.atan2(pts[s.v2].y - pts[s.v1].y, pts[s.v2].x - pts[s.v1].x);
+    const a = DMath.atan2(pts[s.v2].y - pts[s.v1].y, pts[s.v2].x - pts[s.v1].x);
     return Math.round(a * 32768 / Math.PI) & 0xffff;
   };
   const bboxOf = (segs) => {
@@ -512,7 +640,7 @@ function buildBsp(m, vIdx, sdIdx) {
     sgv.setUint16(i * 12 + 4, segAngleBAM(s), true);
     sgv.setInt16(i * 12 + 6, s.line, true);
     sgv.setInt16(i * 12 + 8, s.dir, true);
-    const baseOff = s.offset || Math.hypot(pts[s.v1].x - pts[sideStart].x, pts[s.v1].y - pts[sideStart].y);
+    const baseOff = s.offset || DMath.hypot(pts[s.v1].x - pts[sideStart].x, pts[s.v1].y - pts[sideStart].y);
     sgv.setInt16(i * 12 + 10, Math.round(baseOff), true);
   });
   const ssBuf = new ArrayBuffer(ssectors.length * 4);
@@ -1047,7 +1175,7 @@ function _generateDungeonOnce(opts) {
     const out = [];
     for (let i = 0; i < 8; i++) {
       const a = (22.5 + 45 * i) * Math.PI / 180;
-      out.push({ x: Math.round(cx + Math.cos(a) * r), y: Math.round(cy + Math.sin(a) * r) });
+      out.push({ x: Math.round(cx + DMath.cos(a) * r), y: Math.round(cy + DMath.sin(a) * r) });
     }
     return out;
   }
@@ -1059,7 +1187,7 @@ function _generateDungeonOnce(opts) {
     const out = [];
     for (let i = 0; i < 6; i++) {
       const a = (i * 60) * Math.PI / 180;
-      out.push({ x: Math.round(cx + Math.cos(a) * r), y: Math.round(cy + Math.sin(a) * r) });
+      out.push({ x: Math.round(cx + DMath.cos(a) * r), y: Math.round(cy + DMath.sin(a) * r) });
     }
     return out;
   }
@@ -1295,8 +1423,8 @@ function _generateDungeonOnce(opts) {
         const order = rooms.map((_, k) => k)
           .filter(k => k !== stranded)
           .sort((x, y) =>
-            Math.hypot(rooms[x].cx - rooms[stranded].cx, rooms[x].cy - rooms[stranded].cy) -
-            Math.hypot(rooms[y].cx - rooms[stranded].cx, rooms[y].cy - rooms[stranded].cy));
+            DMath.hypot(rooms[x].cx - rooms[stranded].cx, rooms[x].cy - rooms[stranded].cy) -
+            DMath.hypot(rooms[y].cx - rooms[stranded].cx, rooms[y].cy - rooms[stranded].cy));
         for (const k of order) {
           const co2 = tryCorridor(stranded, k);
           if (!co2) continue;
@@ -1417,7 +1545,19 @@ function _generateDungeonOnce(opts) {
     zonePalettes.push(PALETTES[idx]);
   }
   const centroids = [];
-  const shuffledRooms = rooms.slice().sort(() => rand() - 0.5);
+  // A real shuffle. This used to be `rooms.slice().sort(() => rand() - 0.5)`,
+  // which looks seeded but is not reproducible: how many times the comparator
+  // runs, and on which pairs, is up to each engine's sort algorithm, so V8,
+  // JavaScriptCore and SpiderMonkey each drew a different number of values
+  // from rand() here. Every random choice after this line then diverged —
+  // from the same seed, Chrome and Safari built different levels, and Doom's
+  // lockstep netcode kicked both players as soon as the simulations drifted.
+  // Fisher-Yates draws exactly n-1 values in a fixed order on every engine.
+  const shuffledRooms = rooms.slice();
+  for (let i = shuffledRooms.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    const t = shuffledRooms[i]; shuffledRooms[i] = shuffledRooms[j]; shuffledRooms[j] = t;
+  }
   for (let i = 0; i < NUM_ZONES; i++) {
     centroids.push({ x: shuffledRooms[i].cx, y: shuffledRooms[i].cy });
   }
@@ -2358,7 +2498,7 @@ function _generateDungeonOnce(opts) {
       const cells = [];
       for (let cy = sn(r.cy - inset); cy <= r.cy + inset; cy += 64)
         for (let cx = sn(r.cx - inset); cx <= r.cx + inset; cx += 64)
-          if (clearCell(cx, cy)) cells.push({ cx, cy, d: Math.hypot(cx - r.cx, cy - r.cy) });
+          if (clearCell(cx, cy)) cells.push({ cx, cy, d: DMath.hypot(cx - r.cx, cy - r.cy) });
       if (cells.length) {
         cells.sort((a, b) => a.d - b.d);
         const basin = cells[0];
@@ -2369,7 +2509,7 @@ function _generateDungeonOnce(opts) {
         let placed = 0;
         for (let i = cells.length - 1; i >= 0 && placed < 2; i--) {
           const c = cells[i];
-          if (!r.terrains.every(t => Math.hypot(c.cx - t.cx, c.cy - t.cy) >= 2 * hp + 96)) continue;
+          if (!r.terrains.every(t => DMath.hypot(c.cx - t.cx, c.cy - t.cy) >= 2 * hp + 96)) continue;
           r.terrains.push({ cx: c.cx, cy: c.cy, hw: hp, hh: hp, kind: 'terrace',
             secId: allocSec({ floorH: r.floorH + 16, ceilH: r.ceilH,
               floorTex: r.palette.accent, ceilTex: r.palette.ceil,
@@ -2428,8 +2568,8 @@ function _generateDungeonOnce(opts) {
       for (let i = 0; i < n; i++) {
         const ang = rand() * Math.PI * 2;
         const dist = span * (0.25 + rand() * 0.75);
-        const cx = Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32;
-        const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
+        const cx = Math.round((r.cx + DMath.cos(ang) * dist) / 32) * 32;
+        const cy = Math.round((r.cy + DMath.sin(ang) * dist) / 32) * 32;
         const radius = 48 + Math.floor(rand() * 3) * 16;
         const roll = rand();
         const top = roll < 0.35 ? r.floorH + 64 : roll < 0.7 ? r.floorH + 96 : r.ceilH;
@@ -2451,8 +2591,8 @@ function _generateDungeonOnce(opts) {
         // they ring the terraces rather than collide with them.
         const lo = (r.terrains && r.terrains.length) ? 0.7 : 0.4;
         const dist = span * (lo + rand() * 0.35);
-        const cx = Math.round((r.cx + Math.cos(ang) * dist) / 32) * 32;
-        const cy = Math.round((r.cy + Math.sin(ang) * dist) / 32) * 32;
+        const cx = Math.round((r.cx + DMath.cos(ang) * dist) / 32) * 32;
+        const cy = Math.round((r.cy + DMath.sin(ang) * dist) / 32) * 32;
         const radius = 40 + Math.floor(rand() * 3) * 16;
         if (!clearOfTerrain(cx, cy, radius)) continue;
         // Short kiosks/planters (48–80 tall) with open sky above — NOT
@@ -2634,12 +2774,12 @@ function _generateDungeonOnce(opts) {
         const top = isSilo ? r.floorH + 160 + Math.floor(rand() * 4) * 16
                            : r.floorH + 56 + Math.floor(rand() * 3) * 16;
         const clr = radius + 56;
-        if (Math.hypot(cx - r.cx, cy - r.cy) < clr + 112) continue;       // clear of spawn/plaza
+        if (DMath.hypot(cx - r.cx, cy - r.cy) < clr + 112) continue;       // clear of spawn/plaza
         if (!r.buildings.every(b => Math.abs(cx - b.cx) >= bHx(b) + clr ||
                                     Math.abs(cy - b.cy) >= bHy(b) + clr)) continue;
         if (!(r.terrains || []).every(t => Math.abs(cx - t.cx) >= t.hw + clr ||
                                            Math.abs(cy - t.cy) >= t.hh + clr)) continue;
-        if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 48)) continue;
+        if (!r.pillars.every(p => DMath.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 48)) continue;
         r.pillars.push({ cx, cy, radius, top, tex: pick(metalTex) });
       }
       // Streetlamps — thin lit poles scattered between buildings. Doom can't
@@ -2653,12 +2793,12 @@ function _generateDungeonOnce(opts) {
         const cx = sn(r.cx + (rand() * 2 - 1) * lim);
         const cy = sn(r.cy + (rand() * 2 - 1) * lim);
         const radius = 16, clr = radius + 24;
-        if (Math.hypot(cx - r.cx, cy - r.cy) < clr + 80) continue;
+        if (DMath.hypot(cx - r.cx, cy - r.cy) < clr + 80) continue;
         if (!r.buildings.every(b => Math.abs(cx - b.cx) >= bHx(b) + clr ||
                                     Math.abs(cy - b.cy) >= bHy(b) + clr)) continue;
         if (!(r.terrains || []).every(t => Math.abs(cx - t.cx) >= t.hw + clr ||
                                            Math.abs(cy - t.cy) >= t.hh + clr)) continue;
-        if (!r.pillars.every(p => Math.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 32)) continue;
+        if (!r.pillars.every(p => DMath.hypot(cx - p.cx, cy - p.cy) >= p.radius + radius + 32)) continue;
         const top = r.floorH + 96 + Math.floor(rand() * 3) * 8;
         r.pillars.push({ cx, cy, radius, top, tex: pick(lampTex), lamp: true });
         lamps++;
@@ -2764,11 +2904,11 @@ function _generateDungeonOnce(opts) {
     // clear of the centre feature ring (trimLayers===0 → ring radius = INNER_INSET)
     if (r.feature !== 'none' && r.featureId) {
       const ringR = TRIM_W * (r.trimLayers || 0) + INNER_INSET;
-      if (Math.hypot(px - r.cx, py - r.cy) < ringR + half + m) return false;
+      if (DMath.hypot(px - r.cx, py - r.cy) < ringR + half + m) return false;
     }
     // clear of pillars / planters
     for (const p of (r.pillars || [])) {
-      if (Math.hypot(px - p.cx, py - p.cy) < p.radius + half + m) return false;
+      if (DMath.hypot(px - p.cx, py - p.cy) < p.radius + half + m) return false;
     }
     // clear of compound buildings (including their plinth base ring)
     for (const b of (r.buildings || [])) {
@@ -2809,7 +2949,7 @@ function _generateDungeonOnce(opts) {
     for (let py = Math.ceil(bb.minY / 32) * 32; py <= bb.maxY; py += 32) {
       for (let px = Math.ceil(bb.minX / 32) * 32; px <= bb.maxX; px += 32) {
         if (!padClear(r, px, py, half)) continue;
-        const d = Math.hypot(px - towardX, py - towardY);
+        const d = DMath.hypot(px - towardX, py - towardY);
         if (d < bestD) { bestD = d; best = { cx: px, cy: py, half }; }
       }
     }
@@ -2858,7 +2998,7 @@ function _generateDungeonOnce(opts) {
       let bestI = -1, bestJ = -1, bestD = Infinity, bestG = 1;
       for (let g = 1; g < groups.length; g++) {
         for (const i of base) for (const j of groups[g]) {
-          const d = Math.hypot(rooms[i].cx - rooms[j].cx, rooms[i].cy - rooms[j].cy);
+          const d = DMath.hypot(rooms[i].cx - rooms[j].cx, rooms[i].cy - rooms[j].cy);
           if (d < bestD) { bestD = d; bestI = i; bestJ = j; bestG = g; }
         }
       }
@@ -2869,7 +3009,7 @@ function _generateDungeonOnce(opts) {
       // later fail to materialize is what left levels split in two.
       const cross = [];
       for (const i of base) for (const j of groups[bestG]) {
-        cross.push({ i, j, d: Math.hypot(rooms[i].cx - rooms[j].cx, rooms[i].cy - rooms[j].cy) });
+        cross.push({ i, j, d: DMath.hypot(rooms[i].cx - rooms[j].cx, rooms[i].cy - rooms[j].cy) });
       }
       cross.sort((p, q) => p.d - q.d);
       let linked = false;
@@ -3833,7 +3973,7 @@ function _generateDungeonOnce(opts) {
             if (cellSec[gy * W + gx] !== room.outerId) continue;
             const cx = minX + (gx + 0.5) * CELL;
             const cy = minY + (gy + 0.5) * CELL;
-            if ((cx - p.cx) ** 2 + (cy - p.cy) ** 2 <= r2) {
+            if ((cx - p.cx) * (cx - p.cx) + (cy - p.cy) * (cy - p.cy) <= r2) {
               cellSec[gy * W + gx] = psec;
               cellTex[gy * W + gx] = room.palette.wall;
             }
@@ -3983,7 +4123,7 @@ function _generateDungeonOnce(opts) {
       const t = ((v.x - a.x) * dx + (v.y - a.y) * dy) / lenSq;
       if (t <= 0.001 || t >= 0.999) return null;
       const projX = a.x + t * dx, projY = a.y + t * dy;
-      if ((v.x - projX) ** 2 + (v.y - projY) ** 2 > 1) return null;
+      if ((v.x - projX) * (v.x - projX) + (v.y - projY) * (v.y - projY) > 1) return null;
       // Update lineByVerts: remove the old key for `line` (its v2 is about
       // to change), add the new keys for both halves.
       lineByVerts.delete(vertKey(line.v1, line.v2));
@@ -4148,7 +4288,7 @@ function _generateDungeonOnce(opts) {
       if (!v1 || !v2) continue;
       const mx = (v1.x + v2.x) / 2, my = (v1.y + v2.y) / 2;
       const dx = v2.x - v1.x, dy = v2.y - v1.y;
-      const len = Math.hypot(dx, dy); if (len < 0.001) continue;
+      const len = DMath.hypot(dx, dy); if (len < 0.001) continue;
       // Right perpendicular from midpoint, 1 unit
       const rx = mx + dy / len, ry = my - dx / len;
       const lx = mx - dy / len, ly = my + dx / len;
@@ -4419,8 +4559,8 @@ function _generateDungeonOnce(opts) {
       const ang = rand() * Math.PI * 2;
       things.push({
         id: 't' + things.length,
-        x: Math.round(r.cx + Math.cos(ang) * off),
-        y: Math.round(r.cy + Math.sin(ang) * off),
+        x: Math.round(r.cx + DMath.cos(ang) * off),
+        y: Math.round(r.cy + DMath.sin(ang) * off),
         angle: Math.floor(rand() * 8) * 45,
         type: pick(pool), flags: 7,
       });
@@ -4448,8 +4588,8 @@ function _generateDungeonOnce(opts) {
         const radius = innerR + 32 + rand() * areaW;
         things.push({
           id: 't' + things.length,
-          x: Math.round(r.cx + Math.cos(ang) * radius),
-          y: Math.round(r.cy + Math.sin(ang) * radius),
+          x: Math.round(r.cx + DMath.cos(ang) * radius),
+          y: Math.round(r.cy + DMath.sin(ang) * radius),
           angle: 0,
           type: pick(dec.types), flags: 7,
         });
@@ -4539,8 +4679,8 @@ function _generateDungeonOnce(opts) {
         for (let radius = 32; radius <= 192 && !best; radius += 32) {
           for (let a = 0; a < 16 && !best; a++) {
             const th = (a / 16) * Math.PI * 2;
-            const tx = Math.round((pcx + Math.cos(th) * radius) / 8) * 8;
-            const ty = Math.round((pcy + Math.sin(th) * radius) / 8) * 8;
+            const tx = Math.round((pcx + DMath.cos(th) * radius) / 8) * 8;
+            const ty = Math.round((pcy + DMath.sin(th) * radius) / 8) * 8;
             if (!pointInPolygon(tx, ty, poly)) continue;
             if (!rectClear(tx, ty)) continue;
             if (!reachable(tx, ty)) continue;   // same sector guaranteed
@@ -4682,7 +4822,7 @@ function pointInPolygon(px, py, pts) {
   }
   return inside;
 }
-function angleOf(dx, dy) { let a = Math.atan2(dy, dx); if (a < 0) a += 2 * Math.PI; return a; }
+function angleOf(dx, dy) { let a = DMath.atan2(dy, dx); if (a < 0) a += 2 * Math.PI; return a; }
 function cwDistance(fromAngle, toAngle) {
   let d = fromAngle - toAngle;
   while (d < 0) d += 2 * Math.PI;
@@ -5010,7 +5150,7 @@ function findPotentialSectors(map) {
   }
   const ang = (from, to) => {
     const fv = vmap.get(from), tv = vmap.get(to);
-    return Math.atan2(tv.y - fv.y, tv.x - fv.x);
+    return DMath.atan2(tv.y - fv.y, tv.x - fv.x);
   };
   const TAU = 2 * Math.PI;
   function nextEdge(e) {
@@ -5691,7 +5831,7 @@ function ngonVertices(cx, cy, r, n, rotation = 0) {
   const out = [];
   for (let i = 0; i < n; i++) {
     const a = rotation + (i / n) * Math.PI * 2;
-    out.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+    out.push({ x: cx + DMath.cos(a) * r, y: cy + DMath.sin(a) * r });
   }
   return out;
 }
@@ -5768,7 +5908,7 @@ function macroDoorOneSided(map, lineId, kind = 'normal') {
   const v2 = map.vertices.find(v => v.id === ld.v2);
   if (!v1 || !v2) return { error: 'Wall vertices missing' };
   const dx = v2.x - v1.x, dy = v2.y - v1.y;
-  const len = Math.hypot(dx, dy);
+  const len = DMath.hypot(dx, dy);
   const WIDTH = 64, THICK = 16, MARGIN = 16;
   if (len < WIDTH + MARGIN * 2) return { error: 'Wall too short for a 64-unit door' };
   if (Math.abs(dx) > 0.5 && Math.abs(dy) > 0.5) return { error: 'Door tool requires an axis-aligned wall' };
@@ -5945,7 +6085,7 @@ function shapeShifterRoomPolygon(r) {
     const pts = [];
     for (let i = 0; i < 8; i++) {
       const a = Math.PI / 8 + i * Math.PI / 4;
-      pts.push({ x: r.cx + r.r * Math.cos(a), y: r.cy + r.r * Math.sin(a) });
+      pts.push({ x: r.cx + r.r * DMath.cos(a), y: r.cy + r.r * DMath.sin(a) });
     }
     return pts;
   }
@@ -5953,7 +6093,7 @@ function shapeShifterRoomPolygon(r) {
   const pts = [];
   for (let i = 0; i < 6; i++) {
     const a = i * Math.PI / 3 + Math.PI / 2;
-    pts.push({ x: r.cx + r.r * Math.cos(a), y: r.cy + r.r * Math.sin(a) });
+    pts.push({ x: r.cx + r.r * DMath.cos(a), y: r.cy + r.r * DMath.sin(a) });
   }
   return pts;
 }
@@ -6234,7 +6374,7 @@ function RoomDesignerModal({ preset, onCancel, onSave, onDelete }) {
     const pts = [];
     for (let i = 0; i < n; i++) {
       const a = (Math.PI * 2 * i) / n - Math.PI / 2;
-      pts.push({ dx: sn32(Math.cos(a) * R), dy: sn32(Math.sin(a) * R),
+      pts.push({ dx: sn32(DMath.cos(a) * R), dy: sn32(DMath.sin(a) * R),
         radius: 24, top: 0, tex: 'SUPPORT2' });
     }
     updateCS({ pillars: [...cs.pillars, ...pts] });
@@ -6306,7 +6446,7 @@ function RoomDesignerModal({ preset, onCancel, onSave, onDelete }) {
               const pts = [];
               for (let i = 0; i < nS; i++) {
                 const a = (draft.type === 'octagon' ? Math.PI / 8 : 0) + i * 2 * Math.PI / nS;
-                pts.push((Math.cos(a) * rr).toFixed(1) + ',' + (Math.sin(a) * rr).toFixed(1));
+                pts.push((DMath.cos(a) * rr).toFixed(1) + ',' + (DMath.sin(a) * rr).toFixed(1));
               }
               outline = 'M ' + pts.join(' L ') + ' Z';
             }
@@ -6548,8 +6688,8 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
       if (!overlap) break;
       const ang = attempt * 0.5;
       const dist = 256 + attempt * 64;
-      target.cx = Math.round((view.x + Math.cos(ang) * dist) / 32) * 32;
-      target.cy = Math.round((view.y + Math.sin(ang) * dist) / 32) * 32;
+      target.cx = Math.round((view.x + DMath.cos(ang) * dist) / 32) * 32;
+      target.cy = Math.round((view.y + DMath.sin(ang) * dist) / 32) * 32;
     }
     const r = { ...target, id: nextId('ssr'), label: preset.label, feature: preset.feature,
       customSpec: preset.customSpec || null };
@@ -6808,7 +6948,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
       let t = ((w.x - a.cx) * dx + (w.y - a.cy) * dy) / len2;
       t = Math.max(0, Math.min(1, t));
       const px = a.cx + t * dx, py = a.cy + t * dy;
-      const d2 = (w.x - px) ** 2 + (w.y - py) ** 2;
+      const d2 = (w.x - px) * (w.x - px) + (w.y - py) * (w.y - py);
       if (d2 < TOL * TOL) return c;
     }
     return null;
@@ -6833,7 +6973,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
     if (pointersRef.current.size === 2) {
       const [a, b] = [...pointersRef.current.values()];
       gestureRef.current = { kind: 'pinch',
-        startDist: Math.hypot(a.sx - b.sx, a.sy - b.sy),
+        startDist: DMath.hypot(a.sx - b.sx, a.sy - b.sy),
         startZoom: view.zoom, startView: { x: view.x, y: view.y } };
       return;
     }
@@ -6903,7 +7043,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
     if (!g) return;
     if (g.kind === 'pinch' && pointersRef.current.size === 2) {
       const [a, b] = [...pointersRef.current.values()];
-      const d = Math.hypot(a.sx - b.sx, a.sy - b.sy);
+      const d = DMath.hypot(a.sx - b.sx, a.sy - b.sy);
       if (g.startDist > 4) {
         const zoom = Math.max(0.03, Math.min(2, g.startZoom * (d / g.startDist)));
         setView(v => ({ ...v, zoom }));
@@ -6928,7 +7068,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
           const halfH = Math.max(64, Math.round(Math.abs(w.y - r.cy) / 32) * 32);
           return { ...r, w: halfW * 2, h: halfH * 2 };
         }
-        const rad = Math.max(96, Math.round(Math.hypot(w.x - r.cx, w.y - r.cy) / 32) * 32);
+        const rad = Math.max(96, Math.round(DMath.hypot(w.x - r.cx, w.y - r.cy) / 32) * 32);
         return { ...r, r: rad };
       }));
     } else if (g.kind === 'thingDrag' && pointersRef.current.size === 1) {
@@ -7014,7 +7154,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
         const a = (t.angle || 0) * Math.PI / 180;
         ctx.beginPath();
         ctx.moveTo(p.x, p.y);
-        ctx.lineTo(p.x + Math.cos(a) * 12, p.y - Math.sin(a) * 12);
+        ctx.lineTo(p.x + DMath.cos(a) * 12, p.y - DMath.sin(a) * 12);
         ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
       }
       return;
@@ -7126,7 +7266,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
       const a = (t.angle || 0) * Math.PI / 180;
       ctx.beginPath();
       ctx.moveTo(p.x, p.y);
-      ctx.lineTo(p.x + Math.cos(a) * (radius + 6), p.y - Math.sin(a) * (radius + 6));
+      ctx.lineTo(p.x + DMath.cos(a) * (radius + 6), p.y - DMath.sin(a) * (radius + 6));
       ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
     }
   }, [rooms, connections, selectedId, pendingConnect, view, previewMap, thingsList, selectedThingId, mode, screenToWorld, worldToScreen, roomById]);
@@ -7160,7 +7300,7 @@ function ShapeShifter({ handoff, onClearHandoff, onOpenEther } = {}) {
           paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div className="text-xs font-bold tracking-widest flex items-center gap-1.5"
           style={{ color: COLORS.amber, letterSpacing: '0.18em' }}>
-          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.56</span>
+          SHAPESHIFTER <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.57</span>
         </div>
         <div className="flex gap-1.5">
           {onOpenEther && !previewMap && (
@@ -7470,8 +7610,8 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
         const angle = rng() * Math.PI * 2;
         const span = (sizeOf(anchor) + sizeOf(room)) / 2;
         const d = sn32(span * (0.78 + rng() * 0.14));
-        room.cx = sn32(anchor.cx + Math.cos(angle) * d);
-        room.cy = sn32(anchor.cy + Math.sin(angle) * d);
+        room.cx = sn32(anchor.cx + DMath.cos(angle) * d);
+        room.cy = sn32(anchor.cy + DMath.sin(angle) * d);
         connections.push({ id: 'ewf' + i + '_' + nextN, fromId: anchor.id, toId: id, kind: 'corridor' });
       } else {
         // Corridor mode: place on a CARDINAL axis from the anchor (corridors
@@ -7544,7 +7684,7 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
       const ang = idx * 2.399963 + rng() * 0.9;
       const rad = (0.15 + 0.65 * Math.sqrt((idx + rng()) / Math.max(3, idx + 1))) * sz * 0.5 * 0.8;
       things.push({ type: mPool[Math.floor(rng() * mPool.length)],
-        x: sn32(r.cx + Math.cos(ang) * rad), y: sn32(r.cy + Math.sin(ang) * rad),
+        x: sn32(r.cx + DMath.cos(ang) * rad), y: sn32(r.cy + DMath.sin(ang) * rad),
         angle: Math.floor(rng() * 8) * 45, flags: 7 });
     }
     // ~1 goodie per 6 monsters, spread over the rooms the same way.
@@ -7555,7 +7695,7 @@ function etherGenerateLevel({ rng, presets, roomCount, enemyCount, difficulty, e
       const ang = rng() * Math.PI * 2;
       const rad = rng() * sz * 0.3;
       things.push({ type: ETHER_GOODIES[Math.floor(rng() * ETHER_GOODIES.length)],
-        x: sn32(r.cx + Math.cos(ang) * rad), y: sn32(r.cy + Math.sin(ang) * rad),
+        x: sn32(r.cx + DMath.cos(ang) * rad), y: sn32(r.cy + DMath.sin(ang) * rad),
         angle: 0, flags: 7 });
     }
   }
@@ -7629,7 +7769,7 @@ function EtherWad({ onEditInShapeShifter, onBack, customPresets }) {
         padding: '6px 8px', borderBottom: '1px solid ' + COLORS.border, background: COLORS.bgPanel,
         paddingTop: 'calc(env(safe-area-inset-top) + 0.375rem)' }}>
         <div style={{ color: '#9966ff', fontWeight: 700, letterSpacing: '0.18em', fontSize: 13 }}>
-          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.56</span>
+          ETHERWAD <span style={{ fontSize: 9, color: COLORS.textDim }}>V0.57</span>
         </div>
         <button onClick={onBack}
           style={{ padding: '6px 12px', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em',
@@ -7702,7 +7842,7 @@ function EtherWad({ onEditInShapeShifter, onBack, customPresets }) {
                 const sides = r.type === 'octagon' ? 8 : 6;
                 for (let i = 0; i < sides; i++) {
                   const a = (r.type === 'octagon' ? Math.PI / 8 : 0) + i * 2 * Math.PI / sides;
-                  pts.push((r.cx + Math.cos(a) * r.r).toFixed(0) + ',' + (-(r.cy + Math.sin(a) * r.r)).toFixed(0));
+                  pts.push((r.cx + DMath.cos(a) * r.r).toFixed(0) + ',' + (-(r.cy + DMath.sin(a) * r.r)).toFixed(0));
                 }
                 return <polygon key={r.id} points={pts.join(' ')} fill="rgba(127,255,212,0.08)"
                   stroke={COLORS.cyan} strokeWidth={32 / preview.sc} />;
@@ -8171,7 +8311,7 @@ function WadEditor() {
       const [a, b] = [...pointersRef.current.values()];
       gestureRef.current = {
         kind: 'pinch',
-        startDist: Math.hypot(a.sx - b.sx, a.sy - b.sy),
+        startDist: DMath.hypot(a.sx - b.sx, a.sy - b.sy),
         startZoom: view.zoom,
         startView: { x: view.x, y: view.y },
         startCenter: { x: (a.sx + b.sx) / 2, y: (a.sy + b.sy) / 2 },
@@ -8215,12 +8355,12 @@ function WadEditor() {
     const g = gestureRef.current;
     if (!g) return;
     if (longPressTimerRef.current) {
-      const moved = Math.hypot(ptr.sx - ptr.startX, ptr.sy - ptr.startY);
+      const moved = DMath.hypot(ptr.sx - ptr.startX, ptr.sy - ptr.startY);
       if (moved > 8) cancelLongPress();
     }
     if (g.kind === 'pinch' && pointersRef.current.size === 2) {
       const [a, b] = [...pointersRef.current.values()];
-      const dNow = Math.hypot(a.sx - b.sx, a.sy - b.sy);
+      const dNow = DMath.hypot(a.sx - b.sx, a.sy - b.sy);
       const ratio = dNow / g.startDist;
       // If pinch distance changes more than a hair, mark not a tap
       if (Math.abs(ratio - 1) > 0.05) g.wasTrueTwoFingerTap = false;
@@ -8237,7 +8377,7 @@ function WadEditor() {
       applyTransform(g, sn);
     } else if ((g.kind === 'drag-vertex' || g.kind === 'drag-thing') && pointersRef.current.size === 1) {
       const dx = ptr.sx - ptr.startX, dy = ptr.sy - ptr.startY;
-      if (Math.hypot(dx, dy) > 4) {
+      if (DMath.hypot(dx, dy) > 4) {
         cancelLongPress();
         const w = screenToWorld(ptr.sx, ptr.sy);
         const sn = snapWorld(w.x, w.y);
@@ -8249,7 +8389,7 @@ function WadEditor() {
       }
     } else if (g.kind === 'tap-or-pan' && pointersRef.current.size === 1) {
       const dx = ptr.sx - ptr.startX, dy = ptr.sy - ptr.startY;
-      if (Math.hypot(dx, dy) > 6) { cancelLongPress(); gestureRef.current = { ...g, kind: 'pan' }; }
+      if (DMath.hypot(dx, dy) > 6) { cancelLongPress(); gestureRef.current = { ...g, kind: 'pan' }; }
     }
     if (gestureRef.current?.kind === 'pan' && pointersRef.current.size === 1) {
       const dx = ptr.sx - ptr.startX, dy = ptr.sy - ptr.startY;
@@ -8307,7 +8447,7 @@ function WadEditor() {
 
     const dt = Date.now() - ptr.t;
     const dx = ptr.sx - ptr.startX, dy = ptr.sy - ptr.startY;
-    const wasTap = Math.hypot(dx, dy) < 6 && dt < 350;
+    const wasTap = DMath.hypot(dx, dy) < 6 && dt < 350;
     const g = gestureRef.current;
 
     // Two-finger tap = undo (when pinch lifted with no zoom change)
@@ -8612,7 +8752,7 @@ function WadEditor() {
       if (view.zoom > 0.1 && isWall) {
         const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
         const dx = b.x - a.x, dy = b.y - a.y;
-        const len = Math.hypot(dx, dy) || 1;
+        const len = DMath.hypot(dx, dy) || 1;
         const nx = -dy / len, ny = dx / len;
         ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx + nx * 4, my + ny * 4); ctx.stroke();
       }
@@ -8736,7 +8876,7 @@ function WadEditor() {
       const rad = -t.angle * Math.PI / 180;
       ctx.beginPath();
       ctx.moveTo(s.x, s.y);
-      ctx.lineTo(s.x + Math.cos(rad) * (r + 4), s.y + Math.sin(rad) * (r + 4));
+      ctx.lineTo(s.x + DMath.cos(rad) * (r + 4), s.y + DMath.sin(rad) * (r + 4));
       ctx.stroke();
       if (isSel) {
         ctx.strokeStyle = COLORS.vertexSelected; ctx.lineWidth = 1.5;
@@ -9367,8 +9507,8 @@ function QuickLinePills({ line, map, onChange, onChangeSidedef, onOpenFull, onCl
   const lowerUnp     = (line.flags & 16)  !== 0;
   const v1 = map.vertices.find(v => v.id === line.v1);
   const v2 = map.vertices.find(v => v.id === line.v2);
-  const len = (v1 && v2) ? Math.round(Math.hypot(v2.x - v1.x, v2.y - v1.y)) : 0;
-  const ang = (v1 && v2) ? Math.round(Math.atan2(v2.y - v1.y, v2.x - v1.x) * 180 / Math.PI) : 0;
+  const len = (v1 && v2) ? Math.round(DMath.hypot(v2.x - v1.x, v2.y - v1.y)) : 0;
+  const ang = (v1 && v2) ? Math.round(DMath.atan2(v2.y - v1.y, v2.x - v1.x) * 180 / Math.PI) : 0;
   const front = map.sidedefs.find(s => s.id === line.front);
   const back  = map.sidedefs.find(s => s.id === line.back);
   const [pickFor, setPickFor] = useState(null); // { side: 'front'|'back', slot: 'upper'|'middle'|'lower' }
@@ -9542,7 +9682,7 @@ function RadialMenu({ radial, onAction, onClose }) {
         }}>{radial.kind}</div>
         {actions.map((a, i) => {
           const angle = (i / actions.length) * Math.PI * 2 - Math.PI / 2;
-          const dx = Math.cos(angle) * R, dy = Math.sin(angle) * R;
+          const dx = DMath.cos(angle) * R, dy = DMath.sin(angle) * R;
           return (
             <button key={a.id}
               onClick={(e) => { e.stopPropagation(); onAction(a.id); }}

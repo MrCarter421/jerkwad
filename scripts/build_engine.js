@@ -17,6 +17,10 @@ window.JerkwadEngine = {
   generateShapeShifterMap, buildWad, etherGenerateLevel,
   SHAPESHIFTER_PRESETS, ETHER_MONSTERS, ETHER_GOODIES,
   buildSectorLoops,
+  // Engine-independent sin/cos/atan2/hypot. Anything the arena page layers on
+  // top of the generator (multiplayer things, spawn relocation) feeds the same
+  // WAD, so it has to use these too — see DETERMINISTIC MATH in wad_editor.jsx.
+  DMath,
 };
 `;
 const out = esbuild.transformSync(src, { loader: 'jsx', minify: true, target: 'es2017' });

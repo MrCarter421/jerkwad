@@ -14,12 +14,12 @@ machine** (not the cPanel terminal — see below).
 |---|---|---|
 | 1 Preflight | Node ≥ 16, esbuild (offers to install), branch, uncommitted changes | missing toolchain |
 | 2 Build | `build_app` → `build_html` → `build_engine` | build error, or version not embedded |
-| 3 Validate | the five generator validators | failures (asks first) |
+| 3 Validate | the generator validators, incl. cross-browser determinism | failures (asks first) |
 | 4 Stage | copies the publish manifest into `dist/` | anything not in the manifest |
 | 5 Package | `dist-jerkwad.zip` | — |
 | 6 Upload | rsync / sftp / ftp, or hands you the zip | — |
-| 7 Worker | `npx wrangler deploy` in `workers/doom-relay` | — |
-| 8 Verify | probes the live pages and checks `.git` isn't exposed | — |
+| 7 Worker | tests the relay under workerd, `npx wrangler deploy`, then asks the live relay which build it is | relay test fails (asks first) |
+| 8 Verify | probes the live pages, checks `.git` isn't exposed, that the engine on the host is this engine, and that the live relay is this repo's build | — |
 
 ### Flags
 
@@ -33,7 +33,9 @@ machine** (not the cPanel terminal — see below).
 ```
 
 Use `--code-only` for everything after the first deploy to a host. The WASM
-engines and `freedoom2.wad` change only when you rebuild the engine.
+engines and `freedoom2.wad` change only when you rebuild the engine — and when
+they HAVE changed, deploy without it once. Step 8 compares the engine on the
+host with this one and says so if you forget.
 
 ## Two independent deploys
 
@@ -45,6 +47,16 @@ They are **not** the same thing and don't have to happen together:
   which is why `npx` in the cPanel terminal was a dead end.
 
 Changed `wad_editor.jsx` or a page? Site only. Changed `workers/`? Worker only.
+
+**But a release that touches both needs both.** The netcode fix spans the
+engine (site) and the relay (Worker). The site half works against an old
+relay — games start and survive a stalled player — but recovering from a
+dropped connection needs the new relay, and nothing about a site upload tells
+you the Worker is behind. That gap is how the previous relay fix stayed
+undeployed for three months. So the last step of every run now asks
+`https://doom.yuccabucca.com/api/health` which build is live and fails loudly
+if it is not this repo's; the arena page and the players' waiting screen warn
+about an old relay too.
 
 ## Upload configuration
 
@@ -86,7 +98,13 @@ both from the same source every time, and step 3 refuses to continue unless the
 current version string is actually embedded in `index.html`.
 
 Practical consequence: players on a stale cached copy can't join players on the
-new one. After deploying, a hard refresh fixes it.
+new one. After deploying, a hard refresh fixes it. This is now ENFORCED rather
+than hoped for: the host's engine refuses a joiner whose level checksum
+differs and both screens say "LEVEL MISMATCH — reload" (it used to launch
+anyway and fall apart a minute later). Two stamps keep caches honest:
+`arena/index.html` loads `engine.js?v=<version>` (step 2 refuses to build if
+that number is stale) and `play/index.html` loads the engine as
+`…-doom.js?v=<ENGINE_BUILD>`.
 
 ## After deploying
 

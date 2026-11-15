@@ -166,6 +166,16 @@ const human = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
     const inHtml = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8').includes(ver);
     inHtml ? ok(`version ${bold(ver)} embedded in index.html`)
            : die(`index.html does not contain ${ver} — build did not take`);
+
+    // arena/index.html loads engine.js?v=<version>. Without the stamp a
+    // browser keeps serving last version's cached engine.js under the new
+    // page, and that player builds levels nobody else has.
+    const stamp = (fs.readFileSync(path.join(ROOT, 'arena/index.html'), 'utf8')
+      .match(/<script src="engine\.js\?v=(\d+)"><\/script>/) || [])[1];
+    stamp === String(Math.max(...found))
+      ? ok(`arena page loads engine.js?v=${stamp}`)
+      : die(`arena/index.html loads engine.js?v=${stamp || '(none)'} but the generator is ${ver} — ` +
+            `update the ?v= on its <script> tag`);
   }
 
   // ---- 3. validate --------------------------------------------------------
@@ -182,7 +192,13 @@ const human = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
         ['T-junctions / cracks', ['scripts/check-tjunctions.js', '8', '14']],
         ['spawn safety',         ['scripts/check-spawns.js']],
         ['room reachability',    ['scripts/check-reachability.js']],
+        // Every player's browser must build the same bytes from a seed. Runs
+        // the pipeline under each JS engine it can find (macOS ships jsc —
+        // Safari's) and lints for the constructs that broke it before.
+        ['cross-browser determinism', ['scripts/check-determinism.js', '4', '8,14']],
         ['player layout + audio', ['scripts/check-player-layout.js']],
+        // The page must boot, show its 28 MB download, and survive it stalling.
+        ['player boot + stalled download', ['scripts/check-boot.js']],
       ];
       let bad = 0;
       for (const [label, args] of CHECKS) {
@@ -295,12 +311,36 @@ const human = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
     else {
       const changed = (run('git', ['log', '-1', '--format=%h %s', '--', 'workers/']).out || '').trim();
       info('last Worker change: ' + (changed || 'unknown'));
+      info('this build: ' + bold(relayBuild() || '?') + '   live right now: ' +
+        ((await liveRelayBuild()) || 'unreachable'));
+
+      // The Worker's logic, under Cloudflare's own runtime, before it ships.
+      const t = run(process.execPath, ['scripts/check-relay-logic.js']);
+      if (t.code === 2) warn('relay protocol test — ' + (t.out.trim().split('\n').pop() || 'skipped'));
+      else if (t.code === 0) ok('relay protocol test passed');
+      else {
+        fail('relay protocol test FAILED');
+        console.log(dim(t.out.split('\n').filter(l => /✗|RESULT/.test(l)).join('\n')));
+        if (!await confirm('Deploy a relay that fails its own test?', false)) die('Fix the relay first.');
+      }
+
       const go = DRY ? false : await confirm('Run `npx wrangler deploy` now?', true);
       if (DRY) info('would run: npx wrangler deploy   (in workers/doom-relay)');
       else if (go) {
         info('wrangler runs on THIS machine and uploads to Cloudflare — the web host is not involved');
         const r = spawnSync('npx', ['wrangler', 'deploy'], { cwd: wdir, stdio: 'inherit', shell: process.platform === 'win32' });
-        if (r.status === 0) ok('Worker deployed');
+        if (r.status === 0) {
+          ok('Worker deployed');
+          // "wrangler said yes" is not "the new build is serving". Ask it.
+          const want = relayBuild();
+          let live = null;
+          for (let i = 0; i < 6 && live !== want; i++) {
+            if (i) await new Promise(res => setTimeout(res, 2500));
+            live = await liveRelayBuild();
+          }
+          live === want ? ok(`${relayHost()} now reports ${bold(live)}`)
+            : warn(`${relayHost()} reports ${live || 'nothing'}, expected ${want} — the route may not point at this Worker`);
+        }
         else {
           fail('wrangler deploy failed');
           info('First time?  npx wrangler login  →  npx wrangler secret put DOOM_KEY  →  retry');
@@ -323,11 +363,44 @@ const human = (n) => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
   } else {
     await probe(base);
   }
+  if (!DRY) {
+    // The player page's netcode needs a relay that can re-route a reconnecting
+    // player. Deploying the site alone leaves multiplayer on the old relay —
+    // which is exactly how the last fix never reached anyone.
+    const live = await liveRelayBuild();
+    const want = relayBuild();
+    if (!live) warn(`relay ${relayHost()} did not answer /api/health`);
+    else if (live === want) ok(`relay ${relayHost()} is on ${bold(live)}`);
+    else {
+      fail(`relay ${relayHost()} is on ${bold(live)}, this repo has ${bold(want)}`);
+      info('Multiplayer will keep dropping until the Worker is deployed:');
+      info('    node scripts/deploy.js --worker');
+    }
+  }
 
   console.log('\n' + green(bold('  DONE')) + dim('  dist/ holds exactly what was published\n'));
 })().catch(e => die(e && e.stack || String(e)));
 
 // ===========================================================================
+// The relay's build tag (workers/doom-relay/index.mjs) and where it is served.
+function relayBuild() {
+  try {
+    return (fs.readFileSync(path.join(ROOT, 'workers/doom-relay/index.mjs'), 'utf8')
+      .match(/const BUILD = '([^']+)'/) || [])[1] || null;
+  } catch (e) { return null; }
+}
+function relayHost() {
+  try {
+    return (fs.readFileSync(path.join(ROOT, 'workers/doom-relay/wrangler.toml'), 'utf8')
+      .match(/pattern\s*=\s*"([^"/*]+)/) || [])[1] || 'doom.yuccabucca.com';
+  } catch (e) { return 'doom.yuccabucca.com'; }
+}
+async function liveRelayBuild() {
+  if (!has('curl')) return null;
+  const r = spawnSync('curl', ['-sS', '-m', '10', `https://${relayHost()}/api/health`], { encoding: 'utf8' });
+  try { return JSON.parse(r.stdout || '').build || null; } catch (e) { return null; }
+}
+
 async function setupConfig() {
   console.log();
   info('No upload target yet. Set one up? Settings go in .deploy.json (gitignored).');
@@ -422,6 +495,22 @@ async function probe(base) {
   for (const [label, p] of [['arena page', '/arena/'], ['player page', '/play/']]) {
     const code = await get(url + p);
     code === '200' ? ok(`${label} → ${code}`) : warn(`${label} → ${code || 'no response'}`);
+  }
+  // The engine on the host must be THIS engine. --code-only skips the big
+  // binaries, which is right until they change — then the page ships with
+  // new netcode expectations and the host still serves the old .wasm.
+  for (const rel of ['play/websockets-doom.wasm', 'play/fast-doom.wasm']) {
+    const local = path.join(ROOT, rel);
+    if (!fs.existsSync(local)) continue;
+    const r = spawnSync('curl', ['-sSI', '-m', '15', url + '/' + rel], { encoding: 'utf8' });
+    const len = +(((r.stdout || '').match(/^content-length:\s*(\d+)/im) || [])[1] || 0);
+    const want = fs.statSync(local).size;
+    if (!len) warn(`${rel} — could not read its size on the host`);
+    else if (len === want) ok(`${rel} on the host matches this build`);
+    else {
+      fail(`${rel} on the host is ${len} bytes, this build is ${want}`);
+      info('The engine changed. Deploy WITHOUT --code-only so it is uploaded.');
+    }
   }
   // The one that actually matters for security.
   const git = await get(url + '/.git/HEAD');

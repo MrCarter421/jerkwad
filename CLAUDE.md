@@ -9,14 +9,29 @@ browser. Three generations of tooling live in this repo, all inside `wad_editor.
 | **ShapeShifter** (`ShapeShifter`) | Room-composition editor: place preset rooms on a canvas, drag them together to **fuse**, connect with corridors/teleporters, drop things, BUILD → validated map → PLAY/SAVE exports a vanilla-Doom WAD. | The main app. |
 | **EtherWad** (`EtherWad`) | Automated level generator on top of the ShapeShifter engine. Quantum-random entropy, room-count/enemy/difficulty dials, generates overlapping compositions with intelligent thing placement, hands off to ShapeShifter for editing. | Newest layer (V0.53+). |
 
-Current version: **V0.56** (see the version `<span>` in the ShapeShifter/EtherWad headers).
+Current version: **V0.57** (see the version `<span>` in the ShapeShifter/EtherWad headers).
+Multiplayer pieces carry their own stamps: player page **P13**, engine **E2**
+(`ENGINE_BUILD` in `play/index.html`), relay **relay-4** (`BUILD` in the worker).
 
 ## Repo layout
 
 ```
-wad_editor.jsx   — the entire app (~9k lines). Source of truth.
+wad_editor.jsx   — the entire app (~10k lines). Source of truth.
 index.html       — DEPLOYED ARTIFACT. wad_editor.jsx minified + embedded inline.
                    Never hand-edit the embedded JS; rebuild it (see below).
+arena/           — multiplayer level generator + lobby page (ARENA.md)
+  index.html       the page; its LEVEL PIPELINE block decides a level's bytes
+  engine.js        BUILT from wad_editor.jsx (scripts/build_engine.js)
+play/            — the in-browser Doom player (PLAY.md)
+  index.html       player page: boot, controls, netgame status (build P13)
+  *-doom.{js,wasm} BUILT engine (scripts/build-doom-wasm.sh + engine-patches/)
+  freedoom2.wad    IWAD
+workers/doom-relay/  — Cloudflare Worker: WebSocket relay + lobby (relay-4)
+scripts/         — build, deploy, validators (see Testing)
+  engine-patches/  the netcode patches applied to upstream doom-wasm + README
+  lib/             stack.js (local test stack), arena-level.js (pipeline loader)
+package.json     — dev tooling only (npm install); the site ships no npm code
+ARENA.md PLAY.md DEPLOY.md — multiplayer, player, deploying
 CLAUDE.md        — this file.
 ```
 
@@ -43,7 +58,8 @@ node scripts/build_html.js /tmp/app.js   # splice into index.html + refresh buil
 node scripts/build_engine.js             # arena/engine.js — React-free generator bundle
 ```
 
-esbuild is expected at `/tmp/node_modules/esbuild` (override with `ESBUILD=<path>`).
+`npm install` once provides esbuild (and the test tooling). `ESBUILD=<path>`
+overrides; `/tmp/node_modules/esbuild` is still honoured.
 `build_html.js` fails loudly if the `      try {` / `      } catch (e) {` markers move.
 
 Bump the version string (`V0.xx</span>`, appears in both ShapeShifter and EtherWad headers)
@@ -115,6 +131,16 @@ The heart of everything. Single deterministic pass (own seeded `rand()`), roughl
   Identical-size overlapping rects are user error and will break.
 - **Two-sided middle textures render as impassable-looking glass** — the resolve pass
   strips them; don't add them back.
+- **A level's bytes must not depend on the browser.** The arena never transfers
+  a level: every player rebuilds it from the seed, and Doom's lockstep netcode
+  kills the game for everyone when two builds differ. So nothing that can
+  influence generated output may use `Math.sin/cos/tan/atan*/hypot/pow/exp/log`
+  or `**` (engines disagree in the last digit — use `DMath`, defined at the top
+  of `wad_editor.jsx`, or plain arithmetic), nor `sort()` with a comparator
+  that calls the PRNG (how often it is called is engine-specific — use
+  Fisher-Yates), nor `Math.random`/`Date`. `scripts/check-determinism.js`
+  lints for all of these and runs the pipeline under V8, JavaScriptCore and
+  SpiderMonkey. Before V0.57 Chrome and Safari disagreed on 37% of levels.
 - **Everything snaps to 32** (rooms, footprints, fusion grid). Building `plinthW` must
   stay 32 so precise-fused plinths land on grid-cell boundaries.
 - **No auto-exit, no auto-secret** (V0.52): levels only get an exit where the user (or
@@ -184,8 +210,46 @@ node scripts/check-skybleed.js 20 14    # no unpainted ceiling gaps, no sky-ceil
 node scripts/check-tjunctions.js 8 14   # no vertex mid-linedef (cracks / missing wall)
 node scripts/check-spawns.js            # no player start inside solid geometry / without headroom
 node scripts/check-reachability.js      # every room reachable from P1 through doors/teleporters
+node scripts/check-determinism.js       # same bytes in V8 / JavaScriptCore / SpiderMonkey (+ source lint)
 FUSE=0.25 node scripts/check-skybleed.js 12 14   # the editor's fused path (arena is corridor-only)
 ```
+
+`check-determinism.js` needs a second JS engine to compare against: macOS has
+`jsc` built in; on Debian/Ubuntu `apt install libjavascriptcoregtk-bin
+libmozjs-115-dev`. With none it still lints and exits 2 (skipped).
+
+### Multiplayer
+
+After ANY change to `play/index.html`, `arena/index.html`, the worker or the
+engine patches:
+
+```
+node scripts/check-relay-logic.js    # the relay's protocol under workerd (2 s, no browser)
+node scripts/check-netplay.js        # ~10 min: every way a game has died, played for real
+node scripts/check-boot.js           # the page boots, shows its download, survives it stalling
+node scripts/check-xss.js            # lobby names and ?relay= stay inert text
+node scripts/check-netgame.js        # does a game START (+ SCENARIO=earlystart|forcestart)
+```
+
+- `check-netplay.js` is the battery; each line is one `check-session.js
+  --local` run (real pages + real WASM engine + the real Worker file under
+  workerd via Miniflare) with one fault injected and an expected outcome.
+  `ARENA.md` has the scenario table. `--full` adds the two 30 s timeout cases.
+- `check-session.js` alone targets the **deployed** site by default. In a
+  sandbox the browser reaches it through `HTTPS_PROXY`; the hosts
+  `yuccabucca.com` and `doom.yuccabucca.com` must be allowed.
+- `node scripts/dev-stack.js [--chaos]` is the same stack to play by hand.
+- Negative controls are built in — swap one layer for a previous build and the
+  same test must fail: `WORKER=<old index.mjs>` (the relay;
+  `git show 954c39e:workers/doom-relay/index.mjs` is relay-2),
+  `ENGINE=<dir with old binaries>` (the engine), `JERKWAD_SITE=<another
+  checkout>` (pages + engine + IWAD: `git worktree add /tmp/old <rev>`).
+- The lessons that cost the most time here: a hand-written PORT of the relay
+  cannot show a bug its author does not already know about (run the real
+  file); closing a socket from the server side is the one failure the engine
+  happened to handle (inject faults below the browser too — the chaos proxy);
+  and a fix that needs two deploys must be tested against the OLD other half,
+  because that is the state the world will actually be in for a while.
 
 Deploying: **`node scripts/deploy.js`** runs the whole pipeline (build → validate →
 stage → package → upload → Worker → verify). See `DEPLOY.md`. `--dry-run` stops before
@@ -236,6 +300,18 @@ actually exist* in the output.
 - V0.53: **EtherWad** — QRNG entropy, generate/add-areas, handoff to editor.
 - V0.54: bay-shelter door trim, catacombs/library/chasm themes, add-areas keeps
   monster count flat.
+- V0.57: **multiplayer no longer falls apart.** "Players get kicked after about
+  a minute" was three faults, none of them Cloudflare. (1) The wasm engine
+  dropped a silent peer after 4 s (stock: 30) — any hidden tab, locked phone or
+  network hiccup ended the game; now 30 s, the game pauses and resumes.
+  (2) A lost socket was never recovered — blocking reconnect in the engine,
+  no close handshake and no uid rebind in the relay; now a background
+  reconnect with relay-ping liveness, and relay-4. (3) The generator was not
+  reproducible across browsers — a `sort(() => rand() - 0.5)` shuffle and
+  native `Math.sin/cos/atan2/hypot`; now Fisher-Yates and `DMath`, and the
+  host's engine refuses a mismatched joiner outright. Every seed builds a
+  different level than it did in V0.56 (all validators re-run clean). Details:
+  `ARENA.md` (*Why games died*), `scripts/engine-patches/README.md`.
 - V0.56: **no more cracks / missing wall in room trim.** HEADER_DEPTH and TRIM_W are
   both 16, so a corridor door's header inner edge landed exactly on trim ring 1 — and
   the ring loop then emitted its own full-width line straight over it. Two lines
@@ -252,6 +328,23 @@ actually exist* in the output.
   inside solid geometry) and a playable landscape view in `play/` (build P7).
 
 ## Known issues / next ideas
+
+- **A player who vanishes without leaving freezes the others for 30 s** (their
+  battery died, the OS killed the tab). Leaving normally is instant, and the
+  screen says "waiting for another player" meanwhile, but the relay already
+  knows the socket is gone within milliseconds. It could tell the remaining
+  engines after a short grace period (long enough for a reconnect) so they
+  drop the player in ~10 s instead. Needs a relay→engine notice frame and a
+  hook into `net_server.c`/`net_client.c`; `?timeout=N` is the knob until then.
+- **A hidden tab stalls the game** — `requestAnimationFrame` stops, so the
+  engine does. Unavoidable from the page (timers are throttled too), which is
+  why the stall is tolerated rather than prevented.
+- The engine's final link is not bit-reproducible in emscripten 3.1.6 (same
+  objects, a few function orderings). See the note in `build-doom-wasm.sh`.
+- The generator's seeded LCG (`seed * 1103515245 + 12345`) overflows 2^53, so
+  its low bits are always zero. It is deterministic everywhere — the multiply
+  is one correctly-rounded IEEE operation — but it is a poorer PRNG than it
+  looks. Replacing it changes every level, so not bundled with a fix.
 
 - **The FUSED path still has T-junctions** (`FUSE=0.25 node scripts/check-tjunctions.js`
   reports ~2400 over 6 levels). The 32-unit grid rasterizer emits one wall per cell

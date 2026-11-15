@@ -74,6 +74,14 @@
     border-radius: 4px; font-size: 11px; padding: 7px 10px; }
   #hint { position: fixed; top: calc(env(safe-area-inset-top) + 8px); left: 10px;
     font-size: 10px; color: #6b7d99; z-index: 40; max-width: 50vw; }
+  /* Non-blocking notices over a running game: "waiting for another player",
+     "X left the game". pointer-events:none so they never eat a tap. */
+  #netbanner { position: fixed; top: calc(env(safe-area-inset-top) + 44px); left: 50%;
+    transform: translateX(-50%); z-index: 45; pointer-events: none; display: none;
+    background: rgba(10,14,26,0.86); border: 1px solid #ff9d3d; color: #ffcf99;
+    border-radius: 6px; padding: 8px 14px; font-size: 12px; font-weight: 700;
+    letter-spacing: .06em; text-align: center; max-width: 92vw; }
+  #netbanner.info { border-color: #243759; color: #c5d4e8; font-weight: 400; }
   @media (hover: hover) and (pointer: fine) {
     /* Desktop: hide touch pads (keyboard play) */
     .pad { display: none; }
@@ -85,10 +93,11 @@
   <h1>JERKWAD PLAYER</h1>
   <div class="bar"><div id="bootbar"></div></div>
   <div class="msg" id="bootmsg">loading engine…</div>
-  <div class="msg" style="opacity:0.5">player build P12</div>
+  <div class="msg" style="opacity:0.5">player build P13</div>
 </div>
 <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
 <div id="hint"></div>
+<div id="netbanner"></div>
 <div id="topbar">
   <button id="btn-sound" style="display:none; background:#ffb74d; color:#0a0e1a; font-weight:700">🔈 SOUND</button>
   <button id="btn-fit">FIT</button>
@@ -130,10 +139,29 @@
 //   ?join=1           join a netgame (with ?ws)
 //   ?nodes=N          number of players expected when hosting (default 2)
 //   ?solo=1           -solo-net (test netgame alone)
+//   ?timeout=N        seconds a silent player is waited for before being
+//                     dropped (engine default 30; 4-600)
 // ---------------------------------------------------------------------------
 const qs = new URLSearchParams(location.search);
+
+// Bump whenever play/*-doom.{js,wasm} are rebuilt. Browsers cache those by
+// URL, and a player still running last month's engine has last month's
+// netcode no matter what this page says. With the build in the URL a new
+// deploy takes effect on the next page load, not whenever a cache expires.
+const ENGINE_BUILD = 'E2';
+// The oldest relay this page's netcode is whole against. Recovering from a
+// dropped socket needs the relay to follow a returning player to their new
+// socket; relay-2 could not, and neither it nor relay-3 answered a close.
+const RELAY_MIN_BUILD = 4;
 window.addEventListener('error', (e) => {
   try { setBoot(100, 'ERROR: ' + (e.message || e.type) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '')); } catch (x) {}
+  // A WebAssembly trap means the engine is gone. (Ordinary page errors are
+  // not: do not put a "the game stopped" screen over a game that is fine.)
+  try {
+    if (/RuntimeError|out of bounds|unreachable|null function|table index/i.test(e.message || '')) {
+      engineStopped('The game engine crashed: ' + e.message);
+    }
+  } catch (x) {}
 });
 window.addEventListener('unhandledrejection', (e) => {
   try { setBoot(100, 'ERROR: ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason))); } catch (x) {}
@@ -162,6 +190,81 @@ function readUserWad() {
   });
 }
 
+// The page could not get as far as starting the engine. Say why, keep saying
+// it, and offer the one thing that helps.
+function bootFailed(msg) {
+  netFailed = true;                      // nothing may cover or hide this now
+  bootEl.classList.remove('hidden');
+  setBoot(100, msg);
+  if (!document.getElementById('boot-reload')) {
+    const a = document.createElement('a');
+    a.id = 'boot-reload';
+    a.textContent = '↻ TRY AGAIN';
+    a.href = location.href;
+    a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
+      'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
+    bootEl.appendChild(a);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One download, with a pulse. The IWAD is 28 MB: on a phone it is the step
+// most likely to stall — and a stall here used to be forever, and invisible
+// (a bare `await fetch()` has no timeout, and nothing showed how far it had
+// got). Now the bar moves as bytes arrive; if nothing arrives for 20 s the
+// transfer is abandoned and started again, twice, before giving up with a
+// message.
+// ---------------------------------------------------------------------------
+async function download(url, label, lo, hi) {
+  // (?stallms= shortens the patience so scripts/check-boot.js need not wait a
+  // minute to see a give-up; never below 2 s.)
+  const STALL_MS = Math.max(2000, +qs.get('stallms') || 20000);
+  for (let attempt = 1; ; attempt++) {
+    const ctl = new AbortController();
+    let timer = setTimeout(() => ctl.abort(), STALL_MS);            // no answer at all
+    try {
+      const res = await fetch(url, { signal: ctl.signal, cache: attempt > 1 ? 'reload' : 'default' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      // Content-Length is the size ON THE WIRE; it is only the size of the
+      // data if the server did not compress it.
+      const total = res.headers.get('content-encoding') ? 0 : (+res.headers.get('content-length') || 0);
+      if (!res.body || !res.body.getReader) {                         // very old browser
+        const all = new Uint8Array(await res.arrayBuffer());
+        clearTimeout(timer);
+        return all;
+      }
+      const reader = res.body.getReader();
+      // Known size: write straight into the final buffer, so peak memory is
+      // one copy (it matters on a phone). Unknown: collect, then join.
+      let out = total ? new Uint8Array(total) : null, parts = [], got = 0;
+      for (;;) {
+        clearTimeout(timer);
+        timer = setTimeout(() => ctl.abort(), STALL_MS);              // no progress
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (out && got + value.length <= out.length) out.set(value, got);
+        else { if (out) { parts.push(out.subarray(0, got)); out = null; } parts.push(value); }
+        got += value.length;
+        setBoot(lo + (hi - lo) * (total ? Math.min(1, got / total) : 0.5),
+          'downloading ' + label + '… ' + (got / 1048576).toFixed(0) + (total ? ' / ' + (total / 1048576).toFixed(0) : '') + ' MB');
+      }
+      clearTimeout(timer);
+      if (out && got === out.length) return out;
+      if (out) return out.slice(0, got);
+      const joined = new Uint8Array(got);
+      let off = 0;
+      for (const part of parts) { joined.set(part, off); off += part.length; }
+      return joined;
+    } catch (e) {
+      clearTimeout(timer);
+      const why = e && e.name === 'AbortError' ? 'the download stalled' : (e && e.message) || String(e);
+      if (attempt >= 3) throw new Error(label + ' could not be downloaded (' + why + ')');
+      setBoot(lo, label + ': ' + why + ' — trying again (' + attempt + ' of 2)…');
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+}
+
 // Engine args must be FINAL before websockets-doom.js is evaluated —
 // emscripten snapshots Module.arguments at script load, so we build the
 // arg list (async IndexedDB read included) first and inject the engine
@@ -177,10 +280,7 @@ var Module = {
     Module.addRunDependency('jerkwad-files');
     (async function stage() {
       try {
-        setBoot(30, 'fetching freedoom2.wad…');
-        const iwadRes = await fetch('freedoom2.wad');
-        if (!iwadRes.ok) throw new Error('freedoom2.wad HTTP ' + iwadRes.status);
-        let iwad = new Uint8Array(await iwadRes.arrayBuffer());
+        let iwad = await download('freedoom2.wad', 'game data', 30, 58);
         // canOwn=true (6th arg): MEMFS takes the typed array instead of
         // copying it — halves peak memory for the 28 MB IWAD, which matters
         // a lot on memory-constrained mobile browsers.
@@ -195,30 +295,28 @@ var Module = {
         const wadUrl = qs.get('wad');
         if (wadUrl) {
           setBoot(75, 'fetching ' + wadUrl + '…');
-          const r = await fetch(wadUrl);
-          if (r.ok) FS.createDataFile('/', 'extra.wad', new Uint8Array(await r.arrayBuffer()), true, true, true);
+          FS.createDataFile('/', 'extra.wad', await download(wadUrl, 'level', 75, 88), true, true, true);
         }
         setBoot(90, 'starting: ' + Module.arguments.join(' '));
       } catch (e) {
-        setBoot(100, 'BOOT FAILED: ' + e.message);
-        throw e;
-      } finally {
-        Module.removeRunDependency('jerkwad-files');
+        // Do NOT release the run dependency. There is nothing for the engine
+        // to run, and letting it start anyway (as this used to) buried the
+        // real reason under whatever the engine then complained about — and
+        // its start-up hid this screen.
+        bootFailed('BOOT FAILED: ' + e.message);
+        return;
       }
+      Module.removeRunDependency('jerkwad-files');
     })();
   }],
+  // The .wasm is fetched by the glue script; give it the same build stamp.
+  locateFile: (path, dir) => dir + path + '?v=' + ENGINE_BUILD,
   print: (t) => {
     console.log(t);
-    // Keep the engine's own words. When a boot or a netgame handshake stalls,
-    // this tail is the only thing that says WHERE — and it can be screenshotted
-    // off a phone, which a devtools console cannot.
-    engineLog.push(t.length > 160 ? t.slice(0, 160) + '…' : t);
-    if (engineLog.length > 60) engineLog.shift();
-    const lg = document.getElementById('netlog');
-    if (lg) lg.textContent = engineLog.slice(-10).join('\n');
+    logLine(t);
     // Engine protocol lines: "doom: N, message"
-    if (/^doom: /.test(t)) hintEl.textContent = t.replace(/^doom: \d+,\s*/, '');
-    if (/^doom: 10/.test(t)) hintEl.textContent = 'net game started';
+    const m = /^doom: (\d+),\s*(.*)$/.exec(t);
+    if (m) return onDoomStatus(+m[1], m[2]);
     // A fatal engine error (visplane overflow, etc.) prints here right before
     // the runtime exits — surface it on the (re-shown) boot screen instead of
     // leaving a silent black canvas, so crashes are diagnosable.
@@ -226,33 +324,123 @@ var Module = {
       bootEl.classList.remove('hidden');
       setBoot(100, 'ENGINE: ' + t.slice(0, 120));
     }
-    if (/^doom: 10/.test(t)) { netLaunched = true; hideNetStatus(); }
-    // Relay handshake failure ("doom: 1"). A netgame with a dead socket
-    // limps unplayably (the net loop stalls every tic) — stop and offer a
-    // clean solo restart instead.
-    if (/^doom: 1,/.test(t) && qs.get('ws')) {
-      netFailure('RELAY CONNECTION FAILED — the game socket could not reach ' +
-        (qs.get('ws') || '').replace(/^wss:\/\//, '').split('/')[0] + '.', true);
-    }
-    // "doom: 9, disconnected from server" / "doom: 7, failed to connect to …".
-    // These had NO handler, which is why a failed join just sat on a black
-    // screen with no way out. The overwhelmingly common cause is that the host
-    // already started: vanilla Doom has no late join, so the server refuses
-    // anyone arriving after launch ("not in waiting start state").
-    if (/^doom: (9|7),/.test(t) && qs.get('ws') && !netLaunched) {
-      netFailure(qs.get('join')
-        ? 'COULD NOT JOIN — the host has already started this game. Vanilla ' +
-          'Doom cannot join a match in progress, so ask the host to start a ' +
-          'fresh arena and join before they launch.'
-        : 'LOST THE CONNECTION to the relay.', false);
-    }
   },
-  printErr: (t) => console.warn(t),
+  // stderr used to go to the browser console only — which on a phone is
+  // nowhere. It is where the engine explains a fatal error, so keep it.
+  printErr: (t) => { console.warn(t); logLine('! ' + t); },
   onRuntimeInitialized: () => setBoot(95, 'engine ready'),
+  // The engine quit (a fatal error, or QUIT from Doom's own menu). An older
+  // engine build says nothing first; a current one has already printed
+  // "doom: 17" and this is a no-op.
+  onExit: (code) => { if (code) engineStopped('The game engine stopped unexpectedly (exit ' + code + ').'); },
+  onAbort: (what) => engineStopped('The game engine crashed' + (what ? ': ' + what : '.')),
   // Re-assert a latched RUN once the engine exists: the keydown sent before
   // boot went nowhere.
-  postRun: [() => { bootEl.classList.add('hidden'); if (runLocked) applyRunLock(); }],
+  postRun: [() => { if (!netFailed) bootEl.classList.add('hidden'); if (runLocked) applyRunLock(); }],
 };
+
+// Keep the engine's own words. When a boot or a netgame handshake stalls,
+// this tail is the only thing that says WHERE — and it can be screenshotted
+// off a phone, which a devtools console cannot.
+function logLine(t) {
+  // The engine draws startup progress bars with backspaces; a <pre> shows
+  // those as a row of boxes.
+  t = String(t).replace(/[\x00-\x08\x0b-\x1f]+/g, '').trim();
+  if (!t) return;
+  engineLog.push(t.length > 160 ? t.slice(0, 160) + '…' : t);
+  if (engineLog.length > 60) engineLog.shift();
+  const lg = document.getElementById('netlog');
+  if (lg) lg.textContent = engineLog.slice(-10).join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// ENGINE STATUS LINES — "doom: N, text". The engine's side of every network
+// event a player can be affected by; this turns each into something a person
+// can read. Before P13 only 1, 7, 9 and 10 were handled, and 7/9 only before
+// launch — so anything that went wrong DURING a game was a frozen picture.
+//
+//    1  could not reach the relay            10  game started
+//    2  connected / reconnected              12  (host) a player timed out
+//    4  socket error                         13  refused by the host: <why>
+//    5  socket closed (it will reconnect)    14  (host) turned a player away
+//    6  socket silent/failed, reopening      15  waiting for another player
+//    7  connect failed                       16  game resumed
+//    8  our uid                              17  fatal engine error: <what>
+//    9  disconnected from the host (<why>)   18  (host) a player left
+// ---------------------------------------------------------------------------
+function onDoomStatus(code, msg) {
+  if (code !== 15 && code !== 16) hintEl.textContent = msg;
+  switch (code) {
+    case 10:
+      hintEl.textContent = 'net game started';
+      netLaunched = true; hideNetStatus(); gameIsRunning();
+      break;
+    case 1:
+      // A netgame with no socket at all cannot begin — stop and offer solo.
+      if (qs.get('ws')) {
+        netFailure('RELAY CONNECTION FAILED — the game socket could not reach ' +
+          (qs.get('ws') || '').replace(/^wss?:\/\//, '').split('/')[0] + '.', true);
+      }
+      break;
+    case 13:
+      // The host's engine refused us, and said why.
+      if (qs.get('ws')) netFailure(refusalText(msg), false, true);
+      break;
+    case 7:
+    case 9:
+      if (!qs.get('ws')) break;
+      if (!netLaunched) {
+        // Before launch. (A current engine has usually already said why with a
+        // "13"; netFailure keeps the first, more specific, message.)
+        netFailure(qs.get('join')
+          ? 'COULD NOT JOIN — the host has already started this game. Vanilla ' +
+            'Doom cannot join a match in progress, so ask the host to start a ' +
+            'fresh arena and join before they launch.'
+          : 'LOST THE CONNECTION to the relay.', false);
+      } else if (code === 9) {
+        showStall(false);
+        showNetLost(msg);
+      }
+      break;
+    case 5:
+    case 6:
+      if (netLaunched) hintEl.textContent = 'connection dropped — reconnecting…';
+      break;
+    case 2:
+      if (netLaunched) { hintEl.textContent = 'reconnected'; banner('Reconnected', 2500, true); }
+      break;
+    case 12:
+      banner((msg.match(/'([^']*)'/) || [0, 'A player'])[1] + ' dropped out (no response) — the game goes on', 6000, true);
+      break;
+    case 18:
+      banner((msg.match(/'([^']*)'/) || [0, 'A player'])[1] + ' left the game', 5000, true);
+      break;
+    case 14:
+      turnedAway++; renderNetStatus();
+      break;
+    case 15: showStall(true); break;
+    case 16: showStall(false); break;
+    case 17: engineStopped(msg); break;
+  }
+}
+
+function refusalText(reason) {
+  if (/LEVEL MISMATCH/i.test(reason)) {
+    return 'LEVEL MISMATCH — this browser built a different level than the host\'s, so the ' +
+      'two games could never stay in step. Both players: reload the arena page ' +
+      '(a hard refresh, so everyone is on the same version), then start a new arena.';
+  }
+  if (/not currently accepting/i.test(reason)) {
+    return 'COULD NOT JOIN — the host has already started this game. Vanilla Doom ' +
+      'cannot join a match in progress, so ask the host to start a fresh arena ' +
+      'and join before they launch.';
+  }
+  if (/full/i.test(reason)) return 'COULD NOT JOIN — this arena is full.';
+  return 'COULD NOT JOIN — ' + reason;
+}
+
+// ---------------------------------------------------------------------------
+// NETGAME LOBBY STATUS.};
 
 // ---------------------------------------------------------------------------
 // NETGAME LOBBY STATUS.
@@ -272,6 +460,11 @@ const relayOrigin = wsParam.replace(/^ws/, 'http').replace(/\/api\/ws\/.*$/, '')
 const roomId = (wsParam.match(/\/api\/ws\/([^/?]+)/) || [])[1] || null;
 const wantNodes = Math.max(2, +(qs.get('nodes') || 2));
 let playersIn = 0;
+let netFailed = false;        // a failure screen is up; nothing may cover it
+let engineDead = false;       // the engine has exited; nothing can resume
+let turnedAway = 0;           // (host) players refused for a mismatched level
+let relayBuild = null;        // e.g. "relay-4", from /api/health
+let relayOutdated = false;
 
 function netStatusEl() {
   let el = document.getElementById('netstatus');
@@ -295,7 +488,9 @@ function soloUrl() {
 }
 
 function renderNetStatus() {
-  if (netLaunched) return hideNetStatus();
+  // (The room poll keeps calling this; once the game has launched, failed or
+  // died there is nothing to wait for and it must not redraw underneath.)
+  if (netLaunched || netFailed || engineDead) return hideNetStatus();
   const el = netStatusEl();
   const isHost = !!qs.get('server');
   // HONEST LABEL. This number is how many WebSockets the relay has for this
@@ -308,6 +503,14 @@ function renderNetStatus() {
     '<div style="font-size:30px;font-weight:700;color:#7fffd4">' +
       playersIn + ' / ' + wantNodes + '</div>' +
     '<div style="color:#6b7d99;font-size:11px">relay connections (not confirmed Doom players)</div>' +
+    (turnedAway
+      ? '<div style="color:#ffb74d;font-size:12px;max-width:34em">⚠ A player was turned away: their ' +
+        'browser built a different level than yours. Ask them to reload the arena page ' +
+        '(hard refresh) and join again.</div>' : '') +
+    (relayOutdated
+      ? '<div style="color:#ffb74d;font-size:12px;max-width:34em">⚠ The relay is running an old build (' +
+        relayBuild + '). On it, a connection that drops mid-game cannot recover. Redeploy the ' +
+        'worker: <code>cd workers/doom-relay &amp;&amp; npx wrangler deploy</code></div>' : '') +
     '<div style="color:#6b7d99;font-size:12px;max-width:34em">' +
       (isHost
         ? 'The match starts by itself once Doom has everyone. If this sticks, the ' +
@@ -360,10 +563,23 @@ async function pollRoom() {
   } catch (e) { /* transient — keep the last count */ }
   renderNetStatus();
 }
+// Which relay are we on? An outdated one still relays, but cannot re-route a
+// player who reconnects — worth saying BEFORE the game, not after it dies.
+async function checkRelayBuild() {
+  if (!relayOrigin) return;
+  try {
+    const r = await fetch(relayOrigin + '/api/health', { cache: 'no-store' });
+    const j = await r.json();
+    relayBuild = String(j.build || '?');
+    relayOutdated = (+(relayBuild.match(/(\d+)/) || [0, 0])[1]) < RELAY_MIN_BUILD;
+  } catch (e) { /* unreachable — the game socket will report that itself */ }
+  if (relayOutdated) renderNetStatus();
+}
 if (qs.get('ws') && (qs.get('server') || qs.get('join'))) {
   renderNetStatus();
   setInterval(pollRoom, 2000);
   pollRoom();
+  checkRelayBuild();
 } else {
   // SOLO watchdog. If the engine has not reported "game started" a good while
   // after boot, show its log rather than leaving a black screen with nothing
@@ -390,8 +606,19 @@ if (qs.get('ws') && (qs.get('server') || qs.get('join'))) {
 }
 
 // Shared failure screen for every netgame dead end, with a solo escape.
-function netFailure(msg, withRelayTest) {
+function netFailure(msg, withRelayTest, specific) {
+  // One failure screen. The engine reports a refusal as a specific reason
+  // ("level mismatch") surrounded by its generic consequences ("disconnected",
+  // "failed to connect") — in an order that depends on the engine build. The
+  // specific reason is the one a player needs, so it always wins; a generic
+  // line never replaces anything.
+  if (netFailed && !specific) return;
+  netFailed = true;
   hideNetStatus();
+  showStall(false);
+  // If the engine is still running (an older host let a mismatched player
+  // in), take it out of the game rather than let it start one that must fail.
+  leaveNetGame();
   bootEl.classList.remove('hidden');
   setBoot(100, msg);
   if (!document.getElementById('solo-esc')) {
@@ -408,6 +635,138 @@ function netFailure(msg, withRelayTest) {
     if (withRelayTest) addRelayTest();
   }
 }
+
+// ---------------------------------------------------------------------------
+// DURING A GAME.
+// ---------------------------------------------------------------------------
+const bannerEl = document.getElementById('netbanner');
+let bannerTimer = 0, stalled = false;
+function banner(text, ms, info) {
+  clearTimeout(bannerTimer);
+  bannerEl.textContent = text;
+  bannerEl.classList.toggle('info', !!info);
+  bannerEl.style.display = 'block';
+  if (ms) bannerTimer = setTimeout(() => { if (!stalled) bannerEl.style.display = 'none'; else showStall(true); }, ms);
+}
+// Lockstep netcode cannot advance without every player's input, so while one
+// player's tab is hidden or their connection is stalled, everyone's game
+// stops. The engine now WAITS for that player (up to its timeout) instead of
+// kicking them after four seconds — which only works if the people waiting
+// can see that waiting is what is happening.
+function showStall(on) {
+  stalled = on;
+  clearTimeout(bannerTimer);
+  if (on) {
+    bannerEl.classList.remove('info');
+    bannerEl.textContent = '⏳ WAITING FOR ANOTHER PLAYER — their game is paused or their connection is slow';
+    bannerEl.style.display = 'block';
+  } else bannerEl.style.display = 'none';
+}
+
+function overlay(id, title, body, buttons) {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = id;
+    el.style.cssText = 'position:fixed;inset:0;z-index:48;display:flex;flex-direction:column;' +
+      'align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px;' +
+      'background:rgba(10,14,26,0.9);color:#c5d4e8;font-size:14px;line-height:1.6';
+    document.body.appendChild(el);
+  }
+  el.textContent = '';
+  const h = document.createElement('div');
+  h.style.cssText = 'color:#ff9d3d;letter-spacing:.18em;font-weight:700';
+  h.textContent = title;
+  const b = document.createElement('div');
+  b.style.cssText = 'color:#c5d4e8;font-size:13px;max-width:36em';
+  b.textContent = body;
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px';
+  for (const [label, action, primary] of buttons) {
+    const btn = document.createElement(typeof action === 'string' ? 'a' : 'button');
+    btn.textContent = label;
+    if (typeof action === 'string') btn.href = action; else btn.onclick = action;
+    btn.style.cssText = 'padding:11px 18px;border:0;border-radius:5px;font-weight:700;font-size:13px;' +
+      'text-decoration:none;cursor:pointer;background:' + (primary ? '#7fffd4' : '#33405c') +
+      ';color:' + (primary ? '#0a0e1a' : '#c5d4e8');
+    row.appendChild(btn);
+  }
+  el.append(h, b, row);
+  return el;
+}
+
+// "doom: 9" after launch: this player is no longer in the netgame. Doom
+// carries on locally (the others simply vanish from the level), so this is
+// not a dead end — but it has to be SAID, or it reads as the game breaking.
+function showNetLost(engineReason) {
+  const why = /too long/.test(engineReason)
+    ? 'Nothing was heard from the host for too long — their game or their connection stopped' +
+      (relayOutdated ? ' (and this relay, ' + relayBuild + ', cannot recover a dropped connection).' : '.')
+    : /ended the game/.test(engineReason) ? 'The host left, which ends the game for everyone.'
+    : 'The connection to the host was closed.';
+  const el = overlay('netlost', 'YOU ARE NO LONGER IN THE NETGAME',
+    why + ' You can keep playing this level on your own, or go back and start a new arena.', [
+      ['▶ KEEP PLAYING ALONE', () => el.remove(), true],
+      ['← BACK TO THE ARENA', '../arena/', false],
+    ]);
+}
+
+// The engine itself is gone (a fatal error, or a crash). Nothing can resume.
+function engineStopped(what) {
+  if (engineDead || netFailed) return;
+  engineDead = true;
+  hideNetStatus();
+  showStall(false);
+  const desync = /consistency failure/i.test(what);
+  const el = overlay('enginestopped', desync ? 'THE PLAYERS\' GAMES WENT OUT OF STEP' : 'THE GAME STOPPED',
+    desync
+      ? 'Doom runs the same simulation on every player\'s machine, and two of them just ' +
+        'disagreed — so the game cannot continue. This means the players were not on ' +
+        'identical levels: everyone should reload the arena page (hard refresh) and start a new arena.'
+      : String(what).slice(0, 300), [
+      ['↻ RELOAD', location.href, true],
+      ['▶ PLAY THIS LEVEL SOLO', soloUrl(), false],
+      ['← BACK TO THE ARENA', '../arena/', false],
+    ]);
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'font-size:10px;color:#7fffd4;background:#060910;padding:8px;border-radius:4px;' +
+    'max-width:92vw;max-height:22vh;overflow:auto;text-align:left;white-space:pre-wrap';
+  pre.textContent = engineLog.slice(-8).join('\n');
+  el.appendChild(pre);
+}
+
+// Tell the other players we are going — the engine's jw_net_leave sends the
+// goodbye immediately and never waits. Without it a closed tab looks, to
+// everyone else, exactly like a stalled one: their games freeze until the
+// engine gives up on us. (Engines before E2 do not export it; they time out.)
+function leaveNetGame() {
+  try { if (qs.get('ws') && typeof Module._jw_net_leave === 'function') Module._jw_net_leave(); } catch (e) {}
+}
+window.addEventListener('pagehide', leaveNetGame);
+
+// Keep the screen on. A phone that dims and locks mid-game freezes this
+// player's engine, which stalls everyone else and — if it lasts — drops us.
+// The lock is released by the browser whenever the tab is hidden, so it is
+// re-taken on return and on every gesture.
+let wakeLock = null, running = false;
+async function holdScreenAwake() {
+  if (!running || wakeLock || document.hidden || !('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (e) { /* not allowed right now — the next gesture will retry */ }
+}
+function gameIsRunning() { running = true; holdScreenAwake(); }
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  holdScreenAwake();
+  // A hidden tab gets no frames, so the game — and everyone waiting on it —
+  // stood still. Worth knowing the first time it happens.
+  if (netLaunched && !engineDead && hiddenAt && Date.now() - hiddenAt > 3000 && qs.get('ws')) {
+    banner('While this tab was hidden your game was paused, and the other players had to wait for you.', 7000, true);
+  }
+});
 
 // Relay self-test shown on the connection-failure screen. It splits the two
 // possible causes apart so a bug report can be specific:
@@ -472,6 +831,7 @@ if (AudioCtor) {
   } catch (e) { audioCtx = null; }
 }
 function resumeAudio() {
+  holdScreenAwake();
   if (!audioCtx) return;
   if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
   updateSoundHint();
@@ -501,10 +861,18 @@ try { fitMode = localStorage.getItem('jerkwadFit') || 'fit'; } catch (e) {}
 function applyFit() { document.body.classList.toggle('fill', fitMode === 'fill'); }
 applyFit();
 
-// Hide the boot screen the moment the canvas starts rendering.
+// Hide the boot screen the moment the canvas starts rendering. "Rendering"
+// has to mean the ENGINE set the canvas up: a <canvas> is 300x150 before
+// anyone touches it, so the old test (width > 64) was true from the first
+// tick and the loading screen vanished half a second after page load — every
+// boot, including the whole 28 MB download, happened behind a black rectangle.
 const bootHider = setInterval(() => {
   const c = Module.canvas;
-  if (c.width > 64) { bootEl.classList.add('hidden'); clearInterval(bootHider); }
+  if (netFailed) { clearInterval(bootHider); return; }
+  if (Module.calledRun && c.width > 64 && !(c.width === 300 && c.height === 150)) {
+    bootEl.classList.add('hidden'); clearInterval(bootHider);
+    if (!qs.get('ws')) gameIsRunning();
+  }
 }, 500);
 
 // Build the final argument list, then inject the engine script.
@@ -520,7 +888,9 @@ const bootHider = setInterval(() => {
     }
   }
   if (userWadBytes && userWadBytes.byteLength <= 16) userWadBytes = null;
-  const args = ['-iwad', 'freedoom2.wad', '-nomusic'];
+  // -nogui: a fatal engine error is shown by this page (engineStopped), not by
+  // a blocking browser alert from inside the engine.
+  const args = ['-iwad', 'freedoom2.wad', '-nomusic', '-nogui'];
   let haveUserWad = !!userWadBytes;
   if (haveUserWad) args.push('-merge', 'shapeshifter.wad');
   if (qs.get('wad')) { args.push('-merge', 'extra.wad'); haveUserWad = true; }
@@ -544,6 +914,10 @@ const bootHider = setInterval(() => {
       args.push('-connect', '1');
     }
     if (qs.get('solo')) args.push('-solo-net');
+    // How long a silent player is waited for. The engine's default (30 s) is
+    // right for nearly everyone; ?timeout= tunes it without a rebuild.
+    const t = +qs.get('timeout');
+    if (t >= 4 && t <= 600) args.push('-nettimeout', String(Math.round(t)));
     hintEl.textContent = 'net: ' + ws;
   }
   const extra = qs.get('x');
@@ -562,7 +936,7 @@ const bootHider = setInterval(() => {
     : (wantsNet ? 'websockets-doom.js' : 'fast-doom.js');
   setBoot(8, 'loading engine (' + (engineFile === 'fast-doom.js' ? 'fast' : 'netplay') + ')…');
   const sc = document.createElement('script');
-  sc.src = engineFile;
+  sc.src = engineFile + '?v=' + ENGINE_BUILD;
   sc.onerror = () => setBoot(100, 'BOOT FAILED: engine script failed to load');
   document.body.appendChild(sc);
 })();

@@ -1,0 +1,88 @@
+diff --git a/src/net_server.c b/src/net_server.c
+index 627062c..a4aba9c 100644
+--- a/src/net_server.c
++++ b/src/net_server.c
+@@ -655,6 +655,27 @@ static void NET_SV_ParseSYN(net_packet_t *packet, net_client_t *client, net_addr
+         return;
+     }
+ 
++    // JERKWAD: and the same LEVEL. Nothing transfers a level between
++    // players here: each browser rebuilds it from a seed, and Doom's lockstep
++    // netcode then assumes all of them hold an identical map. When they did
++    // not (different browsers used to build different levels from one seed;
++    // a stale cached page still can), the game launched anyway, ran until the
++    // simulations drifted, hit "consistency failure" and quit on every
++    // machine at once — which looks exactly like everyone being kicked.
++    // Stock Chocolate Doom only WARNS about this, in a dialog this build
++    // never draws. Refuse the connection instead, and say why.
++    {
++        net_client_t *controller = NET_SV_Controller();
++
++        if (controller != NULL && controller != client && !data.drone &&
++            memcmp(data.wad_sha1sum, controller->wad_sha1sum, sizeof(sha1_digest_t)) != 0) {
++            NET_Log("server: error: client WAD checksum differs from the controller's");
++            NET_SV_SendReject(addr, "LEVEL MISMATCH - this browser built a different level than the host");
++            printf("doom: 14, turned away '%s': their level does not match this one\n", player_name);
++            return;
++        }
++    }
++
+     // Allocate a client slot if there isn't one already
+     if (client == NULL) {
+         // find a slot, or return if none found
+@@ -1521,7 +1542,11 @@ static void NET_SV_RunClient(net_client_t *client)
+         client->connection.disconnect_reason == NET_DISCONNECT_TIMEOUT) {
+         NET_Log("server: client at %s timed out", NET_AddrToString(client->addr));
+         NET_SV_BroadcastMessage("Client '%s' timed out and disconnected", client->name);
+-        printf("doom: 12, client '%s' timed out and disconnected", client->name);
++        printf("doom: 12, client '%s' timed out and disconnected\n", client->name);
++    }
++    else if (client->connection.state == NET_CONN_STATE_DISCONNECTED) {
++        // JERKWAD: a player who left on purpose is news too, not a fault.
++        printf("doom: 18, client '%s' left the game\n", client->name);
+     }
+ 
+     // Is this client disconnected?
+@@ -1673,6 +1698,30 @@ void NET_SV_Run(void)
+     }
+ }
+ 
++// JERKWAD: the server's half of jw_net_leave — tell every client the game is
++// over, now, without the five-second acknowledgement wait NET_SV_Shutdown
++// does. A client that hears this stops at once with "the host ended the
++// game"; one that does not would sit frozen until its timeout.
++
++void NET_SV_LeaveNow(void)
++{
++    net_packet_t *packet;
++    int i;
++
++    if (!server_initialized) {
++        return;
++    }
++
++    for (i = 0; i < MAXNETNODES; ++i) {
++        if (ClientConnected(&clients[i])) {
++            packet = NET_NewPacket(10);
++            NET_WriteInt16(packet, NET_PACKET_TYPE_DISCONNECT);
++            NET_Conn_SendPacket(&clients[i].connection, packet);
++            NET_FreePacket(packet);
++        }
++    }
++}
++
+ void NET_SV_Shutdown(void)
+ {
+     int i;
+diff --git a/src/net_server.h b/src/net_server.h
+index b9de745..273d340 100644
+--- a/src/net_server.h
++++ b/src/net_server.h
+@@ -29,6 +29,7 @@ void NET_SV_Run(void);
+ // Blocks until all clients disconnect, or until a 5 second timeout
+ 
+ void NET_SV_Shutdown(void);
++void NET_SV_LeaveNow(void);
+ 
+ // Add a network module to the context used by the server
+ 

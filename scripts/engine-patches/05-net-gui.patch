@@ -1,0 +1,16 @@
+diff --git a/src/net_gui.c b/src/net_gui.c
+index b17c95c..65b2cb0 100644
+--- a/src/net_gui.c
++++ b/src/net_gui.c
+@@ -207,6 +207,11 @@ static void CheckSHA1Sums(void)
+     }
+ 
+     if (!correct_wad) {
++        // JERKWAD: a current host refuses a mismatched player outright
++        // (net_server.c). This line covers joining a host on an older engine
++        // that still lets us in: the page stops here rather than start a game
++        // that is certain to fall apart.
++        printf("doom: 13, LEVEL MISMATCH - this browser built a different level than the host\n");
+         printf("Warning: WAD SHA1 does not match server:\n");
+         PrintSHA1Digest("Local", net_local_wad_sha1sum);
+         PrintSHA1Digest("Server", net_client_wait_data.wad_sha1sum);

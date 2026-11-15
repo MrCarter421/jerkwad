@@ -1,0 +1,272 @@
+# JerkWad Arena — quantum multiplayer Doom on yuccabucca.com
+
+`arena/` is a standalone page (no React, no build step at runtime) that
+generates multiplayer-ready ShapeShifter levels from two sliders and
+hosts/joins Chocolate Doom netgames over the Cloudflare WebSocket relay.
+
+```
+arena/index.html   — the page (sliders, automap, PLAY, Public toggle, lobby)
+arena/engine.js    — React-free bundle of the generator pipeline
+                     (rebuild: scripts/build_engine.js after editing
+                     wad_editor.jsx — same idea as index.html embedding)
+workers/doom-relay — relay + lobby Worker (deploy once, see below)
+```
+
+## How it works
+
+- **GENERATE** draws a 31-bit seed from `crypto.getRandomValues`, runs the
+  EtherWad generator (rooms slider → room count, enemies slider → monster
+  count; difficulty tier derives from enemy density), then layers the
+  multiplayer loadout on top: P1–P4 co-op starts at mutually-farthest
+  rooms, ≥4 deathmatch starts, shotgun/chaingun/rocket/plasma/chainsaw in
+  the biggest rooms with ammo flanking each, medikits, green + blue armor,
+  a backpack, and the Exit Pillar.
+- The page renders a classic **automap image** of the real generated
+  geometry (bright walls, faint passable lines, color-coded things).
+- **Determinism is the multiplayer trick**: the whole pipeline is seeded,
+  so a JOIN rebuilds the host's WAD locally, byte-for-byte, from just
+  `{seed, rooms, enemies}`. Nothing is uploaded anywhere.
+
+  "Byte-for-byte" has to hold **across browsers**, and until V0.57 it did
+  not: from one seed, Chrome (V8) and Safari / every iOS browser
+  (JavaScriptCore) built different WADs for 37% of levels, and Firefox for
+  100%. Doom's netcode is lockstep, so two players on different levels run
+  until their simulations drift, hit `consistency failure`, and both engines
+  quit — which looks exactly like "everyone got kicked". See *Why games
+  died* below. Two things now stand behind the claim:
+  - the pipeline uses nothing that differs between engines
+    (`scripts/check-determinism.js` runs it in three and compares bytes), and
+  - the host's engine **refuses** a joiner whose WAD checksum differs, with
+    a reason on both screens, instead of starting a game that must fail.
+    Host and joiners still need the same deployed version of the site; a
+    stale cached page is now a clear "LEVEL MISMATCH — reload" rather than
+    a mystery.
+- **PLAY** stores the WAD in IndexedDB and opens `play/` with
+  `-server -nodes N` pointed at a fresh relay room
+  (`/api/newroom` → `wss://…/api/ws/<room>`). The game starts when N
+  players are connected. **Public** additionally registers the level in
+  the lobby; **private** rooms never appear anywhere — the room id is
+  unguessable (Durable Object id + signature).
+- The **Public arenas** table polls `/api/lobby/list` every 12 s: name,
+  size, live player count (read from each room's Durable Object), and a
+  JOIN button that rebuilds the level and connects as a client.
+- No relay deployed / offline → the page degrades to solo PLAY.
+
+## Deploying the relay + lobby (one time)
+
+Run these on your OWN computer (Mac/Windows/Linux) with Node.js
+installed — NOT on the web host. Wrangler only uploads the Worker to
+Cloudflare's edge; the Worker never runs on your cPanel/shared host.
+
+```
+cd workers/doom-relay
+npx wrangler login                   # opens a browser to authorize
+npx wrangler secret put DOOM_KEY     # PROMPTS for the value — paste it, don't
+                                     # put it on the command line.
+                                     # generate one: openssl rand -hex 32
+npx wrangler deploy                  # routes doom.yuccabucca.com/* (see wrangler.toml)
+```
+
+Free plan note: `wrangler.toml` uses `new_sqlite_classes` for the two
+Durable Objects — the free Workers plan requires SQLite-backed DOs.
+(`new_classes` errors with `code: 10097`.) No code change needed; the
+storage API is identical.
+
+DNS: add a `doom` subdomain record in Cloudflare — Type `A`, Name
+`doom`, IPv4 `192.0.2.1` (a reserved placeholder; the Worker route
+intercepts before any origin), **Proxied** (orange cloud). Requires
+yuccabucca.com's DNS to be on Cloudflare's nameservers. The arena page
+defaults to `doom.yuccabucca.com`; override with `arena/?relay=other.host`
+for testing.
+
+## API summary (worker)
+
+```
+GET  /api/health                  → { ok, build, time }        is the relay live + which build
+GET  /api/echo   (WS upgrade)     → echoes frames back         WebSocket transport probe
+GET  /api/newroom                 → { room }                  create signed room id
+GET  /api/room/<room>             → { room, gameStarted, players }
+WS   /api/ws/<room>               → per-room packet relay (Durable Object)
+                                    frames are [to u32][from u32][payload];
+                                    to = FFFFFFFF is a ping the relay answers
+POST /api/lobby/register          → { ok }    body: { room, name, seed, rooms,
+                                               enemies, maxPlayers, dm }
+GET  /api/lobby/list              → { levels: [ …entry, players ] }
+```
+
+`health` and `echo` exist to diagnose "cannot connect". `health` is a plain GET
+that proves DNS + the Cloudflare route + the worker; `echo` is a WebSocket that
+proves the upgrade actually works through Cloudflare — the part a plain HTTPS
+check can't see. The play page's connection-failure screen runs both and shows
+which one broke:
+
+- both fail → DNS, the `doom.yuccabucca.com/*` route, or the worker is down.
+- health ok, echo fails → the worker was not redeployed with this code (the
+  pre-fix build 500s every upgrade), or WebSockets are disabled for the zone.
+- both ok but the game won't start → the Doom netgame layer, not the relay.
+  In practice this meant the host had already launched; see *Netgame notes*.
+
+**Diagnose from your own machine** (this repo, any Node 14+, no installs):
+
+```
+node scripts/check-relay.js
+```
+
+It tests DNS/route/worker, room signing, the WebSocket upgrade, and a real
+game socket separately, then tells you which layer broke and what to do.
+
+**Redeploy after pulling this** (`cd workers/doom-relay && npx wrangler deploy`,
+or `node scripts/deploy.js --worker`, which tests the relay first and checks
+the result). Confirm it took by opening `https://doom.yuccabucca.com/api/health`
+— it should report `"build":"relay-4"`. `DOOM_KEY` persists across deploys;
+don't re-set it. `node scripts/check-relay.js` now fails on an older build and
+says so; the arena page and the waiting screen both warn about one too.
+
+### Note on the Cloudflare WebSockets setting
+
+There is a toggle at **Network → WebSockets** in the dashboard, but it is ON by
+default on every plan including Free, so it is rarely the cause. If plain HTTPS
+to the relay works (the arena shows a green light) while WebSockets fail, the
+far more likely explanation is a worker still running the pre-fix code that
+called `routerObject.fetch(path, request)` with a relative URL string: the
+modern module-workers runtime rejects that and 500s every upgrade, while HTTPS
+routes keep working. Redeploying is the fix.
+
+Lobby entries expire after 4 h, or after 10 min with zero connected
+players. Room ids are signed with DOOM_KEY (vendored silentspacemarine
+scheme) so private rooms can't be enumerated.
+
+## Why games died — and what stops it now (V0.57 · engine E2 · page P13 · relay-4)
+
+The report was "the player and the network get kicked after about a minute".
+It was never Cloudflare cutting the connection: a two-player game on the live
+site, left alone, ran for minutes with one socket each and no closes. Three
+separate faults each ended a game the same way, and each needed a trigger —
+which is why it looked random.
+
+**1. The engine gave up on a silent player after four seconds.** The wasm port
+had cut Chocolate Doom's 30 s connection timeout to 4. Anything that stops one
+player's packets for a few seconds ended the game for everyone: a hidden tab
+(the frame loop is `requestAnimationFrame`, which a hidden tab does not get),
+a phone showing a notification or locking, a wifi→cellular handover, one bad
+stretch of signal. Measured, a **3 s** stall was already enough, because
+catching up afterwards takes time too. On screen: nothing — a frozen picture
+and a grey "disconnected" in the corner.
+→ The engine waits 30 s (`?timeout=N` to tune). The game **pauses** — both
+screens say "waiting for another player" — and resumes. The page holds a
+screen wake lock so a phone does not dim and lock mid-game.
+
+**2. A lost socket was never recovered.** The engine only reconnected if the
+browser told it the socket had closed, and did so with a blocking wait from
+inside its packet loop; the relay did not answer close handshakes, so a
+browser could sit in CLOSING forever; and relay-2 kept routing a player's uid
+to their dead socket even if they did come back.
+→ The engine reopens a socket in the background while the game runs (≈100 ms
+on a clean drop), and detects a *silently* dead one by pinging the relay
+(6 s). relay-4 follows a uid to its new socket, retires the old one, answers
+pings and closes.
+
+**3. The players were not always on the same level.** See *Determinism* above.
+→ Deterministic generator, plus the host refusing a mismatched joiner.
+
+A player who really is gone is still dropped — after 30 s if they vanish, at
+once if they leave normally (closing the tab now says goodbye). The others
+then play on.
+
+**Both halves must be deployed.** The site (pages + engine) fixes 1 and 3 on
+its own, and still works against the old relay. Recovery from a dropped
+socket (2) needs relay-4. The previous relay fix sat undeployed for three
+months because nothing said so; now the arena's status line, the waiting
+screen, `check-relay.js` and the deploy wizard's last step all do.
+
+### Testing it
+
+```
+npm install                        # once: puppeteer, ws, miniflare, esbuild
+node scripts/check-netplay.js      # ~10 min: every scenario below, played for real
+node scripts/dev-stack.js          # play it yourself on localhost, two windows
+```
+
+`check-netplay.js` runs `check-session.js --local` once per scenario: the real
+pages, the real WASM engine, and `workers/doom-relay/index.mjs` unmodified
+under workerd. Each fault is something a real session meets:
+
+| Scenario | What is done to the game | What must happen |
+|---|---|---|
+| `stall-joiner`, `stall-host` | a player's page is frozen 6 s (hidden tab, locked phone) | everyone waits, play resumes |
+| `net-stall` | all relay traffic held 5 s, then delivered | everyone waits, play resumes |
+| `drop` | a socket is closed from under the engine | reconnects; nobody notices |
+| `reset` | every connection is torn down (TCP reset) | both reconnect |
+| `zombie-joiner`, `zombie-host` | a connection goes silent *without* closing | noticed in ~6 s, reopened |
+| `leave-joiner`, `leave-host` | a player navigates away | the others are told within seconds, and why |
+| `mismatch` | the joiner builds a different level | refused before launch, reason on both screens |
+| `timeout`, `killed` (`--full`) | a player is gone 40 s / their browser is killed | dropped after a real 30 s wait |
+| `old-relay`, `old-relay-stall` | this engine on the previous relay build | still starts, still survives a stall |
+
+Against the **deployed** site: `node scripts/check-session.js` (add `STALL=6`
+etc. for the in-page faults). Against this checkout's site but the deployed
+relay: `RELAY=doom.yuccabucca.com node scripts/check-session.js --local`.
+
+Other pieces: `check-relay-logic.js` (the relay's protocol, 2 s, no browser),
+`check-determinism.js` (same bytes in V8 / JavaScriptCore / SpiderMonkey),
+`check-relay.js` (is the *deployed* relay reachable and current).
+
+## Netgame notes
+
+**The joiner-black-screen bug (build P10).** Vanilla Doom has no late join: once
+the server launches, anyone arriving is refused with "not in waiting start
+state" and lands on a black screen. The play page used to hand the host a
+single-tap START button in the top bar — and because Chocolate Doom's "waiting
+for players" screen is drawn by the textscreen library, which does NOT render
+to the canvas in this build, the host saw pure black, assumed a hang, and
+pressed it. That one tap started the match with nobody in it and locked out
+every joiner.
+
+`scripts/check-netgame.js` reproduces this end to end (real engine, two real
+browser pages, a local port of the relay's routing) and is the regression
+guard. Three scenarios:
+
+```
+node scripts/check-netgame.js                     # both peers must reach "game started"
+SCENARIO=earlystart node scripts/check-netgame.js # host taps START early: must NOT strand the joiner
+SCENARIO=forcestart node scripts/check-netgame.js # deliberate override: joiner must fail GRACEFULLY
+```
+
+**Mid-game disconnects (relay-3) — superseded.** relay-3 was a partial
+diagnosis and was never deployed; relay-4 contains it. It fixed the relay's
+half of a reconnect, but the test behind it closed sockets from the *server*
+side, which the engine happens to notice. A socket that dies any other way was
+still fatal, and the four-second timeout was not found at all. Kept for the
+record — the two relay bugs were real:
+
+- Sessions were keyed by uid and only ever ADDED when the uid was unknown. The
+  engine re-opens its socket after any blip (`net_websockets.c` clears
+  `inittedWebSockets` in `WebSocketClose` and on a failed send, then reconnects
+  on the next packet) and keeps the SAME uid — so the relay went on routing to
+  the dead socket, both peers fell silent, and Doom timed them out. The uid is
+  now rebound to whichever socket the packet actually arrived on.
+- The close handler assigned an **undeclared** `i`. Worker modules are strict
+  mode, so it threw `ReferenceError` on every close: sessions were never
+  cleaned up, and each disconnect added to the dashboard's error count.
+
+`SCENARIO=blip node scripts/check-netgame.js` severs a socket mid-game and
+asserts nobody is dropped. With `RELAY_LEGACY=1` (the pre-fix logic) it
+reproduces the failure exactly — `doom: 9, disconnected from server` on the
+joiner and `doom: 12, client timed out` on the host. `SCENARIO=sustain` holds a
+game for 40s. **These need a worker redeploy**; confirm with `/api/health`
+reporting `"build":"relay-3"`.
+
+The fix: the host's start control moved onto a WAITING FOR PLAYERS overlay that
+shows the live count from `/api/room/<room>`, and starting without everyone
+needs a second, explicitly-labelled tap. Joiners now handle `doom: 9`
+(disconnected) and `doom: 7` (connect failed), which previously had no handler
+at all — that is why a failed join sat on black with no solo escape.
+
+- The doom server peer is always uid **1** on the relay; joiners connect
+  with `-connect 1` (the WebSocket transport resolves addresses via
+  `atoi`). The play page handles this via `?join=1`.
+- Joiners don't pass `-warp/-skill/-deathmatch` — the server's settings
+  propagate at launch.
+- All peers must load the identical PWAD (see determinism above).
+- Chocolate Doom is vanilla: 4 players max, and the game only begins once
+  the host's `-nodes N` count is reached.

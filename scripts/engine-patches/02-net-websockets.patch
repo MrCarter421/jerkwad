@@ -1,0 +1,616 @@
+diff --git a/src/net_websockets.c b/src/net_websockets.c
+index 71a0028..d93cdd9 100644
+--- a/src/net_websockets.c
++++ b/src/net_websockets.c
+@@ -3,22 +3,66 @@
+ //
+ // DESCRIPTION:
+ //      Websockets network module for Chocolate Doom Wasm
+-
++//
++// JERKWAD: the connection handling in this file is rewritten. Doom's netcode
++// was written for UDP, where "the link" cannot go away; here the link is one
++// WebSocket through a relay, and it can. The original treated that as an
++// afterthought and it cost whole games:
++//
++//  * Reconnecting was a BLOCKING call made from inside SendPacket/RecvPacket
++//    (sleep a full second, poll, repeat up to six times) — i.e. it froze the
++//    game loop mid-frame for longer than the netcode's own timeout allowed.
++//  * A socket was only known to be dead if the browser said so. A half-open
++//    one (a NAT that forgot us, a network path that died without a FIN, a
++//    close handshake the far side never answered) looked "open" forever, so
++//    packets went into the void until the other players were timed out.
++//  * The receive queue held 64 packets, about 1.8 seconds of game traffic.
++//    One stalled frame overflowed it, and every packet that did not fit was
++//    dropped AND leaked.
++//
++// Now: the first connection still blocks (nothing else can happen until it is
++// up), but after that the socket is managed by a small non-blocking state
++// machine driven from the packet calls. A lost socket is reopened in the
++// background while the game keeps running; packets that have nowhere to go
++// are dropped, which Doom's own resend logic is built to absorb. Liveness is
++// measured against the RELAY (a ping it answers), not against the other
++// players, so a frozen peer is never mistaken for a dead link.
++
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "debug.h"
+ #include "doomtype.h"
+ #include "i_system.h"
++#include "i_timer.h"
+ #include "m_argv.h"
+ #include "m_misc.h"
+ #include "net_defs.h"
+ #include "net_packet.h"
+ #include "net_websockets.h"
+ #include "z_zone.h"
++#include <emscripten.h>
+ #include <emscripten/websocket.h>
+ 
+-#define MAX_QUEUE_SIZE 64
++// Game traffic is ~35 packets a second per peer; this is about ten seconds of
++// a four-player game.
++#define MAX_QUEUE_SIZE 1024
++
++#define MAX_ADDRS 64
++
++// A frame addressed to this uid is never delivered to a player. The relay
++// uses it only to learn which socket our uid is on now, and answers it with a
++// four-byte frame "from" the same address — a ping the relay itself answers.
++// An older relay that knows nothing about this simply finds nobody to deliver
++// it to, so sending it is always harmless.
++#define WS_ADDR_RELAY 0xffffffffu
++
++#define WS_PING_PERIOD_MS 2000
++#define WS_SILENCE_LIMIT_MS 6000    // no pong and no data for this long: dead
++#define WS_CONNECT_LIMIT_MS 8000    // a handshake that takes longer is abandoned
++#define WS_BACKOFF_MAX_MS 4000
+ 
+ extern uint32_t instanceUID;
+ 
+@@ -40,8 +84,8 @@ static packet_queue_t client_queue;
+ 
+ // addresses table
+ static int addrs_index = 0;
+-net_addr_t addrs[MAX_QUEUE_SIZE];
+-uint32_t ips[MAX_QUEUE_SIZE];
++net_addr_t addrs[MAX_ADDRS];
++uint32_t ips[MAX_ADDRS];
+ 
+ static void WebsocketsQueueInit(packet_queue_t *queue) { queue->head = queue->tail = 0; }
+ 
+@@ -53,8 +97,10 @@ static void WebsocketsQueuePush(packet_queue_t *queue, net_packet_t *packet, uin
+     new_tail = (queue->tail + 1) % MAX_QUEUE_SIZE;
+ 
+     if (new_tail == queue->head) {
+-        // queue is full
+-
++        // queue is full. The packet is ours to free: dropping the pointer
++        // (as this used to) leaked one allocation per packet for as long as
++        // the game loop stayed stalled.
++        NET_FreePacket(packet);
+         return;
+     }
+ 
+@@ -63,12 +109,6 @@ static void WebsocketsQueuePush(packet_queue_t *queue, net_packet_t *packet, uin
+     queue->tail = new_tail;
+ }
+ 
+-// WebSockets code
+-
+-static EMSCRIPTEN_WEBSOCKET_T websocket;
+-static EmscriptenWebSocketCreateAttributes attr;
+-static boolean inittedWebSockets = false;
+-
+ // Pops one packet from the queue
+ static ws_packet_t *WebsocketsQueuePop(packet_queue_t *queue)
+ {
+@@ -84,96 +124,318 @@ static ws_packet_t *WebsocketsQueuePop(packet_queue_t *queue)
+     return &wsp;
+ }
+ 
+-EM_BOOL WebSocketOpen(int eventType, const EmscriptenWebSocketOpenEvent *e, void *userData) { return 0; }
++// ---------------------------------------------------------------------------
++// The socket
++// ---------------------------------------------------------------------------
++
++static EMSCRIPTEN_WEBSOCKET_T websocket = 0;
++static EmscriptenWebSocketCreateAttributes attr;
++
++static boolean ws_started = false;    // the first connection has succeeded
++static boolean ws_open = false;       // the current socket is OPEN
++static boolean ws_connecting = false; // a handshake is in flight
++static int ws_generation = 0;         // which socket a callback belongs to
++static int ws_attempt_ms = 0;         // when the in-flight handshake began
++static int ws_retry_ms = 0;           // earliest time for the next attempt
++static int ws_failures = 0;           // consecutive attempts that never opened
++static int ws_last_rx_ms = 0;         // last frame received, of any kind
++static int ws_last_ping_ms = 0;
++static int ws_last_poll_ms = 0;      // last time WS_Poll ran at all
++static boolean ws_relay_pongs = false; // this relay answers pings
++static int ws_reconnects = 0;
++
++static void WS_ScheduleRetry(void)
++{
++    int delay = 0;
++
++    if (ws_failures > 0) {
++        delay = 250 << (ws_failures > 4 ? 4 : ws_failures - 1);
++
++        if (delay > WS_BACKOFF_MAX_MS) {
++            delay = WS_BACKOFF_MAX_MS;
++        }
++    }
++
++    ws_retry_ms = I_GetTimeMS() + delay;
++}
++
++// Raw frame: [to:u32][from:u32][payload]. Only ever called on an OPEN socket:
++// emscripten's send does not catch the exception a CONNECTING socket throws.
++static boolean WS_SendFrame(uint32_t to, const byte *data, int len)
++{
++    static char small[2048];
++    char *frame = small;
++    int r;
++
++    if (len + 8 > (int)sizeof(small)) {
++        frame = malloc(len + 8);
++
++        if (frame == NULL) {
++            return false;
++        }
++    }
++
++    memcpy(&frame[0], &to, 4);          // to
++    memcpy(&frame[4], &instanceUID, 4); // from
++
++    if (len > 0) {
++        memcpy(&frame[8], data, len);
++    }
++
++    r = emscripten_websocket_send_binary(websocket, frame, len + 8);
++
++    if (frame != small) {
++        free(frame);
++    }
++
++    return r >= 0;
++}
++
++static void WS_Ping(void)
++{
++    ws_last_ping_ms = I_GetTimeMS();
++    WS_SendFrame(WS_ADDR_RELAY, NULL, 0);
++}
++
++EM_BOOL WebSocketOpen(int eventType, const EmscriptenWebSocketOpenEvent *e, void *userData)
++{
++    if ((int)(intptr_t)userData != ws_generation) {
++        return 0;
++    }
++
++    ws_open = true;
++    ws_connecting = false;
++    ws_failures = 0;
++    ws_last_rx_ms = I_GetTimeMS();
++
++    if (ws_started) {
++        // A RECONNECT. First thing on the new socket: tell the relay our uid
++        // lives here now, so packets for us stop going to the old one. (The
++        // relay learns it from any frame; this makes it immediate instead of
++        // "whenever we next send".)
++        WS_Ping();
++
++        ++ws_reconnects;
++        printf("doom: 2, reconnected to the relay (%d)\n", ws_reconnects);
++    }
++
++    // Not on the FIRST connection, though. The host's first frame has to be
++    // its new-game announce: relay builds before relay-4 answer that announce
++    // by closing every socket they already know — and a ping sent ahead of it
++    // makes the host's own socket one of them. Against such a relay the game
++    // then could not even start. (Pings begin from WS_Poll, after the
++    // announce; the old relay ignores them.)
++
++    return 0;
++}
+ 
+ EM_BOOL WebSocketClose(int eventType, const EmscriptenWebSocketCloseEvent *e, void *userData)
+ {
+-    printf("doom: 5, ws close(eventType=%d, wasClean=%d, code=%d, reason=%s, userData=%d)\n", eventType, e->wasClean,
+-           e->code, e->reason, (int)userData);
+-    inittedWebSockets = false;
++    if ((int)(intptr_t)userData != ws_generation) {
++        return 0;
++    }
++
++    printf("doom: 5, ws close(wasClean=%d, code=%d, reason=%s)\n", e->wasClean, e->code, e->reason);
++
++    if (!ws_open) {
++        // never opened: a failed attempt, back off before the next one
++        ++ws_failures;
++    }
++
++    ws_open = false;
++    ws_connecting = false;
++    WS_ScheduleRetry();
++
+     return 0;
+ }
+ 
+ EM_BOOL WebSocketError(int eventType, const EmscriptenWebSocketErrorEvent *e, void *userData)
+ {
+-    printf("doom: 4, ws error(eventType=%d, userData=%d)\n", eventType, (int)userData);
++    if ((int)(intptr_t)userData != ws_generation) {
++        return 0;
++    }
++
++    printf("doom: 4, ws error\n");
+     return 0;
+ }
+ 
+ EM_BOOL WebSocketMessage(int eventType, const EmscriptenWebSocketMessageEvent *e, void *userData)
+ {
+-    // printf("message(eventType=%d, userData=%d, data=%p, numBytes=%d, isText=%d)\n", eventType, (int)userData,
+-    // e->data, e->numBytes, e->isText);
+-
+     net_packet_t *packet;
++    uint32_t ip;
++
++    if (e->isText || e->numBytes < 4) {
++        return 0;
++    }
++
++    ws_last_rx_ms = I_GetTimeMS();
++
++    ip = 0;
++    ip = ip | (uint32_t)e->data[3] << 24;
++    ip = ip | (uint32_t)e->data[2] << 16;
++    ip = ip | (uint32_t)e->data[1] << 8;
++    ip = ip | (uint32_t)e->data[0];
++
++    if (ip == WS_ADDR_RELAY) {
++        // the relay answering our ping — transport business, not a packet
++        ws_relay_pongs = true;
++        return 0;
++    }
+ 
+     packet = NET_NewPacket(e->numBytes - 4);
+     memcpy(packet->data, &e->data[4], e->numBytes - 4);
+     packet->len = e->numBytes - 4;
+ 
+-    uint32_t ip = 0;
+-    ip = ip | *(&e->data[3]) << 24;
+-    ip = ip | *(&e->data[2]) << 16;
+-    ip = ip | *(&e->data[1]) << 8;
+-    ip = ip | *(&e->data[0]);
+-
+     WebsocketsQueuePush(&client_queue, packet, ip);
+ 
+     return 0;
+ }
+ 
+-static boolean InitWebSockets(void)
++// Drop whatever socket we have and start a new handshake. Never blocks.
++static boolean WS_Begin(void)
+ {
+     int wss;
+ 
+-    if (inittedWebSockets == true) {
+-        return (true);
++    wss = M_CheckParmWithArgs("-wss", 1);
++
++    if (!wss) {
++        printf("-wss is missing\n");
++        return false;
+     }
+ 
+-    wss = M_CheckParmWithArgs("-wss", 1);
+-    printf("%d\n", wss);
++    if (websocket > 0) {
++        // delete() also detaches our callbacks, so a socket we have given up
++        // on can never report back into the state of its replacement.
++        emscripten_websocket_close(websocket, 1000, "replaced");
++        emscripten_websocket_delete(websocket);
++        websocket = 0;
++    }
++
++    ws_open = false;
++    ws_connecting = false;
++
++    emscripten_websocket_init_create_attributes(&attr);
++
++    attr.url = myargv[wss + 1];
++    // this doesn't work with some ws servers
++    // attr.protocols = "binary";
++
++    ++ws_generation;
++    websocket = emscripten_websocket_new(&attr);
++
++    if (websocket <= 0) {
++        websocket = 0;
++        return false;
++    }
++
++    emscripten_websocket_set_onopen_callback(websocket, (void *)(intptr_t)ws_generation, WebSocketOpen);
++    emscripten_websocket_set_onclose_callback(websocket, (void *)(intptr_t)ws_generation, WebSocketClose);
++    emscripten_websocket_set_onerror_callback(websocket, (void *)(intptr_t)ws_generation, WebSocketError);
++    emscripten_websocket_set_onmessage_callback(websocket, (void *)(intptr_t)ws_generation, WebSocketMessage);
++
++    ws_connecting = true;
++    ws_attempt_ms = I_GetTimeMS();
++
++    return true;
++}
++
++// The first connection. Blocking is right here: the game cannot begin, or
++// even say who it is, until the relay is reachable.
++static boolean InitWebSockets(void)
++{
++#ifdef JERKWAD_NO_ASYNCIFY
++    // The solo engine is built without ASYNCIFY and cannot wait.
++    printf("doom: 1, this engine build has no network support\n");
++    return false;
++#else
++    int attempt;
+ 
+-    if (wss) {
+-        emscripten_websocket_init_create_attributes(&attr);
++    if (ws_started) {
++        return true;
++    }
+ 
+-        attr.url = myargv[wss + 1];
+-        // this doesn't work with some ws servers
+-        // attr.protocols = "binary";
++    for (attempt = 0; attempt < 3; ++attempt) {
++        if (!WS_Begin()) {
++            break;
++        }
+ 
+-        websocket = emscripten_websocket_new(&attr);
+-        if (websocket <= 0) {
+-            return (false);
++        while (ws_connecting && I_GetTimeMS() - ws_attempt_ms < WS_CONNECT_LIMIT_MS) {
++            emscripten_sleep(50);
+         }
+ 
+-        emscripten_websocket_set_onopen_callback(websocket, (void *)42, WebSocketOpen);
+-        emscripten_websocket_set_onclose_callback(websocket, (void *)43, WebSocketClose);
+-        emscripten_websocket_set_onerror_callback(websocket, (void *)44, WebSocketError);
+-        emscripten_websocket_set_onmessage_callback(websocket, (void *)45, WebSocketMessage);
+-
+-        uint16_t readyState = 0;
+-        int retries = 6;
+-        do {
+-            emscripten_websocket_get_ready_state(websocket, &readyState);
+-            emscripten_sleep(1000);
+-            if (retries-- == 0 && readyState == 0) {
+-                printf("doom: 1, failed to connect to websockets server\n");
+-                return (false);
+-            }
+-        } while (readyState == 0);
+-
+-        if (readyState == 1) {
++        if (ws_open) {
+             printf("doom: 2, connected to %s\n", attr.url);
+-            inittedWebSockets = true;
+-            return (true);
++            ws_started = true;
++            return true;
+         }
+-        else {
+-            printf("doom: 1, failed to connect to websockets server\n");
+-            return (false);
++
++        emscripten_sleep(400);
++    }
++
++    printf("doom: 1, failed to connect to websockets server\n");
++    return false;
++#endif
++}
++
++// Keep the socket alive. Called from every send and receive, so it runs many
++// times a frame and must do nothing but compare a few integers on the happy
++// path.
++static void WS_Poll(void)
++{
++    int now;
++
++    if (!ws_started) {
++        return;
++    }
++
++    now = I_GetTimeMS();
++
++    // If WE were not running (a hidden tab gets no frames, a locked phone no
++    // CPU), the silence was ours, not the relay's: frames that arrived in the
++    // meantime are still waiting to be delivered to us. Start the clock again
++    // rather than throwing away a socket that is perfectly healthy.
++    if (now - ws_last_poll_ms > 1000) {
++        ws_last_rx_ms = now;
++    }
++
++    ws_last_poll_ms = now;
++
++    if (ws_open) {
++        if (now - ws_last_ping_ms >= WS_PING_PERIOD_MS) {
++            WS_Ping();
++        }
++
++        // Only a relay that answers pings can be judged by its silence. An
++        // older one says nothing on its own, and "nobody has sent me anything"
++        // is then also what waiting alone in a lobby looks like.
++        if (!ws_relay_pongs || now - ws_last_rx_ms < WS_SILENCE_LIMIT_MS) {
++            return;
+         }
++
++        printf("doom: 6, relay silent for %d ms, reopening the socket\n", now - ws_last_rx_ms);
++        ws_open = false;
++        ws_failures = 0;
++        ws_retry_ms = now;
+     }
+-    else {
+-        printf("-wss is missing\n");
+-        return (false);
++
++    if (ws_connecting) {
++        if (now - ws_attempt_ms < WS_CONNECT_LIMIT_MS) {
++            return;
++        }
++
++        // a handshake that never finished
++        ws_connecting = false;
++        ++ws_failures;
++        WS_ScheduleRetry();
++    }
++
++    if (now - ws_retry_ms < 0) {
++        return;
++    }
++
++    if (!WS_Begin()) {
++        ++ws_failures;
++        WS_ScheduleRetry();
+     }
+ }
+ 
+@@ -184,37 +446,33 @@ static boolean NET_Websockets_InitClient(void)
+     return true;
+ }
+ 
+-static uint32_t to_ip;
+-
+ static boolean NET_Websockets_InitServer(void)
+ {
+     if (InitWebSockets() == false) return false;
+     WebsocketsQueueInit(&client_queue);
+-    char *wspacket = malloc(8);
+-    to_ip = 0;
+-    memcpy(&wspacket[0], &to_ip, 4);       // to
+-    memcpy(&wspacket[4], &instanceUID, 4); // from
+-    emscripten_websocket_send_binary(websocket, wspacket, 8);
+-    free(wspacket);
++
++    // A frame to uid 0 from the server announces a NEW game: the relay clears
++    // the room. Sent here, once — never on a reconnect, which must not throw
++    // the players out of a game in progress.
++    WS_SendFrame(0, NULL, 0);
+     return true;
+ }
+ 
+ static void NET_Websockets_SendPacket(net_addr_t *addr, net_packet_t *packet)
+ {
+-    if (InitWebSockets() == false) return;
+-    char *wspacket = malloc(packet->len + 8);
+-
+-    if (addr->handle) {
+-        to_ip = (*(uint32_t *)(addr->handle));
+-        memcpy(&wspacket[0], &to_ip, 4);       // to
+-        memcpy(&wspacket[4], &instanceUID, 4); // from
+-        memcpy(&wspacket[8], packet->data, packet->len);
+-        int r = emscripten_websocket_send_binary(websocket, wspacket, packet->len + 8);
+-        if (r < 0) {
+-            printf("doom: 6, failed to send ws packet, reconnecting");
+-            inittedWebSockets = false;
+-        }
+-        free(wspacket);
++    WS_Poll();
++
++    // With no open socket the packet is simply lost. That is what UDP does
++    // too, and what Doom's resend requests exist for.
++    if (!ws_open || !addr->handle) {
++        return;
++    }
++
++    if (!WS_SendFrame(*(uint32_t *)(addr->handle), packet->data, packet->len)) {
++        printf("doom: 6, failed to send ws packet, reconnecting\n");
++        ws_open = false;
++        ws_failures = 0;
++        ws_retry_ms = I_GetTimeMS();
+     }
+ }
+ 
+@@ -222,17 +480,20 @@ static net_addr_t *FindAddressByIp(uint32_t ip)
+ {
+     // looks for address in the addresses table, or create a new one
+     // this should be a circular queue, but it's not, it's an hacky version
+-    // i'm assuming there won't be more than MAX_QUEUE_SIZE address during one gaming session
++    // i'm assuming there won't be more than MAX_ADDRS address during one gaming session
++    int i;
+ 
+-    // do we have it?
+-    for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
++    // do we have it? Only the slots handed out so far: the rest are zeroed,
++    // and scanning them made uid 0 "match" an address with no module — whose
++    // release then called through a null function pointer.
++    for (i = 0; i < addrs_index; i++) {
+         if (ips[i] == ip) {
+             return (&addrs[i]);
+         }
+     }
+     // nope, we need a new one
+-    if (addrs_index >= MAX_QUEUE_SIZE) {
+-        printf("doom: 3, we're out of client addresses");
++    if (addrs_index >= MAX_ADDRS) {
++        printf("doom: 3, we're out of client addresses\n");
+         return (0);
+     }
+     else {
+@@ -247,18 +508,28 @@ static net_addr_t *FindAddressByIp(uint32_t ip)
+ static boolean NET_Websockets_RecvPacket(net_addr_t **addr, net_packet_t **packet)
+ {
+     ws_packet_t *popped;
++    net_addr_t *from;
+ 
+-    if (InitWebSockets() == false) return false;
++    WS_Poll();
+ 
+-    popped = WebsocketsQueuePop(&client_queue);
++    for (;;) {
++        popped = WebsocketsQueuePop(&client_queue);
+ 
+-    if (popped != NULL) {
+-        *packet = popped->packet;
+-        *addr = FindAddressByIp((*(uint32_t *)(popped->from)));
+-        return true;
+-    }
++        if (popped == NULL) {
++            return false;
++        }
+ 
+-    return false;
++        from = FindAddressByIp((*(uint32_t *)(popped->from)));
++
++        if (from != NULL) {
++            *packet = popped->packet;
++            *addr = from;
++            return true;
++        }
++
++        // no address to attribute it to: the caller would dereference NULL
++        NET_FreePacket(popped->packet);
++    }
+ }
+ 
+ static void NET_Websockets_AddrToString(net_addr_t *addr, char *buffer, int buffer_len)
+@@ -266,7 +537,9 @@ static void NET_Websockets_AddrToString(net_addr_t *addr, char *buffer, int buff
+     M_snprintf(buffer, buffer_len, "ws client %u", (*(uint32_t *)(addr->handle)));
+ }
+ 
+-static void NET_Websockets_FreeAddress(net_addr_t *addr) { free(addr); }
++// Addresses live in the static table above for the life of the program; they
++// were never malloc'd, so there is nothing to free (this used to free() one).
++static void NET_Websockets_FreeAddress(net_addr_t *addr) {}
+ 
+ // this is only used to resolve the server address - hacky
+ static net_addr_t *NET_Websockets_ResolveAddress(const char *address)
+@@ -278,4 +551,3 @@ net_module_t net_websockets_module = {
+     NET_Websockets_InitClient,   NET_Websockets_InitServer,  NET_Websockets_SendPacket,     NET_Websockets_RecvPacket,
+     NET_Websockets_AddrToString, NET_Websockets_FreeAddress, NET_Websockets_ResolveAddress,
+ };
+-

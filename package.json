@@ -1,0 +1,20 @@
+{
+  "name": "jerkwad",
+  "version": "0.57.0",
+  "private": true,
+  "description": "Build and test tooling for JerkWad. The site itself ships no npm code: index.html, arena/ and play/ are static files (see DEPLOY.md).",
+  "scripts": {
+    "stack": "node scripts/dev-stack.js",
+    "netplay": "node scripts/check-netplay.js",
+    "soak": "node scripts/check-session.js",
+    "determinism": "node scripts/check-determinism.js",
+    "relay": "node scripts/check-relay-logic.js",
+    "deploy": "node scripts/deploy.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "miniflare": "^4.20260730.0",
+    "puppeteer": "^25.17.0",
+    "ws": "^8.23.0"
+  }
+}

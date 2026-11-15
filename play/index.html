@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>JerkWad Player — Chocolate Doom WASM</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0e1a">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden;
+    background: #0a0e1a; color: #c5d4e8;
+    font-family: system-ui, sans-serif; touch-action: none; }
+  #stage { position: fixed; inset: 0; display: flex;
+    align-items: center; justify-content: center; overflow: hidden; }
+  /* Desktop: centred at natural size. */
+  canvas { background: #000; max-width: 100vw; max-height: 100vh;
+    image-rendering: pixelated; display: block; }
+  /* Touch devices: the earlier build read canvas.width/height in JS to size
+     the frame, but the engine sets the backing store to a FIXED Doom
+     resolution independent of the screen — so that math produced a tiny box
+     on real phones. Instead let the canvas box fill the viewport and let the
+     browser's object-fit preserve the picture's aspect. object-fit reads the
+     canvas backing store as the intrinsic size, so `contain` letterboxes the
+     game at the largest UNDISTORTED size no matter what resolution the engine
+     picked — no JS, nothing to get wrong.
+       dvw/dvh track the viewport actually visible under the mobile browser
+     chrome (the address bar); vw/vh are the fallback for older engines.
+       !important beats the inline width/height SDL writes on the canvas. */
+  @media (pointer: coarse) {
+    canvas {
+      width: 100vw !important;  height: 100vh !important;
+      width: 100dvw !important; height: 100dvh !important;
+      max-width: none !important; max-height: none !important;
+      object-fit: contain;                /* FIT: keep aspect, letterbox */
+    }
+    body.fill canvas { object-fit: fill; } /* FILL: stretch edge to edge */
+  }
+  #boot { position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; z-index: 50;
+    background: #0a0e1a; transition: opacity 0.5s; padding: 24px; text-align: center; }
+  #boot h1 { color: #ff9d3d; letter-spacing: 0.2em; font-size: 20px; }
+  #boot .bar { width: min(420px, 80vw); height: 10px; border: 1px solid #243759;
+    border-radius: 5px; overflow: hidden; }
+  #boot .bar > div { height: 100%; width: 0%; background: #7fffd4; transition: width 0.2s; }
+  #boot .msg { font-size: 12px; color: #6b7d99; min-height: 2em; }
+  #boot.hidden { opacity: 0; pointer-events: none; }
+  .pad { position: fixed; z-index: 40; user-select: none; -webkit-user-select: none; }
+  .pad button { position: absolute; display: flex; align-items: center; justify-content: center;
+    background: rgba(20,32,51,0.55); color: #7fffd4; border: 1px solid rgba(127,255,212,0.5);
+    border-radius: 50%; font-size: 15px; font-weight: 700;
+    width: 58px; height: 58px; touch-action: none; }
+  .pad button:active, .pad button.on { background: rgba(127,255,212,0.35); }
+  #dpad { left: calc(env(safe-area-inset-left) + 14px); bottom: calc(env(safe-area-inset-bottom) + 20px);
+    width: 180px; height: 180px; }
+  #dpad .u { left: 61px; top: 0; }  #dpad .d { left: 61px; bottom: 0; }
+  /* Middle row = STRAFE, top corners = TURN. */
+  #dpad .l { left: 0; top: 61px; font-size: 11px; }
+  #dpad .r { right: 0; top: 61px; font-size: 11px; }
+  #dpad .tl { left: 0; top: 0; }
+  #dpad .tr { right: 0; top: 0; }
+  #acts { right: calc(env(safe-area-inset-right) + 14px); bottom: calc(env(safe-area-inset-bottom) + 20px);
+    width: 190px; height: 200px; }
+  #acts .fire { right: 0; bottom: 62px; width: 72px; height: 72px; color: #ff5c5c; border-color: rgba(255,92,92,0.55); }
+  #acts .use  { right: 84px; bottom: 8px; }
+  #acts .run  { right: 84px; bottom: 72px; font-size: 11px; color: #9fd0ff; border-color: rgba(159,208,255,0.55); }
+  #acts .run.on { background: rgba(159,208,255,0.42); color: #eaf4ff; }
+  #acts .wpn  { right: 84px; bottom: 136px; font-size: 11px; color: #ffb74d; border-color: rgba(255,183,77,0.55); }
+  #topbar { position: fixed; top: calc(env(safe-area-inset-top) + 8px); right: 10px; z-index: 40;
+    display: flex; gap: 6px; }
+  #topbar button { background: rgba(20,32,51,0.55); color: #c5d4e8; border: 1px solid #243759;
+    border-radius: 4px; font-size: 11px; padding: 7px 10px; }
+  #hint { position: fixed; top: calc(env(safe-area-inset-top) + 8px); left: 10px;
+    font-size: 10px; color: #6b7d99; z-index: 40; max-width: 50vw; }
+  /* Non-blocking notices over a running game: "waiting for another player",
+     "X left the game". pointer-events:none so they never eat a tap. */
+  #netbanner { position: fixed; top: calc(env(safe-area-inset-top) + 44px); left: 50%;
+    transform: translateX(-50%); z-index: 45; pointer-events: none; display: none;
+    background: rgba(10,14,26,0.86); border: 1px solid #ff9d3d; color: #ffcf99;
+    border-radius: 6px; padding: 8px 14px; font-size: 12px; font-weight: 700;
+    letter-spacing: .06em; text-align: center; max-width: 92vw; }
+  #netbanner.info { border-color: #243759; color: #c5d4e8; font-weight: 400; }
+  @media (hover: hover) and (pointer: fine) {
+    /* Desktop: hide touch pads (keyboard play) */
+    .pad { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="boot">
+  <h1>JERKWAD PLAYER</h1>
+  <div class="bar"><div id="bootbar"></div></div>
+  <div class="msg" id="bootmsg">loading engine…</div>
+  <div class="msg" style="opacity:0.5">player build P13</div>
+</div>
+<div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
+<div id="hint"></div>
+<div id="netbanner"></div>
+<div id="topbar">
+  <button id="btn-sound" style="display:none; background:#ffb74d; color:#0a0e1a; font-weight:700">🔈 SOUND</button>
+  <button id="btn-fit">FIT</button>
+  <button id="btn-fs">FULLSCREEN</button>
+  <button id="btn-esc">MENU</button>
+  <button id="btn-yes">Y</button>
+  <button id="btn-enter">ENTER</button>
+</div>
+<div class="pad" id="dpad">
+  <button class="u" data-key="38">▲</button>
+  <button class="d" data-key="40">▼</button>
+  <!-- Strafe sits on the main left/right (the positions your thumb rests on);
+       turning moved up to the corners. -->
+  <button class="l" data-key="188">⟨STR</button>
+  <button class="r" data-key="190">STR⟩</button>
+  <button class="tl" data-key="37">◀</button>
+  <button class="tr" data-key="39">▶</button>
+</div>
+<div class="pad" id="acts">
+  <button class="fire" data-key="17">FIRE</button>
+  <button class="use"  data-key="32">USE</button>
+  <button class="run"  id="btn-run">RUN</button>
+  <button class="wpn"  id="btn-wpn">WPN</button>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// JerkWad browser player. Boots Chocolate Doom (cloudflare/doom-wasm fork,
+// WebSockets netplay build) with freedoom2.wad as the IWAD and — when
+// present — the last WAD exported from ShapeShifter, read from IndexedDB
+// (db 'jerkwad', store 'wads', key 'current'; written by the DOOM button).
+//
+// Query params:
+//   ?wad=<url>        also merge a PWAD fetched from a URL
+//   ?warp=N           warp to MAPxx (default 1 when a user WAD is loaded)
+//   ?skill=N          1-5 (default 3)
+//   ?ws=wss://host    WebSocket relay (Cloudflare Worker) for multiplayer
+//   ?server=1         host a netgame (with ?ws)
+//   ?join=1           join a netgame (with ?ws)
+//   ?nodes=N          number of players expected when hosting (default 2)
+//   ?solo=1           -solo-net (test netgame alone)
+//   ?timeout=N        seconds a silent player is waited for before being
+//                     dropped (engine default 30; 4-600)
+// ---------------------------------------------------------------------------
+const qs = new URLSearchParams(location.search);
+
+// Bump whenever play/*-doom.{js,wasm} are rebuilt. Browsers cache those by
+// URL, and a player still running last month's engine has last month's
+// netcode no matter what this page says. With the build in the URL a new
+// deploy takes effect on the next page load, not whenever a cache expires.
+const ENGINE_BUILD = 'E2';
+// The oldest relay this page's netcode is whole against. Recovering from a
+// dropped socket needs the relay to follow a returning player to their new
+// socket; relay-2 could not, and neither it nor relay-3 answered a close.
+const RELAY_MIN_BUILD = 4;
+window.addEventListener('error', (e) => {
+  try { setBoot(100, 'ERROR: ' + (e.message || e.type) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '')); } catch (x) {}
+  // A WebAssembly trap means the engine is gone. (Ordinary page errors are
+  // not: do not put a "the game stopped" screen over a game that is fine.)
+  try {
+    if (/RuntimeError|out of bounds|unreachable|null function|table index/i.test(e.message || '')) {
+      engineStopped('The game engine crashed: ' + e.message);
+    }
+  } catch (x) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { setBoot(100, 'ERROR: ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason))); } catch (x) {}
+});
+const bootEl = document.getElementById('boot');
+const bootBar = document.getElementById('bootbar');
+const bootMsg = document.getElementById('bootmsg');
+const hintEl = document.getElementById('hint');
+const setBoot = (pct, msg) => { bootBar.style.width = pct + '%'; if (msg) bootMsg.textContent = msg; };
+
+function readUserWad() {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open('jerkwad', 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore('wads'); };
+      req.onsuccess = () => {
+        try {
+          const tx = req.result.transaction('wads', 'readonly');
+          const get = tx.objectStore('wads').get('current');
+          get.onsuccess = () => resolve(get.result || null);
+          get.onerror = () => resolve(null);
+        } catch (e) { resolve(null); }
+      };
+      req.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+
+// The page could not get as far as starting the engine. Say why, keep saying
+// it, and offer the one thing that helps.
+function bootFailed(msg) {
+  netFailed = true;                      // nothing may cover or hide this now
+  bootEl.classList.remove('hidden');
+  setBoot(100, msg);
+  if (!document.getElementById('boot-reload')) {
+    const a = document.createElement('a');
+    a.id = 'boot-reload';
+    a.textContent = '↻ TRY AGAIN';
+    a.href = location.href;
+    a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
+      'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
+    bootEl.appendChild(a);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One download, with a pulse. The IWAD is 28 MB: on a phone it is the step
+// most likely to stall — and a stall here used to be forever, and invisible
+// (a bare `await fetch()` has no timeout, and nothing showed how far it had
+// got). Now the bar moves as bytes arrive; if nothing arrives for 20 s the
+// transfer is abandoned and started again, twice, before giving up with a
+// message.
+// ---------------------------------------------------------------------------
+async function download(url, label, lo, hi) {
+  // (?stallms= shortens the patience so scripts/check-boot.js need not wait a
+  // minute to see a give-up; never below 2 s.)
+  const STALL_MS = Math.max(2000, +qs.get('stallms') || 20000);
+  for (let attempt = 1; ; attempt++) {
+    const ctl = new AbortController();
+    let timer = setTimeout(() => ctl.abort(), STALL_MS);            // no answer at all
+    try {
+      const res = await fetch(url, { signal: ctl.signal, cache: attempt > 1 ? 'reload' : 'default' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      // Content-Length is the size ON THE WIRE; it is only the size of the
+      // data if the server did not compress it.
+      const total = res.headers.get('content-encoding') ? 0 : (+res.headers.get('content-length') || 0);
+      if (!res.body || !res.body.getReader) {                         // very old browser
+        const all = new Uint8Array(await res.arrayBuffer());
+        clearTimeout(timer);
+        return all;
+      }
+      const reader = res.body.getReader();
+      // Known size: write straight into the final buffer, so peak memory is
+      // one copy (it matters on a phone). Unknown: collect, then join.
+      let out = total ? new Uint8Array(total) : null, parts = [], got = 0;
+      for (;;) {
+        clearTimeout(timer);
+        timer = setTimeout(() => ctl.abort(), STALL_MS);              // no progress
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (out && got + value.length <= out.length) out.set(value, got);
+        else { if (out) { parts.push(out.subarray(0, got)); out = null; } parts.push(value); }
+        got += value.length;
+        setBoot(lo + (hi - lo) * (total ? Math.min(1, got / total) : 0.5),
+          'downloading ' + label + '… ' + (got / 1048576).toFixed(0) + (total ? ' / ' + (total / 1048576).toFixed(0) : '') + ' MB');
+      }
+      clearTimeout(timer);
+      if (out && got === out.length) return out;
+      if (out) return out.slice(0, got);
+      const joined = new Uint8Array(got);
+      let off = 0;
+      for (const part of parts) { joined.set(part, off); off += part.length; }
+      return joined;
+    } catch (e) {
+      clearTimeout(timer);
+      const why = e && e.name === 'AbortError' ? 'the download stalled' : (e && e.message) || String(e);
+      if (attempt >= 3) throw new Error(label + ' could not be downloaded (' + why + ')');
+      setBoot(lo, label + ': ' + why + ' — trying again (' + attempt + ' of 2)…');
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+}
+
+// Engine args must be FINAL before websockets-doom.js is evaluated —
+// emscripten snapshots Module.arguments at script load, so we build the
+// arg list (async IndexedDB read included) first and inject the engine
+// script dynamically afterwards. The binary file staging happens in
+// preRun (it needs the runtime FS object).
+let userWadBytes = null;
+
+var Module = {
+  canvas: document.getElementById('canvas'),
+  arguments: [],           // finalized in boot() before script injection
+  preRun: [function () {
+    // Block run() until the IWAD + optional PWADs are staged into MEMFS.
+    Module.addRunDependency('jerkwad-files');
+    (async function stage() {
+      try {
+        let iwad = await download('freedoom2.wad', 'game data', 30, 58);
+        // canOwn=true (6th arg): MEMFS takes the typed array instead of
+        // copying it — halves peak memory for the 28 MB IWAD, which matters
+        // a lot on memory-constrained mobile browsers.
+        FS.createDataFile('/', 'freedoom2.wad', iwad, true, true, true);
+        setBoot(60, 'IWAD staged (' + (iwad.length >> 20) + ' MB)');
+        iwad = null;   // drop our reference; MEMFS owns it now
+        if (userWadBytes) {
+          FS.createDataFile('/', 'shapeshifter.wad', new Uint8Array(userWadBytes), true, true, true);
+          setBoot(70, 'ShapeShifter WAD staged (' + userWadBytes.byteLength + ' bytes)');
+          userWadBytes = null;   // free the level bytes after staging
+        }
+        const wadUrl = qs.get('wad');
+        if (wadUrl) {
+          setBoot(75, 'fetching ' + wadUrl + '…');
+          FS.createDataFile('/', 'extra.wad', await download(wadUrl, 'level', 75, 88), true, true, true);
+        }
+        setBoot(90, 'starting: ' + Module.arguments.join(' '));
+      } catch (e) {
+        // Do NOT release the run dependency. There is nothing for the engine
+        // to run, and letting it start anyway (as this used to) buried the
+        // real reason under whatever the engine then complained about — and
+        // its start-up hid this screen.
+        bootFailed('BOOT FAILED: ' + e.message);
+        return;
+      }
+      Module.removeRunDependency('jerkwad-files');
+    })();
+  }],
+  // The .wasm is fetched by the glue script; give it the same build stamp.
+  locateFile: (path, dir) => dir + path + '?v=' + ENGINE_BUILD,
+  print: (t) => {
+    console.log(t);
+    logLine(t);
+    // Engine protocol lines: "doom: N, message"
+    const m = /^doom: (\d+),\s*(.*)$/.exec(t);
+    if (m) return onDoomStatus(+m[1], m[2]);
+    // A fatal engine error (visplane overflow, etc.) prints here right before
+    // the runtime exits — surface it on the (re-shown) boot screen instead of
+    // leaving a silent black canvas, so crashes are diagnosable.
+    if (/I_Error|R_Error|overflow|Error:/i.test(t)) {
+      bootEl.classList.remove('hidden');
+      setBoot(100, 'ENGINE: ' + t.slice(0, 120));
+    }
+  },
+  // stderr used to go to the browser console only — which on a phone is
+  // nowhere. It is where the engine explains a fatal error, so keep it.
+  printErr: (t) => { console.warn(t); logLine('! ' + t); },
+  onRuntimeInitialized: () => setBoot(95, 'engine ready'),
+  // The engine quit (a fatal error, or QUIT from Doom's own menu). An older
+  // engine build says nothing first; a current one has already printed
+  // "doom: 17" and this is a no-op.
+  onExit: (code) => { if (code) engineStopped('The game engine stopped unexpectedly (exit ' + code + ').'); },
+  onAbort: (what) => engineStopped('The game engine crashed' + (what ? ': ' + what : '.')),
+  // Re-assert a latched RUN once the engine exists: the keydown sent before
+  // boot went nowhere.
+  postRun: [() => { if (!netFailed) bootEl.classList.add('hidden'); if (runLocked) applyRunLock(); }],
+};
+
+// Keep the engine's own words. When a boot or a netgame handshake stalls,
+// this tail is the only thing that says WHERE — and it can be screenshotted
+// off a phone, which a devtools console cannot.
+function logLine(t) {
+  // The engine draws startup progress bars with backspaces; a <pre> shows
+  // those as a row of boxes.
+  t = String(t).replace(/[\x00-\x08\x0b-\x1f]+/g, '').trim();
+  if (!t) return;
+  engineLog.push(t.length > 160 ? t.slice(0, 160) + '…' : t);
+  if (engineLog.length > 60) engineLog.shift();
+  const lg = document.getElementById('netlog');
+  if (lg) lg.textContent = engineLog.slice(-10).join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// ENGINE STATUS LINES — "doom: N, text". The engine's side of every network
+// event a player can be affected by; this turns each into something a person
+// can read. Before P13 only 1, 7, 9 and 10 were handled, and 7/9 only before
+// launch — so anything that went wrong DURING a game was a frozen picture.
+//
+//    1  could not reach the relay            10  game started
+//    2  connected / reconnected              12  (host) a player timed out
+//    4  socket error                         13  refused by the host: <why>
+//    5  socket closed (it will reconnect)    14  (host) turned a player away
+//    6  socket silent/failed, reopening      15  waiting for another player
+//    7  connect failed                       16  game resumed
+//    8  our uid                              17  fatal engine error: <what>
+//    9  disconnected from the host (<why>)   18  (host) a player left
+// ---------------------------------------------------------------------------
+function onDoomStatus(code, msg) {
+  if (code !== 15 && code !== 16) hintEl.textContent = msg;
+  switch (code) {
+    case 10:
+      hintEl.textContent = 'net game started';
+      netLaunched = true; hideNetStatus(); gameIsRunning();
+      break;
+    case 1:
+      // A netgame with no socket at all cannot begin — stop and offer solo.
+      if (qs.get('ws')) {
+        netFailure('RELAY CONNECTION FAILED — the game socket could not reach ' +
+          (qs.get('ws') || '').replace(/^wss?:\/\//, '').split('/')[0] + '.', true);
+      }
+      break;
+    case 13:
+      // The host's engine refused us, and said why.
+      if (qs.get('ws')) netFailure(refusalText(msg), false, true);
+      break;
+    case 7:
+    case 9:
+      if (!qs.get('ws')) break;
+      if (!netLaunched) {
+        // Before launch. (A current engine has usually already said why with a
+        // "13"; netFailure keeps the first, more specific, message.)
+        netFailure(qs.get('join')
+          ? 'COULD NOT JOIN — the host has already started this game. Vanilla ' +
+            'Doom cannot join a match in progress, so ask the host to start a ' +
+            'fresh arena and join before they launch.'
+          : 'LOST THE CONNECTION to the relay.', false);
+      } else if (code === 9) {
+        showStall(false);
+        showNetLost(msg);
+      }
+      break;
+    case 5:
+    case 6:
+      if (netLaunched) hintEl.textContent = 'connection dropped — reconnecting…';
+      break;
+    case 2:
+      if (netLaunched) { hintEl.textContent = 'reconnected'; banner('Reconnected', 2500, true); }
+      break;
+    case 12:
+      banner((msg.match(/'([^']*)'/) || [0, 'A player'])[1] + ' dropped out (no response) — the game goes on', 6000, true);
+      break;
+    case 18:
+      banner((msg.match(/'([^']*)'/) || [0, 'A player'])[1] + ' left the game', 5000, true);
+      break;
+    case 14:
+      turnedAway++; renderNetStatus();
+      break;
+    case 15: showStall(true); break;
+    case 16: showStall(false); break;
+    case 17: engineStopped(msg); break;
+  }
+}
+
+function refusalText(reason) {
+  if (/LEVEL MISMATCH/i.test(reason)) {
+    return 'LEVEL MISMATCH — this browser built a different level than the host\'s, so the ' +
+      'two games could never stay in step. Both players: reload the arena page ' +
+      '(a hard refresh, so everyone is on the same version), then start a new arena.';
+  }
+  if (/not currently accepting/i.test(reason)) {
+    return 'COULD NOT JOIN — the host has already started this game. Vanilla Doom ' +
+      'cannot join a match in progress, so ask the host to start a fresh arena ' +
+      'and join before they launch.';
+  }
+  if (/full/i.test(reason)) return 'COULD NOT JOIN — this arena is full.';
+  return 'COULD NOT JOIN — ' + reason;
+}
+
+// ---------------------------------------------------------------------------
+// NETGAME LOBBY STATUS.};
+
+// ---------------------------------------------------------------------------
+// NETGAME LOBBY STATUS.
+//
+// Chocolate Doom's "waiting for players" screen is drawn by the textscreen
+// library, which does not render to the canvas in this build — so a host sat
+// looking at pure black, assumed it had hung, and pressed START. That begins
+// the match with one player, and vanilla Doom has NO late join, so every
+// subsequent joiner is refused ("not in waiting start state") and lands on a
+// black screen of its own. That single interaction was the whole multiplayer
+// bug. So: show the real player count, and refuse to start early by accident.
+// ---------------------------------------------------------------------------
+let netLaunched = false;
+const engineLog = [];
+const wsParam = qs.get('ws') || '';
+const relayOrigin = wsParam.replace(/^ws/, 'http').replace(/\/api\/ws\/.*$/, '');
+const roomId = (wsParam.match(/\/api\/ws\/([^/?]+)/) || [])[1] || null;
+const wantNodes = Math.max(2, +(qs.get('nodes') || 2));
+let playersIn = 0;
+let netFailed = false;        // a failure screen is up; nothing may cover it
+let engineDead = false;       // the engine has exited; nothing can resume
+let turnedAway = 0;           // (host) players refused for a mismatched level
+let relayBuild = null;        // e.g. "relay-4", from /api/health
+let relayOutdated = false;
+
+function netStatusEl() {
+  let el = document.getElementById('netstatus');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'netstatus';
+    el.style.cssText = 'position:fixed;inset:0;z-index:46;display:flex;flex-direction:column;' +
+      'align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px;' +
+      'background:rgba(10,14,26,0.94);color:#c5d4e8;font-size:14px;line-height:1.6';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function hideNetStatus() { const el = document.getElementById('netstatus'); if (el) el.remove(); }
+
+function soloUrl() {
+  const solo = new URLSearchParams(location.search);
+  solo.delete('ws'); solo.delete('server'); solo.delete('join');
+  solo.delete('nodes'); solo.delete('dm');
+  return location.pathname + '?' + solo.toString();
+}
+
+function renderNetStatus() {
+  // (The room poll keeps calling this; once the game has launched, failed or
+  // died there is nothing to wait for and it must not redraw underneath.)
+  if (netLaunched || netFailed || engineDead) return hideNetStatus();
+  const el = netStatusEl();
+  const isHost = !!qs.get('server');
+  // HONEST LABEL. This number is how many WebSockets the relay has for this
+  // room — NOT how many players Doom has finished its handshake with. Calling
+  // it "players" made a stuck handshake look like a full lobby that simply
+  // refused to start.
+  el.innerHTML =
+    '<div style="color:#ff9d3d;letter-spacing:.18em;font-weight:700">' +
+      (isHost ? 'WAITING TO START' : 'WAITING FOR THE HOST') + '</div>' +
+    '<div style="font-size:30px;font-weight:700;color:#7fffd4">' +
+      playersIn + ' / ' + wantNodes + '</div>' +
+    '<div style="color:#6b7d99;font-size:11px">relay connections (not confirmed Doom players)</div>' +
+    (turnedAway
+      ? '<div style="color:#ffb74d;font-size:12px;max-width:34em">⚠ A player was turned away: their ' +
+        'browser built a different level than yours. Ask them to reload the arena page ' +
+        '(hard refresh) and join again.</div>' : '') +
+    (relayOutdated
+      ? '<div style="color:#ffb74d;font-size:12px;max-width:34em">⚠ The relay is running an old build (' +
+        relayBuild + '). On it, a connection that drops mid-game cannot recover. Redeploy the ' +
+        'worker: <code>cd workers/doom-relay &amp;&amp; npx wrangler deploy</code></div>' : '') +
+    '<div style="color:#6b7d99;font-size:12px;max-width:34em">' +
+      (isHost
+        ? 'The match starts by itself once Doom has everyone. If this sticks, the ' +
+          'engine log below shows where it stopped.'
+        : 'Connected. The host\'s game starts automatically once everyone is in.') +
+    '</div>' +
+    '<pre id="netlog" style="font-size:10px;color:#7fffd4;background:#060910;padding:8px;' +
+      'border-radius:4px;max-width:92vw;max-height:22vh;overflow:auto;text-align:left;' +
+      'white-space:pre-wrap;margin-top:4px"></pre>';
+  const pre = el.querySelector('#netlog');
+  if (pre) pre.textContent = engineLog.slice(-10).join('\n') || '(waiting for the engine…)';
+
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px';
+  if (isHost) {
+    const b = document.createElement('button');
+    const ready = playersIn >= wantNodes;
+    b.textContent = ready ? '▶ START NOW' : '▶ START ANYWAY (locks others out)';
+    b.style.cssText = 'padding:11px 18px;border:0;border-radius:5px;font-weight:700;' +
+      'font-size:13px;background:' + (ready ? '#7fff7f' : '#33405c') + ';color:' +
+      (ready ? '#0a0e1a' : '#c5d4e8');
+    // Starting without everyone still needs TWO taps — a single tap on a black
+    // screen is how the game kept launching with nobody in it, locking joiners
+    // out for good. When the relay shows everyone present it is one tap.
+    let armed = ready;
+    b.onclick = () => {
+      if (!armed) { armed = true; b.textContent = '▶ TAP AGAIN TO START WITHOUT THEM'; b.style.background = '#ff9d3d'; b.style.color = '#0a0e1a'; return; }
+      sendKey('keydown', 32); setTimeout(() => sendKey('keyup', 32), 80);
+      b.disabled = true; b.textContent = 'STARTING…';
+    };
+    row.appendChild(b);
+  }
+  // Always an escape. The arena's Players dropdown DEFAULTS TO 2, so anyone
+  // who just wants to play alone lands on this screen and used to be stuck
+  // here with no way out once the old top-bar START button was removed.
+  const solo = document.createElement('a');
+  solo.textContent = '▶ PLAY SOLO INSTEAD';
+  solo.href = soloUrl();
+  solo.style.cssText = 'padding:11px 18px;border-radius:5px;font-weight:700;font-size:13px;' +
+    'background:#7fffd4;color:#0a0e1a;text-decoration:none';
+  row.appendChild(solo);
+  el.appendChild(row);
+}
+
+async function pollRoom() {
+  if (netLaunched || !roomId || !relayOrigin) return;
+  try {
+    const r = await fetch(relayOrigin + '/api/room/' + roomId, { cache: 'no-store' });
+    if (r.ok) { const j = await r.json(); playersIn = j.players | 0; }
+  } catch (e) { /* transient — keep the last count */ }
+  renderNetStatus();
+}
+// Which relay are we on? An outdated one still relays, but cannot re-route a
+// player who reconnects — worth saying BEFORE the game, not after it dies.
+async function checkRelayBuild() {
+  if (!relayOrigin) return;
+  try {
+    const r = await fetch(relayOrigin + '/api/health', { cache: 'no-store' });
+    const j = await r.json();
+    relayBuild = String(j.build || '?');
+    relayOutdated = (+(relayBuild.match(/(\d+)/) || [0, 0])[1]) < RELAY_MIN_BUILD;
+  } catch (e) { /* unreachable — the game socket will report that itself */ }
+  if (relayOutdated) renderNetStatus();
+}
+if (qs.get('ws') && (qs.get('server') || qs.get('join'))) {
+  renderNetStatus();
+  setInterval(pollRoom, 2000);
+  pollRoom();
+  checkRelayBuild();
+} else {
+  // SOLO watchdog. If the engine has not reported "game started" a good while
+  // after boot, show its log rather than leaving a black screen with nothing
+  // to report. Costs nothing when the game is running normally.
+  setTimeout(() => {
+    if (netLaunched) return;
+    const el = netStatusEl();
+    el.innerHTML =
+      '<div style="color:#ff9d3d;letter-spacing:.18em;font-weight:700">GAME DID NOT START</div>' +
+      '<div style="color:#6b7d99;font-size:12px;max-width:34em">The engine loaded but never' +
+      ' reported "game started". Its last words:</div>' +
+      '<pre id="netlog" style="font-size:10px;color:#7fffd4;background:#060910;padding:8px;' +
+        'border-radius:4px;max-width:92vw;max-height:40vh;overflow:auto;text-align:left;' +
+        'white-space:pre-wrap"></pre>';
+    el.querySelector('#netlog').textContent =
+      engineLog.slice(-16).join('\n') || '(the engine printed nothing at all)';
+    const again = document.createElement('a');
+    again.textContent = '↻ RELOAD';
+    again.href = location.href;
+    again.style.cssText = 'padding:11px 18px;border-radius:5px;font-weight:700;font-size:13px;' +
+      'background:#7fffd4;color:#0a0e1a;text-decoration:none';
+    el.appendChild(again);
+  }, 40000);
+}
+
+// Shared failure screen for every netgame dead end, with a solo escape.
+function netFailure(msg, withRelayTest, specific) {
+  // One failure screen. The engine reports a refusal as a specific reason
+  // ("level mismatch") surrounded by its generic consequences ("disconnected",
+  // "failed to connect") — in an order that depends on the engine build. The
+  // specific reason is the one a player needs, so it always wins; a generic
+  // line never replaces anything.
+  if (netFailed && !specific) return;
+  netFailed = true;
+  hideNetStatus();
+  showStall(false);
+  // If the engine is still running (an older host let a mismatched player
+  // in), take it out of the game rather than let it start one that must fail.
+  leaveNetGame();
+  bootEl.classList.remove('hidden');
+  setBoot(100, msg);
+  if (!document.getElementById('solo-esc')) {
+    const a = document.createElement('a');
+    a.id = 'solo-esc';
+    a.textContent = '▶ PLAY THIS LEVEL SOLO';
+    const solo = new URLSearchParams(location.search);
+    solo.delete('ws'); solo.delete('server'); solo.delete('join');
+    solo.delete('nodes'); solo.delete('dm');
+    a.href = location.pathname + '?' + solo.toString();
+    a.style.cssText = 'display:inline-block;margin-top:10px;padding:10px 16px;' +
+      'background:#7fffd4;color:#0a0e1a;font-weight:700;border-radius:4px;text-decoration:none';
+    bootEl.appendChild(a);
+    if (withRelayTest) addRelayTest();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DURING A GAME.
+// ---------------------------------------------------------------------------
+const bannerEl = document.getElementById('netbanner');
+let bannerTimer = 0, stalled = false;
+function banner(text, ms, info) {
+  clearTimeout(bannerTimer);
+  bannerEl.textContent = text;
+  bannerEl.classList.toggle('info', !!info);
+  bannerEl.style.display = 'block';
+  if (ms) bannerTimer = setTimeout(() => { if (!stalled) bannerEl.style.display = 'none'; else showStall(true); }, ms);
+}
+// Lockstep netcode cannot advance without every player's input, so while one
+// player's tab is hidden or their connection is stalled, everyone's game
+// stops. The engine now WAITS for that player (up to its timeout) instead of
+// kicking them after four seconds — which only works if the people waiting
+// can see that waiting is what is happening.
+function showStall(on) {
+  stalled = on;
+  clearTimeout(bannerTimer);
+  if (on) {
+    bannerEl.classList.remove('info');
+    bannerEl.textContent = '⏳ WAITING FOR ANOTHER PLAYER — their game is paused or their connection is slow';
+    bannerEl.style.display = 'block';
+  } else bannerEl.style.display = 'none';
+}
+
+function overlay(id, title, body, buttons) {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = id;
+    el.style.cssText = 'position:fixed;inset:0;z-index:48;display:flex;flex-direction:column;' +
+      'align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px;' +
+      'background:rgba(10,14,26,0.9);color:#c5d4e8;font-size:14px;line-height:1.6';
+    document.body.appendChild(el);
+  }
+  el.textContent = '';
+  const h = document.createElement('div');
+  h.style.cssText = 'color:#ff9d3d;letter-spacing:.18em;font-weight:700';
+  h.textContent = title;
+  const b = document.createElement('div');
+  b.style.cssText = 'color:#c5d4e8;font-size:13px;max-width:36em';
+  b.textContent = body;
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px';
+  for (const [label, action, primary] of buttons) {
+    const btn = document.createElement(typeof action === 'string' ? 'a' : 'button');
+    btn.textContent = label;
+    if (typeof action === 'string') btn.href = action; else btn.onclick = action;
+    btn.style.cssText = 'padding:11px 18px;border:0;border-radius:5px;font-weight:700;font-size:13px;' +
+      'text-decoration:none;cursor:pointer;background:' + (primary ? '#7fffd4' : '#33405c') +
+      ';color:' + (primary ? '#0a0e1a' : '#c5d4e8');
+    row.appendChild(btn);
+  }
+  el.append(h, b, row);
+  return el;
+}
+
+// "doom: 9" after launch: this player is no longer in the netgame. Doom
+// carries on locally (the others simply vanish from the level), so this is
+// not a dead end — but it has to be SAID, or it reads as the game breaking.
+function showNetLost(engineReason) {
+  const why = /too long/.test(engineReason)
+    ? 'Nothing was heard from the host for too long — their game or their connection stopped' +
+      (relayOutdated ? ' (and this relay, ' + relayBuild + ', cannot recover a dropped connection).' : '.')
+    : /ended the game/.test(engineReason) ? 'The host left, which ends the game for everyone.'
+    : 'The connection to the host was closed.';
+  const el = overlay('netlost', 'YOU ARE NO LONGER IN THE NETGAME',
+    why + ' You can keep playing this level on your own, or go back and start a new arena.', [
+      ['▶ KEEP PLAYING ALONE', () => el.remove(), true],
+      ['← BACK TO THE ARENA', '../arena/', false],
+    ]);
+}
+
+// The engine itself is gone (a fatal error, or a crash). Nothing can resume.
+function engineStopped(what) {
+  if (engineDead || netFailed) return;
+  engineDead = true;
+  hideNetStatus();
+  showStall(false);
+  const desync = /consistency failure/i.test(what);
+  const el = overlay('enginestopped', desync ? 'THE PLAYERS\' GAMES WENT OUT OF STEP' : 'THE GAME STOPPED',
+    desync
+      ? 'Doom runs the same simulation on every player\'s machine, and two of them just ' +
+        'disagreed — so the game cannot continue. This means the players were not on ' +
+        'identical levels: everyone should reload the arena page (hard refresh) and start a new arena.'
+      : String(what).slice(0, 300), [
+      ['↻ RELOAD', location.href, true],
+      ['▶ PLAY THIS LEVEL SOLO', soloUrl(), false],
+      ['← BACK TO THE ARENA', '../arena/', false],
+    ]);
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'font-size:10px;color:#7fffd4;background:#060910;padding:8px;border-radius:4px;' +
+    'max-width:92vw;max-height:22vh;overflow:auto;text-align:left;white-space:pre-wrap';
+  pre.textContent = engineLog.slice(-8).join('\n');
+  el.appendChild(pre);
+}
+
+// Tell the other players we are going — the engine's jw_net_leave sends the
+// goodbye immediately and never waits. Without it a closed tab looks, to
+// everyone else, exactly like a stalled one: their games freeze until the
+// engine gives up on us. (Engines before E2 do not export it; they time out.)
+function leaveNetGame() {
+  try { if (qs.get('ws') && typeof Module._jw_net_leave === 'function') Module._jw_net_leave(); } catch (e) {}
+}
+window.addEventListener('pagehide', leaveNetGame);
+
+// Keep the screen on. A phone that dims and locks mid-game freezes this
+// player's engine, which stalls everyone else and — if it lasts — drops us.
+// The lock is released by the browser whenever the tab is hidden, so it is
+// re-taken on return and on every gesture.
+let wakeLock = null, running = false;
+async function holdScreenAwake() {
+  if (!running || wakeLock || document.hidden || !('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (e) { /* not allowed right now — the next gesture will retry */ }
+}
+function gameIsRunning() { running = true; holdScreenAwake(); }
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  holdScreenAwake();
+  // A hidden tab gets no frames, so the game — and everyone waiting on it —
+  // stood still. Worth knowing the first time it happens.
+  if (netLaunched && !engineDead && hiddenAt && Date.now() - hiddenAt > 3000 && qs.get('ws')) {
+    banner('While this tab was hidden your game was paused, and the other players had to wait for you.', 7000, true);
+  }
+});
+
+// Relay self-test shown on the connection-failure screen. It splits the two
+// possible causes apart so a bug report can be specific:
+//   HEALTH  — a plain GET; proves DNS + the Cloudflare route + the worker.
+//   ECHO    — a WebSocket that echoes a byte; proves WebSockets actually
+//             upgrade through Cloudflare (the part a plain HTTPS check misses).
+// If both pass but the game still won't connect, the fault is the Doom netgame
+// layer, not the relay — which is a very different fix.
+function addRelayTest() {
+  if (document.getElementById('relay-test')) return;
+  const ws = qs.get('ws') || '';
+  const origin = ws.replace(/^wss:/, 'https:').replace(/\/api\/ws\/.*$/, '');
+  const line = document.createElement('div');
+  line.id = 'relay-test';
+  line.style.cssText = 'margin-top:14px;font-size:12px;color:#c5d4e8;max-width:90vw;line-height:1.7';
+  bootEl.appendChild(line);
+  const set = (html) => { line.innerHTML = 'relay self-test:<br>' + html; };
+  let health = '…', echo = '…';
+  const paint = () => set('&nbsp;&nbsp;HEALTH (route): ' + health + '<br>&nbsp;&nbsp;ECHO (websocket): ' + echo);
+  paint();
+
+  fetch(origin + '/api/health', { cache: 'no-store' })
+    .then(r => r.json())
+    .then(j => { health = '✅ up, build ' + (j.build || '?'); paint(); })
+    .catch(e => { health = '❌ ' + e.message + ' (route/DNS/worker not reachable)'; paint(); });
+
+  try {
+    const probe = new WebSocket(origin.replace(/^https:/, 'wss:') + '/api/echo');
+    probe.binaryType = 'arraybuffer';
+    const timer = setTimeout(() => { echo = '❌ timeout (WebSockets not upgrading)'; paint(); try { probe.close(); } catch (x) {} }, 8000);
+    probe.onopen = () => probe.send(new Uint8Array([1, 2, 3, 4]));
+    probe.onmessage = (m) => { clearTimeout(timer); echo = '✅ round-trip ok'; paint(); probe.close(); };
+    probe.onerror = () => { clearTimeout(timer); echo = '❌ connection failed (Cloudflare WebSockets off, or worker not redeployed)'; paint(); };
+    probe.onclose = (e) => { if (echo === '…') { clearTimeout(timer); echo = '❌ closed before echo (code ' + e.code + ')'; paint(); } };
+  } catch (e) { echo = '❌ ' + e.message; paint(); }
+}
+// ---------------------------------------------------------------------------
+// AUDIO. Two things made sound arrive late and inconsistently:
+//
+//  1. SDL creates its AudioContext when the game opens the audio device, well
+//     into engine startup. A context created without a user gesture starts
+//     SUSPENDED, so the opening sounds were written into a context that
+//     wasn't running yet.
+//  2. Emscripten's autoResumeAudioContext() arms its resume handler with
+//     listenOnce — a ONE-SHOT listener, on document/#canvas only, for
+//     keydown/mousedown/touchstart. If that first gesture landed before the
+//     context existed, or the tab was backgrounded (which re-suspends the
+//     context), nothing ever re-armed it and audio stayed dead or came back
+//     at random.
+//
+// So: build the context ourselves at page load, hand it to SDL (the glue does
+// `if (!SDL2.audioContext)` and adopts ours), and keep a PERSISTENT resume
+// handler on every gesture plus tab re-focus.
+// ---------------------------------------------------------------------------
+const AudioCtor = window.AudioContext || window.webkitAudioContext;
+let audioCtx = null;
+if (AudioCtor) {
+  try {
+    audioCtx = new AudioCtor({ latencyHint: 'interactive' });
+    Module.SDL2 = Module.SDL2 || {};
+    Module.SDL2.audioContext = audioCtx;
+  } catch (e) { audioCtx = null; }
+}
+function resumeAudio() {
+  holdScreenAwake();
+  if (!audioCtx) return;
+  if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+  updateSoundHint();
+}
+function updateSoundHint() {
+  const b = document.getElementById('btn-sound');
+  if (!b) return;
+  b.style.display = (audioCtx && audioCtx.state !== 'running') ? '' : 'none';
+}
+// capture:true so a control that calls preventDefault/stopPropagation on its
+// own touch handling can never starve the resume.
+['pointerdown', 'touchstart', 'mousedown', 'keydown', 'click'].forEach(ev =>
+  window.addEventListener(ev, resumeAudio, { capture: true, passive: true }));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeAudio(); });
+if (audioCtx) audioCtx.onstatechange = updateSoundHint;
+
+// ---------------------------------------------------------------------------
+// LAYOUT is CSS now (see the `pointer: coarse` block). The canvas box fills
+// the visible viewport (100dvw x 100dvh) and object-fit does the aspect work:
+//   FIT  = object-fit: contain — largest UNDISTORTED size, letterboxed
+//   FILL = object-fit: fill    — stretched edge to edge
+// object-fit reads the engine's real backing store, so nothing here needs to
+// know or guess the resolution. The only JS is the toggle.
+// ---------------------------------------------------------------------------
+let fitMode = 'fit';
+try { fitMode = localStorage.getItem('jerkwadFit') || 'fit'; } catch (e) {}
+function applyFit() { document.body.classList.toggle('fill', fitMode === 'fill'); }
+applyFit();
+
+// Hide the boot screen the moment the canvas starts rendering. "Rendering"
+// has to mean the ENGINE set the canvas up: a <canvas> is 300x150 before
+// anyone touches it, so the old test (width > 64) was true from the first
+// tick and the loading screen vanished half a second after page load — every
+// boot, including the whole 28 MB download, happened behind a black rectangle.
+const bootHider = setInterval(() => {
+  const c = Module.canvas;
+  if (netFailed) { clearInterval(bootHider); return; }
+  if (Module.calledRun && c.width > 64 && !(c.width === 300 && c.height === 150)) {
+    bootEl.classList.add('hidden'); clearInterval(bootHider);
+    if (!qs.get('ws')) gameIsRunning();
+  }
+}, 500);
+
+// Build the final argument list, then inject the engine script.
+(async function boot() {
+  setBoot(5, 'reading saved WAD…');
+  userWadBytes = await readUserWad();
+  // Opened by the editor's DOOM button? The WAD write races our load —
+  // poll for up to 6 s before concluding there's no user level.
+  if ((qs.get('wait') || window.opener) && (!userWadBytes || userWadBytes.byteLength <= 16)) {
+    for (let i = 0; i < 20 && (!userWadBytes || userWadBytes.byteLength <= 16); i++) {
+      await new Promise(r => setTimeout(r, 300));
+      userWadBytes = await readUserWad();
+    }
+  }
+  if (userWadBytes && userWadBytes.byteLength <= 16) userWadBytes = null;
+  // -nogui: a fatal engine error is shown by this page (engineStopped), not by
+  // a blocking browser alert from inside the engine.
+  const args = ['-iwad', 'freedoom2.wad', '-nomusic', '-nogui'];
+  let haveUserWad = !!userWadBytes;
+  if (haveUserWad) args.push('-merge', 'shapeshifter.wad');
+  if (qs.get('wad')) { args.push('-merge', 'extra.wad'); haveUserWad = true; }
+  const joiningEarly = qs.get('ws') && qs.get('join');
+  if (!joiningEarly) {
+    const warp = qs.get('warp') || (haveUserWad ? '1' : null);
+    if (warp) args.push('-warp', warp);
+    args.push('-skill', qs.get('skill') || '3');
+  }
+  const ws = qs.get('ws');
+  const joining = ws && qs.get('join');
+  if (ws) {
+    args.push('-wss', ws);
+    if (qs.get('server')) {
+      args.push('-server');
+      args.push('-nodes', qs.get('nodes') || '2');
+      if (qs.get('dm')) args.push('-deathmatch');
+    } else if (joining) {
+      // The doom server peer is always uid 1 on the relay; the websocket
+      // transport resolves -connect via atoi(), so the address is "1".
+      args.push('-connect', '1');
+    }
+    if (qs.get('solo')) args.push('-solo-net');
+    // How long a silent player is waited for. The engine's default (30 s) is
+    // right for nearly everyone; ?timeout= tunes it without a rebuild.
+    const t = +qs.get('timeout');
+    if (t >= 4 && t <= 600) args.push('-nettimeout', String(Math.round(t)));
+    hintEl.textContent = 'net: ' + ws;
+  }
+  const extra = qs.get('x');
+  if (extra) args.push(...extra.split(',').filter(Boolean));
+  Module.arguments = args;
+  // ENGINE SELECT. The default build carries -s ASYNCIFY, which rewrites
+  // every function into a resumable state machine so emscripten_sleep() can
+  // block — that instrumentation costs several times the runtime speed and
+  // ~550 KB of code. The only things that need it are the netgame connect
+  // wait and screen-wipe pacing, so SOLO play now uses a fast ASYNCIFY-free
+  // build (I_Sleep is a no-op there; emscripten_set_main_loop already paces
+  // frames). Netgames keep the ASYNCIFY build. ?engine= forces either.
+  const wantsNet = !!qs.get('ws');
+  const engineFile = (qs.get('engine') === 'fast') ? 'fast-doom.js'
+    : (qs.get('engine') === 'websockets-doom') ? 'websockets-doom.js'
+    : (wantsNet ? 'websockets-doom.js' : 'fast-doom.js');
+  setBoot(8, 'loading engine (' + (engineFile === 'fast-doom.js' ? 'fast' : 'netplay') + ')…');
+  const sc = document.createElement('script');
+  sc.src = engineFile + '?v=' + ENGINE_BUILD;
+  sc.onerror = () => setBoot(100, 'BOOT FAILED: engine script failed to load');
+  document.body.appendChild(sc);
+})();
+
+// ---------------------------------------------------------------------------
+// Touch controls — synthesize keyboard events for SDL2's emscripten backend.
+// keyCodes: arrows 37-40, Ctrl 17 (fire), Space 32 (use), , 188 . 190
+// (strafe), Escape 27, Enter 13, y 89.
+// ---------------------------------------------------------------------------
+function sendKey(type, keyCode) {
+  const ev = new KeyboardEvent(type, { keyCode, which: keyCode, bubbles: true });
+  // SDL2 listens on window; KeyboardEvent keyCode is read-only in some
+  // browsers when constructed — defineProperty forces it.
+  try {
+    Object.defineProperty(ev, 'keyCode', { get: () => keyCode });
+    Object.defineProperty(ev, 'which', { get: () => keyCode });
+  } catch (e) {}
+  window.dispatchEvent(ev);
+  document.dispatchEvent(ev);
+  Module.canvas.dispatchEvent(ev);
+}
+// ---------------------------------------------------------------------------
+// WASD. Chocolate Doom's vanilla bindings are arrows + , / . for strafe, and
+// it reads them from its own config, which we can't edit from here. So instead
+// of rebinding the engine, translate WASD into the keys it already knows:
+//   W/S -> forward/back (same as up/down arrow)
+//   A/D -> strafe left/right (the modern convention, and it matches the touch
+//          pad, where the main left/right are strafe and the corners turn)
+// Arrow keys keep working exactly as before, so both schemes are live at once.
+// ---------------------------------------------------------------------------
+const WASD = { KeyW: 38, KeyS: 40, KeyA: 188, KeyD: 190 };
+const wasdHeld = new Set();
+window.addEventListener('keydown', (e) => {
+  const kc = WASD[e.code];
+  // Let browser/OS shortcuts through (Ctrl+W etc.), and ignore auto-repeat:
+  // the engine only needs the initial press to consider the key held.
+  if (!kc || e.ctrlKey || e.metaKey || e.altKey || e.repeat || wasdHeld.has(e.code)) return;
+  wasdHeld.add(e.code);
+  e.preventDefault();
+  sendKey('keydown', kc);
+});
+window.addEventListener('keyup', (e) => {
+  const kc = WASD[e.code];
+  if (!kc || !wasdHeld.has(e.code)) return;
+  wasdHeld.delete(e.code);
+  e.preventDefault();
+  sendKey('keyup', kc);
+});
+// Losing focus mid-strafe would otherwise leave the key stuck down.
+window.addEventListener('blur', () => {
+  wasdHeld.forEach(code => sendKey('keyup', WASD[code]));
+  wasdHeld.clear();
+});
+
+document.querySelectorAll('.pad button').forEach((b) => {
+  if (!b.dataset.key) return;   // WPN / RUN have their own handlers
+  const kc = +b.dataset.key;
+  const down = (e) => { e.preventDefault(); b.classList.add('on'); sendKey('keydown', kc); };
+  const up = (e) => { e.preventDefault(); b.classList.remove('on'); sendKey('keyup', kc); };
+  b.addEventListener('touchstart', down, { passive: false });
+  b.addEventListener('touchend', up, { passive: false });
+  b.addEventListener('touchcancel', up, { passive: false });
+  b.addEventListener('mousedown', down);
+  b.addEventListener('mouseup', up);
+  b.addEventListener('mouseleave', (e) => { if (b.classList.contains('on')) up(e); });
+});
+document.getElementById('btn-esc').addEventListener('click', () => {
+  sendKey('keydown', 27); setTimeout(() => sendKey('keyup', 27), 80);
+});
+// The host's START control now lives on the WAITING FOR PLAYERS overlay,
+// where it shows the live player count and needs a second tap to start
+// without everyone. The old unconditional top-bar START button is gone: it
+// was a single tap, on a black screen, that silently locked out every joiner.
+document.getElementById('btn-enter').addEventListener('click', () => {
+  sendKey('keydown', 13); setTimeout(() => sendKey('keyup', 13), 80);
+});
+document.getElementById('btn-yes').addEventListener('click', () => {
+  sendKey('keydown', 89); setTimeout(() => sendKey('keyup', 89), 80);
+});
+// WPN button cycles weapon slots 2→3→4→5→6→7→1. Selecting an unowned slot
+// is a harmless no-op in Doom, so tapping again advances to the next one.
+// RUN LOCK. Doom's "speed" key is Shift, normally held. On a touchscreen there
+// is no spare thumb for that, so this latches it: one tap sends keydown and
+// never releases, so the engine sees Shift held until you tap again. The
+// choice is remembered, and re-asserted after boot and whenever the tab is
+// re-focused — a keydown with no matching keyup can otherwise be forgotten if
+// the page loses focus while it is latched.
+const RUN_KEY = 16;
+let runLocked = false;
+try { runLocked = localStorage.getItem('jerkwadRun') === '1'; } catch (e) {}
+const runBtn = document.getElementById('btn-run');
+function applyRunLock() {
+  runBtn.classList.toggle('on', runLocked);
+  runBtn.textContent = runLocked ? 'RUN●' : 'RUN';
+  sendKey(runLocked ? 'keydown' : 'keyup', RUN_KEY);
+}
+runBtn.addEventListener('click', () => {
+  runLocked = !runLocked;
+  try { localStorage.setItem('jerkwadRun', runLocked ? '1' : '0'); } catch (e) {}
+  applyRunLock();
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden && runLocked) applyRunLock(); });
+runBtn.classList.toggle('on', runLocked);
+runBtn.textContent = runLocked ? 'RUN●' : 'RUN';
+
+const WPN_KEYS = [50, 51, 52, 53, 54, 55, 49];   // '2'..'7', then '1'
+let wpnIdx = 0;
+document.getElementById('btn-wpn').addEventListener('click', () => {
+  const kc = WPN_KEYS[wpnIdx++ % WPN_KEYS.length];
+  sendKey('keydown', kc);
+  setTimeout(() => sendKey('keyup', kc), 80);
+});
+document.getElementById('btn-fs').addEventListener('click', () => {
+  const el = document.documentElement;
+  if (document.fullscreenElement) document.exitFullscreen();
+  else {
+    // No orientation lock: portrait is playable now, and forcing landscape
+    // took the choice away from the player.
+    const p = (el.requestFullscreen || el.webkitRequestFullscreen || function(){}).call(el);
+    if (p && p.then) p.catch(() => {});
+  }
+});
+// FIT keeps the picture's real proportions (default); FILL stretches it edge
+// to edge. Both are just an object-fit swap via the body.fill class.
+const fitBtn = document.getElementById('btn-fit');
+function paintFitBtn() { fitBtn.textContent = fitMode === 'fit' ? 'FIT' : 'FILL'; }
+paintFitBtn();
+fitBtn.addEventListener('click', () => {
+  fitMode = fitMode === 'fit' ? 'fill' : 'fit';
+  try { localStorage.setItem('jerkwadFit', fitMode); } catch (e) {}
+  paintFitBtn();
+  applyFit();
+});
+document.getElementById('btn-sound').addEventListener('click', resumeAudio);
+updateSoundHint();
+</script>
+
+</body>
+</html>

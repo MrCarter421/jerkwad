@@ -1,0 +1,65 @@
+diff --git a/src/net_common.c b/src/net_common.c
+index e2e2bf2..82afc34 100644
+--- a/src/net_common.c
++++ b/src/net_common.c
+@@ -30,13 +30,47 @@
+ #include "net_packet.h"
+ #include "net_structrw.h"
+ 
+-// connections time out after 30 seconds
+-// we changed this for websockets
+-#define CONNECTION_TIMEOUT_LEN 4
++// JERKWAD: a connection times out after 30 seconds of silence, as in stock
++// Chocolate Doom. The wasm port had cut this to FOUR, presumably so that a
++// closed tab would free the other players quickly. But four seconds is
++// shorter than the ordinary life of a browser tab: switching tabs stops the
++// frame loop, a phone that shows a notification or locks its screen stops
++// everything, a wifi-to-cellular handover or one lost TCP segment on a weak
++// link stalls the socket for longer than that. Every one of those ended the
++// game for everybody, a few seconds to a minute in — measured: a 3 s stall
++// was already enough, because catching up afterwards takes time too.
++//
++// With 30 the game PAUSES while a player is away and carries on when they
++// are back, which is what lockstep netcode is supposed to do. A player who
++// really leaves says so (see jw_net_leave), so nobody waits 30 s for them.
++#define CONNECTION_TIMEOUT_DEFAULT 30
+ 
+ // maximum time between sending packets
+ 
+-#define KEEPALIVE_PERIOD 2
++#define KEEPALIVE_PERIOD 1
++
++// -nettimeout <seconds> overrides the default, so the limit can be tuned
++// from the player page's URL without rebuilding the engine.
++static unsigned int NET_ConnectionTimeoutMS(void)
++{
++    static unsigned int timeout_ms = 0;
++
++    if (timeout_ms == 0) {
++        int p = M_CheckParmWithArgs("-nettimeout", 1);
++
++        timeout_ms = CONNECTION_TIMEOUT_DEFAULT * 1000;
++
++        if (p > 0) {
++            int secs = atoi(myargv[p + 1]);
++
++            if (secs >= 4 && secs <= 600) {
++                timeout_ms = (unsigned int)secs * 1000;
++            }
++        }
++    }
++
++    return timeout_ms;
++}
+ 
+ // reliable packet that is guaranteed to reach its destination
+ 
+@@ -265,7 +299,7 @@ void NET_Conn_Run(net_connection_t *conn)
+     if (conn->state == NET_CONN_STATE_CONNECTED) {
+         // Check the keepalive counters
+ 
+-        if (nowtime - conn->keepalive_recv_time > CONNECTION_TIMEOUT_LEN * 1000) {
++        if (nowtime - conn->keepalive_recv_time > NET_ConnectionTimeoutMS()) {
+             // Haven't received any packets from the other end in a long
+             // time.  Assume disconnected.
+ 

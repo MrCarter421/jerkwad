@@ -31,6 +31,12 @@ scripts/         — build, deploy, validators (see Testing)
   engine-patches/  the netcode patches applied to upstream doom-wasm + README
   lib/             stack.js (local test stack), arena-level.js (pipeline loader)
 package.json     — dev tooling only (npm install); the site ships no npm code
+                   `overrides` patch sharp/undici, which miniflare 4.x pins to
+                   vulnerable versions; drop them once a miniflare release pins
+                   fixed ones (`npm view miniflare@latest dependencies`).
+                   `allowScripts` approves esbuild/puppeteer/workerd install
+                   scripts (npm 11+ blocks them by default; puppeteer's fetches
+                   Chrome) — pinned, so bumping one means `npm install-scripts approve <pkg>`.
 ARENA.md PLAY.md DEPLOY.md — multiplayer, player, deploying
 CLAUDE.md        — this file.
 ```
